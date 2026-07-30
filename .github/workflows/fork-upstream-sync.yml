@@ -27,6 +27,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # See the note in fork-effect-tsgo-update.yml: the enterprise policy holds
+          # GITHUB_TOKEN at read-only, so pushing master and opening the PR both need FORK_PAT.
+          token: ${{ secrets.FORK_PAT || github.token }}
 
       - name: Fast-forward master to upstream
         id: ff
@@ -71,7 +74,7 @@ jobs:
       - name: Open the PR
         if: steps.ff.outputs.changed == 'yes'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.FORK_PAT || github.token }}
         run: |
           set -euo pipefail
           if [ "${{ steps.merge.outputs.conflicts }}" = "yes" ]; then

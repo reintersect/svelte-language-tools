@@ -1,10 +1,16 @@
 # Opens a PR when a new @reintersect/effect-tsgo lands on npm.
 #
-# Polls the registry rather than being pushed to from the effect-tsgo repo. A repository_dispatch
-# from there would be the "proper" event-driven design, but it needs a cross-repo PAT stored as a
-# secret in both repos — a credential to mint, rotate and leak. The registry is the thing we
-# actually care about (a version nobody published is a version nobody can install), a poll costs
-# one HTTP request, and GITHUB_TOKEN is enough.
+# Polls the registry rather than taking a repository_dispatch from the effect-tsgo repo. Event
+# driven would be tidier, but it needs a PAT in *both* repos and the registry is the thing that
+# actually matters — a version nobody published is a version nobody can install.
+#
+# Needs a FORK_PAT secret. Not by choice: this org's enterprise policy pins
+# `default_workflow_permissions` to `read` and refuses to let a repository raise it
+# ("Write permissions for workflows are disabled by the enterprise"), so the built-in
+# GITHUB_TOKEN cannot open a pull request no matter what `permissions:` says below. A fine-grained
+# token scoped to this one repository with Contents: read/write and Pull requests: read/write is
+# the minimum that works. The fallback to github.token is there so the job still runs (and fails
+# visibly at the PR step) if the secret is missing.
 name: fork · effect-tsgo update
 
 on:
@@ -77,6 +83,7 @@ jobs:
         if: steps.v.outputs.changed == 'yes'
         uses: peter-evans/create-pull-request@v7
         with:
+          token: ${{ secrets.FORK_PAT || github.token }}
           branch: fork/effect-tsgo-${{ steps.v.outputs.latest }}
           base: tsgo-engine
           title: 'chore: effect-tsgo ${{ steps.v.outputs.pinned }} → ${{ steps.v.outputs.latest }}'
