@@ -189,7 +189,10 @@ export class TsGoPlugin implements Plugin {
      */
     private async ensureProjectOpened(): Promise<void> {
         this.eagerOpenDone ??= (async () => {
-            const files = this.shadows.findProjectSvelteFiles();
+            const files = [
+                ...this.shadows.findProjectSvelteFiles(),
+                ...this.shadows.findDependencySvelteFiles()
+            ];
             Logger.log(`[tsgo] materialising ${files.length} shadows`);
             const started = Date.now();
             const written = new Set<string>();

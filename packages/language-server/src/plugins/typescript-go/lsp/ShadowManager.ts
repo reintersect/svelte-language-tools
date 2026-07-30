@@ -1,4 +1,4 @@
-import { dirname, join, relative, resolve } from 'path';
+import { dirname, isAbsolute, join, relative, resolve } from 'path';
 import fs from 'fs';
 import ts from 'typescript';
 import { Document } from '../../../lib/documents';
@@ -269,13 +269,38 @@ export class ShadowManager {
                 // and every route's `./$types` import.
                 rootDirs: [...base.rootDirs, this.options.sourceRoot, this.shadowRoot]
             },
-            // `files` and `include` are unioned by TypeScript. The base's resolved file list
-            // goes in `files` because a derived config's `include` *replaces* the base's rather
-            // than extending it — writing our own glob would silently drop `.svelte-kit`'s
-            // ambient declarations ($env/static/public and friends).
-            files: [...base.fileNames, ...shimFiles],
-            include: [`${this.shadowRoot}/**/*`]
+            // `files` carries the base's resolved file list with each .svelte entry replaced
+            // by its shadow. Deliberately no `include` glob over the shadow root: in a monorepo
+            // the shadow tree holds components from every workspace package, and globbing them
+            // all in makes them roots of *this* project — where their own `$lib`/`#lib` aliases
+            // and workspace deps do not resolve. On packages/ui that turned 18 real errors into
+            // 1277. Shadows for other packages still resolve when imported, because they exist
+            // on disk and rootDirs bridges to them; they just are not roots.
+            files: [...base.fileNames, ...shimFiles]
         };
+
+        // Node subpath imports (`#lib/*`) resolve through package.json's `imports` field, which
+        // `rootDirs` has no effect on — so `#lib/x.svelte` bypasses the shadow tree entirely and
+        // lands on svelte's ambient `declare module '*.svelte'`, silently typing the component
+        // `any`. Barrel files re-exporting named members from a component are the usual casualty.
+        // Only emitted when there is something to add, and merged with the base's own paths:
+        // like `include` and `rootDirs`, a derived config's `paths` REPLACES the base's, and
+        // dropping SvelteKit's `$lib`/`$app` mappings breaks the project outright.
+        const subpathPaths = this.subpathImportPaths();
+        if (Object.keys(subpathPaths).length) {
+            // The base's path values are relative to the config that declared them, and would
+            // otherwise be re-interpreted relative to this one. `baseUrl` would express that,
+            // but TypeScript 7 removed it (TS5102), so the values are made absolute instead.
+            const inherited: Record<string, string[]> = {};
+            for (const [pattern, targets] of Object.entries(base.paths)) {
+                inherited[pattern] = targets.map((target) =>
+                    base.pathsBasePath && !isAbsolute(target)
+                        ? normalizePath(resolve(base.pathsBasePath, target))
+                        : target
+                );
+            }
+            config.compilerOptions.paths = { ...inherited, ...subpathPaths };
+        }
 
         if (this.options.tsconfigPath) {
             config.extends = this.options.tsconfigPath;
@@ -297,11 +322,51 @@ export class ShadowManager {
     }
 
     /**
+     * `paths` entries mirroring the project package.json's `imports` field, each resolving to
+     * the shadow tree first and the real tree second.
+     */
+    private subpathImportPaths(): Record<string, string[]> {
+        const paths: Record<string, string[]> = {};
+        let pkg: any;
+        try {
+            pkg = JSON.parse(
+                fs.readFileSync(join(this.options.projectPath, 'package.json'), 'utf8')
+            );
+        } catch {
+            return paths;
+        }
+
+        for (const [pattern, target] of Object.entries(pkg.imports ?? {})) {
+            // Conditional exports can nest; take the first string we find.
+            const resolved = firstStringTarget(target);
+            if (!resolved?.startsWith('./')) {
+                continue;
+            }
+            const real = normalizePath(join(this.options.projectPath, resolved.slice(2)));
+            const shadowed = normalizePath(
+                join(this.shadowRoot, relative(this.rootDirFor(real), real))
+            );
+            paths[pattern] = [shadowed, real];
+        }
+        return paths;
+    }
+
+    /**
      * Resolve the user's config far enough to know which files it pulls in and what its
      * `rootDirs` are, so the overlay can extend both rather than overwrite them.
      */
-    private parseBaseConfig(): { rootDirs: string[]; fileNames: string[] } {
-        const fallback = { rootDirs: [this.options.projectPath], fileNames: [] as string[] };
+    private parseBaseConfig(): {
+        rootDirs: string[];
+        fileNames: string[];
+        paths: Record<string, string[]>;
+        pathsBasePath: string | undefined;
+    } {
+        const fallback = {
+            rootDirs: [this.options.projectPath],
+            fileNames: [] as string[],
+            paths: {} as Record<string, string[]>,
+            pathsBasePath: undefined as string | undefined
+        };
         if (!this.options.tsconfigPath) {
             return fallback;
         }
@@ -348,11 +413,96 @@ export class ShadowManager {
                 f.endsWith('.svelte') ? this.getShadowPath(normalizePath(f)) : normalizePath(f)
             );
 
-            return { rootDirs, fileNames };
+            return {
+                rootDirs,
+                fileNames,
+                paths: (parsed.options.paths ?? {}) as Record<string, string[]>,
+                pathsBasePath:
+                    (parsed.options as any).pathsBasePath ?? parsed.options.baseUrl ?? undefined
+            };
         } catch (e) {
             Logger.error('[tsgo] could not parse the project tsconfig; using defaults', e);
             return fallback;
         }
+    }
+
+    /**
+     * `.svelte` files shipped inside dependencies that need a shadow.
+     *
+     * Most published Svelte libraries emit a `Foo.svelte.d.ts` next to `Foo.svelte`, which
+     * TypeScript resolves on its own. A minority (virtua, parts of SvelteKit and Storybook)
+     * ship the raw component with differently-named typings, and those fall through to the
+     * ambient `declare module '*.svelte'` — the component then types as
+     * `SvelteComponent<Record<string, any>, any, any>` and every prop check against it fails.
+     * Only files missing that sibling are transformed, which on a large monorepo is ~180 of
+     * ~2000 rather than all of them.
+     */
+    findDependencySvelteFiles(): string[] {
+        const found: string[] = [];
+        const seen = new Set<string>();
+
+        // Walk only the packages this project actually depends on. Scanning node_modules
+        // wholesale takes minutes on a large pnpm monorepo — most of it is transitive
+        // dependencies with no Svelte in them at all.
+        for (const packageRoot of this.dependencyRoots()) {
+            const walk = (dir: string, depth: number) => {
+                if (depth > 6) {
+                    return;
+                }
+                let entries: fs.Dirent[];
+                try {
+                    entries = fs.readdirSync(dir, { withFileTypes: true });
+                } catch {
+                    return;
+                }
+                for (const entry of entries) {
+                    const full = join(dir, entry.name);
+                    if (entry.isDirectory()) {
+                        if (entry.name !== 'node_modules' && !entry.name.startsWith('.')) {
+                            walk(full, depth + 1);
+                        }
+                    } else if (entry.name.endsWith('.svelte') && !fs.existsSync(`${full}.d.ts`)) {
+                        const normalized = normalizePath(full);
+                        if (!seen.has(normalized)) {
+                            seen.add(normalized);
+                            found.push(normalized);
+                        }
+                    }
+                }
+            };
+            walk(packageRoot, 0);
+        }
+        return found;
+    }
+
+    /** Resolved directories of the project's declared dependencies. */
+    private dependencyRoots(): string[] {
+        let pkg: any;
+        try {
+            pkg = JSON.parse(
+                fs.readFileSync(join(this.options.projectPath, 'package.json'), 'utf8')
+            );
+        } catch {
+            return [];
+        }
+        const names = [
+            ...Object.keys(pkg.dependencies ?? {}),
+            ...Object.keys(pkg.devDependencies ?? {}),
+            ...Object.keys(pkg.peerDependencies ?? {})
+        ];
+        const roots: string[] = [];
+        for (const name of names) {
+            try {
+                const manifest = require.resolve(`${name}/package.json`, {
+                    paths: [this.options.projectPath]
+                });
+                roots.push(dirname(manifest));
+            } catch {
+                // Not every dependency exposes its package.json, and that is fine — those
+                // either have no Svelte in them or ship their own typings.
+            }
+        }
+        return roots;
     }
 
     /** Every `.svelte` file in the project, which all need eagerly-opened shadows. */
@@ -386,6 +536,31 @@ export class ShadowManager {
         walk(this.options.sourceRoot, 0);
         return found;
     }
+}
+
+/** First string in a possibly-nested package.json conditional-exports value. */
+function firstStringTarget(value: unknown): string | undefined {
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (Array.isArray(value)) {
+        for (const entry of value) {
+            const found = firstStringTarget(entry);
+            if (found) {
+                return found;
+            }
+        }
+        return undefined;
+    }
+    if (value && typeof value === 'object') {
+        for (const entry of Object.values(value)) {
+            const found = firstStringTarget(entry);
+            if (found) {
+                return found;
+            }
+        }
+    }
+    return undefined;
 }
 
 /** Resolve the tsgo executable from the project, preferring effect-tsgo when present. */
