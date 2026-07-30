@@ -423,6 +423,7 @@ export class ShadowManager {
         }
 
         this.writeTsSupportConfig(base, shimFiles, paths);
+        this.writeSiblingOverlays(shimFiles);
 
         if (this.options.tsconfigPath) {
             config.extends = this.options.tsconfigPath;
@@ -620,6 +621,76 @@ export class ShadowManager {
     }
 
     /**
+     * Give every other workspace package that owns components its own overlay project.
+     *
+     * tsgo picks a file's project purely by walking up from its path, so a shadow under
+     * `packages/ui/.svelte-ls-overlay/svelte/` lands in whatever tsconfig sits above it — and
+     * without one of ours, that is `packages/ui/tsconfig.json`, which has never heard of the
+     * svelte2tsx shims. Opening a component from a sibling package then reports
+     * `Cannot find name 'svelteHTML'` on every file: fast, because the project is small, and
+     * wrong, because it is the wrong project.
+     *
+     * Writing an overlay next to each mirror fixes that, and buys the thing that actually makes
+     * editing quick. TypeScript discards its whole type checker on any program change, so the
+     * cost of a keystroke is the cost of rebuilding the types the *program* needs — measured at
+     * ~300ms in a ~10,300-file app against ~18ms in a ~2,900-file library. Editing a component in
+     * a sibling package now re-checks that package's program instead of the app's.
+     *
+     * Skips anything under `node_modules`: a dependency's components are never opened in the
+     * editor, so they need a mirror to resolve into but not a project of their own.
+     */
+    private writeSiblingOverlays(shimFiles: string[]) {
+        for (const packageRoot of this.svelteOwningPackages()) {
+            if (
+                normalizePath(packageRoot) === normalizePath(this.packageRoot) ||
+                packageRoot.includes('/node_modules/')
+            ) {
+                continue;
+            }
+            // Only a config the package actually owns. `findConfigFile` walks upward, so without
+            // this check a package with no tsconfig would adopt the monorepo root's and inherit
+            // an unrelated file list.
+            const tsconfigPath = findProjectTsconfig(packageRoot);
+            if (!tsconfigPath || !normalizePath(tsconfigPath).startsWith(packageRoot + '/')) {
+                continue;
+            }
+
+            try {
+                const base = this.parseBaseConfig(tsconfigPath, packageRoot);
+                const config: any = {
+                    extends: tsconfigPath,
+                    compilerOptions: {
+                        allowArbitraryExtensions: true,
+                        allowImportingTsExtensions: true,
+                        noEmit: true,
+                        jsx: 'preserve',
+                        rootDirs: [
+                            ...base.rootDirs,
+                            this.options.sourceRoot,
+                            ...new Set(this.mirrorRoots.values())
+                        ]
+                    },
+                    files: [...base.fileNames, ...shimFiles]
+                };
+                const paths = this.overlayPaths(base);
+                if (Object.keys(paths).length) {
+                    config.compilerOptions.paths = paths;
+                }
+
+                const overlayDir = join(packageRoot, OVERLAY_DIR);
+                fs.mkdirSync(overlayDir, { recursive: true });
+                const target = join(overlayDir, 'tsconfig.json');
+                const contents = JSON.stringify(config, null, 4);
+                if (!fs.existsSync(target) || fs.readFileSync(target, 'utf8') !== contents) {
+                    fs.writeFileSync(target, contents);
+                }
+            } catch (e) {
+                Logger.debug(`[tsgo] could not write a sibling overlay for ${packageRoot}`, e);
+            }
+        }
+    }
+
+    /**
      * Create a mirror directory and mark it ignored.
      *
      * Deliberately nothing else: no package.json, no links. The mirror sits inside the package
@@ -710,23 +781,31 @@ export class ShadowManager {
      * Resolve the user's config far enough to know which files it pulls in and what its
      * `rootDirs` are, so the overlay can extend both rather than overwrite them.
      */
-    private parseBaseConfig(): {
+    private parseBaseConfig(
+        tsconfigOverride?: string,
+        projectRoot?: string
+    ): {
         rootDirs: string[];
         fileNames: string[];
         paths: Record<string, string[]>;
         pathsBasePath: string | undefined;
     } {
+        // Without an override this is the project the server was opened for, and the parse also
+        // establishes instance state (`rootDirsLongestFirst`, `projectSvelteFiles`). With one it
+        // is a sibling package getting its own overlay, and must not disturb either.
+        const isPrimary = !tsconfigOverride;
+        const tsconfigPath = tsconfigOverride ?? this.options.tsconfigPath;
         const fallback = {
-            rootDirs: [this.options.projectPath],
+            rootDirs: [projectRoot ?? this.options.projectPath],
             fileNames: [] as string[],
             paths: {} as Record<string, string[]>,
             pathsBasePath: undefined as string | undefined
         };
-        if (!this.options.tsconfigPath) {
+        if (!tsconfigPath) {
             return fallback;
         }
         try {
-            const read = ts.readConfigFile(this.options.tsconfigPath, ts.sys.readFile);
+            const read = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
             if (read.error || !read.config) {
                 return fallback;
             }
@@ -745,18 +824,21 @@ export class ShadowManager {
                             depth
                         )
                 },
-                dirname(this.options.tsconfigPath)
+                dirname(tsconfigPath)
             );
 
             const rootDirs = parsed.options.rootDirs?.length
                 ? parsed.options.rootDirs.map((d) => normalizePath(d))
-                : [this.options.projectPath];
+                : [projectRoot ?? this.options.projectPath];
 
             // Must be set before the fileNames below are mapped: getShadowPath depends on it,
-            // or the `files` list would name shadows at paths we never write to.
-            this.rootDirsLongestFirst = [
-                ...new Set([...rootDirs, normalizePath(this.options.sourceRoot)])
-            ].sort((a, b) => b.length - a.length);
+            // or the `files` list would name shadows at paths we never write to. Only the primary
+            // parse may set it — a sibling package's rootDirs would move every shadow path.
+            if (isPrimary) {
+                this.rootDirsLongestFirst = [
+                    ...new Set([...rootDirs, normalizePath(this.options.sourceRoot)])
+                ].sort((a, b) => b.length - a.length);
+            }
 
             // Substitute each .svelte entry with its shadow. tsgo cannot parse the real file,
             // and the shadows must be listed explicitly: they never exist on disk, so an
@@ -773,9 +855,11 @@ export class ShadowManager {
                     : (this.writeKitShadow(normalized) ?? normalized);
             });
 
-            this.projectSvelteFiles = parsed.fileNames
-                .filter((f) => f.endsWith('.svelte'))
-                .map((f) => normalizePath(f));
+            if (isPrimary) {
+                this.projectSvelteFiles = parsed.fileNames
+                    .filter((f) => f.endsWith('.svelte'))
+                    .map((f) => normalizePath(f));
+            }
 
             return {
                 rootDirs,
