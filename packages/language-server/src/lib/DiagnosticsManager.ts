@@ -22,13 +22,25 @@ export interface DiagnosticsManager {
 }
 
 /**
- * How long to wait after the last edit before recomputing diagnostics for the documents the
- * user is actually typing in. This is the dominant term in keystroke -> squiggle latency, so
- * it's kept just above typical inter-keystroke time rather than at a comfortable half second.
- * In-flight computations are cancelled on each new edit (see `cancelStarted`), so a shorter
- * window costs little beyond some discarded work.
+ * How long to wait after the last edit before recomputing diagnostics for the documents the user
+ * is actually typing in.
+ *
+ * Almost nothing. The instinct is that a short window wastes work — every keystroke starting a
+ * check that the next keystroke invalidates — and with an engine whose checks cannot be cancelled
+ * that would be true. It isn't, because `cancelStarted` drops a superseded computation before it
+ * is ever dispatched, so a burst coalesces on its own.
+ *
+ * Measured on a ~800-component SvelteKit app, from the last keystroke to the diagnostics that
+ * describe it:
+ *
+ *              single edit    burst of 6, 60ms apart
+ *   120ms         413ms              461ms
+ *    20ms         307ms              331ms
+ *
+ * Better in both, so the long window was buying nothing. Kept non-zero only so that a single
+ * logical edit arriving as several notifications is still one check.
  */
-const BATCH_UPDATE_DEBOUNCE_MS = Number(process.env.SVELTE_LS_DIAGNOSTICS_DEBOUNCE_MS ?? 120);
+const BATCH_UPDATE_DEBOUNCE_MS = Number(process.env.SVELTE_LS_DIAGNOSTICS_DEBOUNCE_MS ?? 20);
 
 export class PushDiagnosticsManager implements DiagnosticsManager {
     constructor(
