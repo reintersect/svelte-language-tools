@@ -27,7 +27,7 @@ export function mapLocationBack(
         return Location.create(uri, range);
     }
 
-    const snapshot = shadows.getSnapshot(originalPath);
+    const snapshot = shadows.ensureSnapshot(originalPath);
     if (!snapshot) {
         return undefined;
     }
@@ -62,7 +62,7 @@ export function mapWorkspaceEditBack(
             add(uri, edits);
             return;
         }
-        const snapshot = shadows.getSnapshot(originalPath);
+        const snapshot = shadows.ensureSnapshot(originalPath);
         if (!snapshot) {
             return;
         }

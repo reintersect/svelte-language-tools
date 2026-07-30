@@ -196,8 +196,22 @@ export class TsGoPlugin implements Plugin {
             Logger.log(`[tsgo] materialising ${files.length} shadows`);
             const started = Date.now();
             const written = new Set<string>();
+            let reused = 0;
             for (const filePath of files) {
                 try {
+                    const shadowPathIfFresh = this.shadows.getShadowPath(filePath);
+                    // A shadow newer than its source is already what the transform would produce,
+                    // so re-deriving it is pure startup cost. The editor is usually reopened on an
+                    // unchanged tree, which makes this nearly the whole loop. Correctness comes
+                    // from the fingerprint: a Svelte or svelte2tsx upgrade invalidates all of them.
+                    if (
+                        !this.docManager.get(pathToUrl(filePath)) &&
+                        this.shadows.isShadowFresh(filePath, shadowPathIfFresh)
+                    ) {
+                        written.add(shadowPathIfFresh);
+                        reused++;
+                        continue;
+                    }
                     const uri = pathToUrl(filePath);
                     // Reuse the client's buffer when the file is already open in the editor so
                     // an unsaved edit isn't clobbered by the on-disk text — but otherwise build
@@ -216,7 +230,10 @@ export class TsGoPlugin implements Plugin {
                 }
             }
             this.shadows.pruneOrphanedShadows(written);
-            Logger.log(`[tsgo] materialised ${written.size} shadows in ${Date.now() - started}ms`);
+            Logger.log(
+                `[tsgo] materialised ${written.size} shadows in ${Date.now() - started}ms ` +
+                    `(${reused} reused from disk)`
+            );
         })();
         return this.eagerOpenDone;
     }

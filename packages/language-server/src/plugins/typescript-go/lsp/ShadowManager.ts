@@ -4,7 +4,7 @@ import ts from 'typescript';
 import { internalHelpers, InternalHelpers } from 'svelte2tsx';
 import { Document } from '../../../lib/documents';
 import { Logger } from '../../../logger';
-import { normalizePath } from '../../../utils';
+import { normalizePath, pathToUrl } from '../../../utils';
 import { DocumentSnapshot, SvelteDocumentSnapshot } from '../../typescript/DocumentSnapshot';
 import { SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
 
@@ -20,6 +20,8 @@ import { SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
  */
 const OVERLAY_DIR = '.svelte-ls-overlay';
 const SHADOW_ROOT = 'svelte';
+/** Bump when the shadow tree's layout changes, to invalidate every shadow on disk. */
+const SHADOW_LAYOUT_VERSION = 2;
 
 export interface ShadowManagerOptions {
     /** Directory of the user's tsconfig — the project root for our purposes. */
@@ -102,6 +104,8 @@ export class ShadowManager {
     private readonly mirrorRoots = new Map<string, string>();
     private readonly packageRootByDir = new Map<string, string>();
     private readonly originalByShadowPath = new Map<string, string>();
+    /** False when the transform's output could have changed since the shadows were written. */
+    private fingerprintValid = false;
 
     constructor(private readonly options: ShadowManagerOptions) {
         this.overlayPath = join(options.projectPath, OVERLAY_DIR);
@@ -223,12 +227,91 @@ export class ShadowManager {
     }
 
     /**
+     * The snapshot for a file, transforming it from disk if it is not cached.
+     *
+     * Startup only writes shadows whose source is newer, so most files never get transformed at
+     * all — which means a mapping lookup for one of them (go-to-definition landing in a component
+     * nobody has opened) would otherwise find nothing and silently drop the result. Transforming
+     * on demand costs well under a millisecond and only happens for files actually navigated to.
+     */
+    ensureSnapshot(svelteFilePath: string): SvelteDocumentSnapshot | undefined {
+        const cached = this.getSnapshot(svelteFilePath);
+        if (cached) {
+            return cached;
+        }
+        try {
+            const text = fs.readFileSync(svelteFilePath, 'utf8');
+            return this.transform(new Document(pathToUrl(svelteFilePath), text, true));
+        } catch (e) {
+            Logger.debug(`[tsgo] could not transform ${svelteFilePath} on demand`, e);
+            return undefined;
+        }
+    }
+
+    /**
+     * Whether the shadow on disk already reflects its source, so startup can skip it.
+     *
+     * Guarded by a fingerprint of everything that changes generated output — the Svelte and
+     * svelte2tsx versions, and the layout version below. Without it, upgrading either would leave
+     * a tree of stale shadows that look fresh by timestamp and produce types for code that is no
+     * longer what the transform emits.
+     */
+    isShadowFresh(sourcePath: string, shadowPath: string): boolean {
+        if (!this.fingerprintValid) {
+            return false;
+        }
+        try {
+            const shadow = fs.statSync(shadowPath, { throwIfNoEntry: false });
+            if (!shadow) {
+                return false;
+            }
+            const source = fs.statSync(sourcePath, { throwIfNoEntry: false });
+            return !!source && shadow.mtimeMs >= source.mtimeMs;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Compare the current transform fingerprint against the one the shadows were written with,
+     * and record the new one. Everything is stale when it differs.
+     */
+    private checkFingerprint(): boolean {
+        const fingerprint = JSON.stringify({
+            layout: SHADOW_LAYOUT_VERSION,
+            svelte: this.options.snapshotOptions.version ?? 'unknown',
+            options: {
+                typingsNamespace: this.options.snapshotOptions.typingsNamespace,
+                transformOnTemplateError: this.options.snapshotOptions.transformOnTemplateError,
+                emitJsDoc: this.options.snapshotOptions.emitJsDoc
+            }
+        });
+        const target = join(this.overlayPath, '.fingerprint');
+        let matched = false;
+        try {
+            matched = fs.readFileSync(target, 'utf8') === fingerprint;
+        } catch {
+            matched = false;
+        }
+        if (!matched) {
+            try {
+                fs.mkdirSync(this.overlayPath, { recursive: true });
+                fs.writeFileSync(target, fingerprint);
+            } catch {
+                // If it cannot be recorded, treat every shadow as stale rather than trusting one.
+                return false;
+            }
+        }
+        return matched;
+    }
+
+    /**
      * Snapshot for a *generated* path. Convenience for callers working in shadow space, e.g.
      * translating an LSP position on a shadow into a checker offset.
      */
     getSnapshotByShadowPath(shadowPath: string): SvelteDocumentSnapshot | undefined {
         const original = this.getOriginalPath(shadowPath);
-        return original ? this.getSnapshot(original) : undefined;
+        return original ? this.ensureSnapshot(original) : undefined;
     }
 
     /**
@@ -367,6 +450,7 @@ export class ShadowManager {
      */
     writeOverlayTsconfig(shimFiles: string[]) {
         fs.mkdirSync(this.overlayPath, { recursive: true });
+        this.fingerprintValid = this.checkFingerprint();
         // Discovering the mirrors has to happen before the config is written, since every one of
         // them is a rootDirs entry.
         for (const packagePath of this.svelteOwningPackages()) {
