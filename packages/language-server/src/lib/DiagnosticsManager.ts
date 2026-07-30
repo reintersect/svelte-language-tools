@@ -21,6 +21,15 @@ export interface DiagnosticsManager {
     cancelStarted(uri: string): void;
 }
 
+/**
+ * How long to wait after the last edit before recomputing diagnostics for the documents the
+ * user is actually typing in. This is the dominant term in keystroke -> squiggle latency, so
+ * it's kept just above typical inter-keystroke time rather than at a comfortable half second.
+ * In-flight computations are cancelled on each new edit (see `cancelStarted`), so a shorter
+ * window costs little beyond some discarded work.
+ */
+const BATCH_UPDATE_DEBOUNCE_MS = Number(process.env.SVELTE_LS_DIAGNOSTICS_DEBOUNCE_MS ?? 120);
+
 export class PushDiagnosticsManager implements DiagnosticsManager {
     constructor(
         private sendDiagnostics: SendDiagnostics,
@@ -100,7 +109,7 @@ export class PushDiagnosticsManager implements DiagnosticsManager {
             this.update(doc);
         });
         this.pendingUpdates.clear();
-    }, 500);
+    }, BATCH_UPDATE_DEBOUNCE_MS);
 }
 
 export class PullDiagnosticsManager implements DiagnosticsManager {

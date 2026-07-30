@@ -198,24 +198,28 @@ export function debounce(fn: () => void, miliseconds: number): () => void {
  * @param miliseconds Number of miliseconds to debounce/throttle
  */
 export function debounceThrottle(fn: () => void, miliseconds: number): () => void {
-    let timeout: ReturnType<typeof setTimeout>;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     let lastInvocation = Date.now() - miliseconds;
 
-    function maybeCall() {
+    function schedule(delay: number) {
         clearTimeout(timeout);
 
         timeout = setTimeout(() => {
-            if (Date.now() - lastInvocation < miliseconds) {
-                maybeCall();
+            const sinceLastInvocation = Date.now() - lastInvocation;
+            if (sinceLastInvocation < miliseconds) {
+                // The throttle floor hasn't elapsed yet. Wait only the time that's actually
+                // left, not a whole fresh interval — re-arming the full interval here made
+                // the effective delay up to 2x `miliseconds`.
+                schedule(miliseconds - sinceLastInvocation);
                 return;
             }
 
             fn();
             lastInvocation = Date.now();
-        }, miliseconds);
+        }, delay);
     }
 
-    return maybeCall;
+    return () => schedule(miliseconds);
 }
 
 /**

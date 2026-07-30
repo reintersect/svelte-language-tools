@@ -57,6 +57,15 @@ enum ExecuteMode {
     Collect
 }
 
+/** A 'smart' method is demoted to 'low' once its own measured cost exceeds this. */
+const SMART_DEMOTION_THRESHOLD_MS = 500;
+/**
+ * How long a 'low' priority request waits before executing, so higher-priority work and
+ * further document changes get a chance to land first. Kept short: it is pure added
+ * latency for whichever request ends up being the last one.
+ */
+const LOW_PRIORITY_DEBOUNCE_MS = 250;
+
 export class PluginHost implements LSProvider, OnWatchFileChanges {
     private plugins: Plugin[] = [];
     private pluginHostConfig: LSPProviderConfig = {
@@ -65,6 +74,8 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
     };
     private deferredRequests: Record<string, [number, Promise<any>]> = {};
     private requestTimings: Record<string, [time: number, lastExecuted: number]> = {};
+    /** Keyed by `${uri}@${version}` so duplicate outline/sticky-scroll requests share one computation. */
+    private inFlightDocumentSymbols = new Map<string, Promise<SymbolInformation[]>>();
 
     constructor(private documentsManager: DocumentManager) {}
 
@@ -383,21 +394,30 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
     ): Promise<SymbolInformation[]> {
         const document = this.getDocument(textDocument.uri);
 
-        // VSCode requested document symbols twice for the outline view and the sticky scroll
-        // Manually delay here and don't use low priority as one of them will return no symbols
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        if (cancellationToken.isCancellationRequested) {
-            return [];
+        // VS Code asks for document symbols twice (outline view and sticky scroll). Coalesce
+        // them: the second request joins the first instead of racing it. This used to be a
+        // flat 1s sleep, which cost every request a second to work around the duplicate.
+        const key = `${document.uri}@${document.version}`;
+        const inFlight = this.inFlightDocumentSymbols.get(key);
+        if (inFlight) {
+            return inFlight;
         }
 
-        return (
-            await this.execute<SymbolInformation[]>(
-                'getDocumentSymbols',
-                [document, cancellationToken],
-                ExecuteMode.Collect,
-                'high'
-            )
-        ).flat();
+        const pending = this.execute<SymbolInformation[]>(
+            'getDocumentSymbols',
+            [document, cancellationToken],
+            ExecuteMode.Collect,
+            'high'
+        )
+            .then((results) => results.flat())
+            .finally(() => {
+                if (this.inFlightDocumentSymbols.get(key) === pending) {
+                    this.inFlightDocumentSymbols.delete(key);
+                }
+            });
+
+        this.inFlightDocumentSymbols.set(key, pending);
+        return pending;
     }
 
     private comparePosition(pos1: Position, pos2: Position) {
@@ -895,25 +915,22 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
         priority: 'low' | 'high' | 'smart'
     ): Promise<(T | null) | T[] | void> {
         const plugins = this.plugins.filter((plugin) => typeof plugin[name] === 'function');
-        // Priority 'smart' tries to aproximate how much time a method takes to execute,
-        // making it low priority if it takes too long or if it seems like other methods do.
+        // Priority 'smart' approximates how expensive a method is and demotes it to 'low'
+        // when it's genuinely slow. Demotion is deliberately keyed on *this* method's own
+        // measured cost: the previous heuristic also demoted whenever any three methods had
+        // exceeded 400ms in the last minute, which on a large project penalised fast methods
+        // with a full second of debounce for unrelated slowness.
         const now = performance.now();
-        if (
-            priority === 'smart' &&
-            (this.requestTimings[name]?.[0] > 500 ||
-                Object.values(this.requestTimings).filter(
-                    (t) => t[0] > 400 && now - t[1] < 60 * 1000
-                ).length > 2)
-        ) {
+        if (priority === 'smart' && this.requestTimings[name]?.[0] > SMART_DEMOTION_THRESHOLD_MS) {
             Logger.debug(`Executing next invocation of "${name}" with low priority`);
             priority = 'low';
-            if (this.requestTimings[name]) {
-                this.requestTimings[name][0] = this.requestTimings[name][0] / 2 + 150;
-            }
+            // Decay the recorded cost so a single slow run doesn't pin the method to 'low';
+            // the next real execution re-measures it.
+            this.requestTimings[name][0] = this.requestTimings[name][0] / 2 + 150;
         }
 
         if (priority === 'low') {
-            // If a request doesn't have priority, we first wait 1 second to
+            // If a request doesn't have priority, we wait a little to
             // 1. let higher priority requests get through first
             // 2. wait for possible document changes, which make the request wait again
             // Due to waiting, low priority items should preferrably be those who do not
@@ -935,7 +952,7 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
                                 // of the same type until the previous one is answered.
                                 reject();
                             }
-                        }, 1000);
+                        }, LOW_PRIORITY_DEBOUNCE_MS);
                     })
                 ];
                 try {
