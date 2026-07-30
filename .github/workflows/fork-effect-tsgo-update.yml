@@ -1,0 +1,94 @@
+# Opens a PR when a new @reintersect/effect-tsgo lands on npm.
+#
+# Polls the registry rather than being pushed to from the effect-tsgo repo. A repository_dispatch
+# from there would be the "proper" event-driven design, but it needs a cross-repo PAT stored as a
+# secret in both repos — a credential to mint, rotate and leak. The registry is the thing we
+# actually care about (a version nobody published is a version nobody can install), a poll costs
+# one HTTP request, and GITHUB_TOKEN is enough.
+name: fork · effect-tsgo update
+
+on:
+  schedule:
+    # Every 6 hours. GitHub drops scheduled runs on inactive forks after 60 days, so if this goes
+    # quiet, push anything to wake it.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve latest and pinned versions
+        id: v
+        run: |
+          set -euo pipefail
+          latest=$(npm view @reintersect/effect-tsgo version)
+          # The engine resolves the binary by package name at runtime, so the "pinned" version is
+          # whatever the language server's devDependency says. Absent means never pinned yet.
+          pinned=$(node -p "
+            const p = require('./packages/language-server/package.json');
+            (p.devDependencies?.['@reintersect/effect-tsgo']
+             ?? p.dependencies?.['@reintersect/effect-tsgo']
+             ?? '').replace(/^[^0-9]*/, '') || 'none'
+          ")
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "changed=$([ "$latest" != "$pinned" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+
+      - name: Pin the new version
+        if: steps.v.outputs.changed == 'yes'
+        run: |
+          node -e "
+            const fs = require('fs');
+            const f = 'packages/language-server/package.json';
+            const p = JSON.parse(fs.readFileSync(f, 'utf8'));
+            (p.devDependencies ??= {})['@reintersect/effect-tsgo'] = '^${{ steps.v.outputs.latest }}';
+            fs.writeFileSync(f, JSON.stringify(p, null, 4) + '\n');
+          "
+
+      - uses: pnpm/action-setup@v4
+        if: steps.v.outputs.changed == 'yes'
+      - uses: actions/setup-node@v4
+        if: steps.v.outputs.changed == 'yes'
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # The point of the PR is to find out whether the new tsgo still works, so the run has to
+      # actually exercise it. A red check here is the useful outcome, not a failure of the job.
+      - name: Install, build and test against it
+        if: steps.v.outputs.changed == 'yes'
+        continue-on-error: true
+        id: verify
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm --filter svelte2tsx build
+          pnpm --filter @reintersect/svelte-language-server build
+          pnpm --filter @reintersect/svelte-language-server test
+          cd packages/svelte-check && npx rollup -c && node test-sanity.js
+
+      - name: Open the PR
+        if: steps.v.outputs.changed == 'yes'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: fork/effect-tsgo-${{ steps.v.outputs.latest }}
+          base: tsgo-engine
+          title: 'chore: effect-tsgo ${{ steps.v.outputs.pinned }} → ${{ steps.v.outputs.latest }}'
+          commit-message: 'chore: bump @reintersect/effect-tsgo to ${{ steps.v.outputs.latest }}'
+          labels: dependencies, effect-tsgo
+          body: |
+            `@reintersect/effect-tsgo` went from `${{ steps.v.outputs.pinned }}` to
+            `${{ steps.v.outputs.latest }}`.
+
+            Build + tests against the new binary: **${{ steps.verify.outcome }}**
+
+            tsgo tracks TypeScript 7 nightlies, so the things most likely to break are the ones
+            this fork depends on that are not stable API: the undocumented `tsgo --lsp -stdio`
+            entry point, `custom/initializeAPISession`, and the `--pretty`/`--listFiles` output
+            shapes that `svelte-check --tsgo` parses. If the sanity tests went red, start there.

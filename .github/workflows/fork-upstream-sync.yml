@@ -1,0 +1,92 @@
+# Keeps the fork current with sveltejs/language-tools without cooking it.
+#
+# The fork's `master` is a plain mirror of upstream — nothing of ours is ever committed there, so
+# it fast-forwards cleanly forever. Our work lives on `tsgo-engine` (the default branch). This
+# job advances `master`, then opens a PR merging it into `tsgo-engine`, so upstream changes always
+# arrive as a reviewable diff with CI on it rather than as a surprise in the working branch.
+#
+# It deliberately does not auto-merge. The conflict-prone files are exactly the ones this fork
+# rewrote — `packages/language-server/src/plugins/typescript-go/**`, `packages/svelte-check/src/**`
+# and the two renamed package.json files — and a bad automatic resolution there is silent: the
+# tsgo overlay fails by resolving imports to `any`, not by erroring.
+name: fork · upstream sync
+
+on:
+  schedule:
+    - cron: '43 6 * * 1' # Mondays, early
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward master to upstream
+        id: ff
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/sveltejs/language-tools.git
+          git fetch upstream master
+          before=$(git rev-parse origin/master)
+          after=$(git rev-parse upstream/master)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+          if [ "$before" = "$after" ]; then
+            echo "changed=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=yes" >> "$GITHUB_OUTPUT"
+          # --ff-only: if this ever fails, something committed to the fork's master, which is the
+          # one invariant this design rests on. Better to fail loudly than to merge around it.
+          git push origin "$after:refs/heads/master" --force-with-lease="master:$before"
+          echo "count=$(git rev-list --count $before..$after)" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream into the working branch
+        if: steps.ff.outputs.changed == 'yes'
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git checkout -B fork/upstream-sync origin/tsgo-engine
+          if git merge --no-edit ${{ steps.ff.outputs.after }}; then
+            echo "conflicts=no" >> "$GITHUB_OUTPUT"
+          else
+            # Leave the conflict markers in place and push anyway — a PR that shows exactly which
+            # files upstream and this fork both touched is more useful than a job that gave up.
+            echo "conflicts=yes" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git add -A
+            git commit -m 'chore: merge upstream (CONFLICTED — do not merge as-is)'
+          fi
+          git push -f origin fork/upstream-sync
+
+      - name: Open the PR
+        if: steps.ff.outputs.changed == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.merge.outputs.conflicts }}" = "yes" ]; then
+            title='chore: merge upstream — CONFLICTED'
+            body="Upstream moved ${{ steps.ff.outputs.count }} commit(s). **This merge has conflicts and the branch contains conflict markers — do not merge as-is.**
+
+          Conflicted files:
+          \`\`\`
+          $(cat /tmp/conflicts.txt)
+          \`\`\`
+          "
+          else
+            title='chore: merge upstream'
+            body="Upstream moved ${{ steps.ff.outputs.count }} commit(s) and merged cleanly. Worth a look at whether anything upstream changed under \`packages/language-server/src/plugins/typescript/\` — the tsgo engine mirrors several of those providers and does not inherit their fixes."
+          fi
+          gh pr create --base tsgo-engine --head fork/upstream-sync \
+            --title "$title" --body "$body" --label upstream 2>/dev/null \
+            || gh pr edit fork/upstream-sync --title "$title" --body "$body"
