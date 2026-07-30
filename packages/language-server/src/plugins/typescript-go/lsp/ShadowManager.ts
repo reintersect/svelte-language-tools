@@ -1,6 +1,7 @@
 import { dirname, isAbsolute, join, relative, resolve } from 'path';
 import fs from 'fs';
 import ts from 'typescript';
+import { internalHelpers, InternalHelpers } from 'svelte2tsx';
 import { Document } from '../../../lib/documents';
 import { Logger } from '../../../logger';
 import { normalizePath } from '../../../utils';
@@ -8,17 +9,14 @@ import { DocumentSnapshot, SvelteDocumentSnapshot } from '../../typescript/Docum
 import { SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
 
 /**
- * Directory holding the only two things that must physically exist for the overlay to work:
- * the overlay tsconfig, and an empty directory skeleton mirroring the source tree.
+ * Directory each package gets for its generated twins, plus — in the package being checked —
+ * the overlay tsconfig.
  *
- * The generated `.tsx` shadows themselves are never written — tsgo accepts them via `didOpen`
- * and they participate fully in module resolution, *provided their parent directory exists on
- * disk*. That directory requirement is why the skeleton exists at all.
- *
- * Deliberately a dot-directory at the project root rather than somewhere under `node_modules`:
+ * A dot-directory at the package root, deliberately not somewhere under `node_modules`:
  * TypeScript treats anything inside `node_modules` as an external library source, and shadows
  * placed there fail to resolve ordinary dependencies (`Cannot find module 'runed'`). This
- * mirrors what `.svelte-kit` already does, so it is a familiar thing to see and to gitignore.
+ * mirrors what `.svelte-kit` already does, so it is a familiar thing to see and to gitignore —
+ * and it writes its own `.gitignore` regardless.
  */
 const OVERLAY_DIR = '.svelte-ls-overlay';
 const SHADOW_ROOT = 'svelte';
@@ -38,6 +36,22 @@ export interface ShadowManagerOptions {
     /** Absolute path to the user's tsconfig/jsconfig, if there is one. */
     tsconfigPath: string | undefined;
     snapshotOptions: SvelteSnapshotOptions;
+    /**
+     * When set, SvelteKit route/hook/param files get shadows too, carrying the type annotations
+     * that give `load({ params })` and friends their inferred parameter types. Without it those
+     * parameters are implicitly `any` and a strict project reports an error on every one.
+     *
+     * Optional because the shadow has to be *materialised* for this to work, which only the
+     * batch path does — an unwritten file named in `files` is TS6053.
+     */
+    kitFiles?: InternalHelpers.KitFilesSettings;
+}
+
+/** A SvelteKit file's generated twin, with what's needed to map positions back. */
+export interface KitShadow {
+    originalPath: string;
+    shadowPath: string;
+    addedCode: InternalHelpers.AddedCode[];
 }
 
 /**
@@ -60,12 +74,44 @@ export class ShadowManager {
      * lookup lands in the wrong place and silently falls back to `declare module '*.svelte'`.
      */
     private rootDirsLongestFirst: string[] = [];
+    /**
+     * The `.svelte` files the user's own tsconfig resolves to, as opposed to every `.svelte`
+     * file that needs a shadow. The two differ by a lot: shadows are written for the whole
+     * workspace and for dependencies, because anything the program can import has to resolve,
+     * while only this set is the project's own responsibility to report on.
+     */
+    private projectSvelteFiles: string[] = [];
+    private projectSvelteFileScan: string[] | undefined;
+    private dependencySvelteFileScan: string[] | undefined;
+    private owningPackages: string[] | undefined;
+    /** Kit shadows by original path, and the reverse lookup by shadow path. */
+    private readonly kitShadows = new Map<string, KitShadow>();
+    private readonly kitShadowsByShadowPath = new Map<string, KitShadow>();
+
+    /**
+     * Nearest directory at or above the project that has a package.json.
+     *
+     * Not the same as `projectPath`, which is wherever the tsconfig happens to live —
+     * `svelte-check --tsconfig ./.svelte-kit/tsconfig.json` is the documented way to check a
+     * SvelteKit project, and `.svelte-kit` has no package.json. Reading dependencies and subpath
+     * imports from there yields nothing at all, which shows up as every component from a
+     * dependency silently typing as `any`.
+     */
+    private readonly packageRoot: string;
+    /** Mirror directory per package root, and the package root per directory that feeds it. */
+    private readonly mirrorRoots = new Map<string, string>();
+    private readonly packageRootByDir = new Map<string, string>();
+    private readonly originalByShadowPath = new Map<string, string>();
 
     constructor(private readonly options: ShadowManagerOptions) {
         this.overlayPath = join(options.projectPath, OVERLAY_DIR);
-        this.shadowRoot = join(this.overlayPath, SHADOW_ROOT);
         this.overlayTsconfigPath = join(this.overlayPath, 'tsconfig.json');
         this.rootDirsLongestFirst = [normalizePath(options.sourceRoot)];
+        this.packageRoot = findPackageRoot(options.projectPath, options.sourceRoot);
+        // The project's own mirror. Named separately because it is the one the overlay tsconfig
+        // sits beside, and the one the LSP writes editor-open shadows into.
+        this.shadowRoot = normalizePath(join(this.packageRoot, OVERLAY_DIR, SHADOW_ROOT));
+        this.mirrorRoots.set(normalizePath(this.packageRoot), this.shadowRoot);
     }
 
     /** The rootDir a file resolves against: the longest one that contains it. */
@@ -80,35 +126,96 @@ export class ShadowManager {
     }
 
     /**
+     * The mirror a given file's shadow belongs in: one per package, inside that package.
+     *
+     * Two things about a module specifier depend on where the *importing file* physically sits,
+     * and both silently break if a component is type-checked from somewhere else:
+     *
+     * - **Bare specifiers** walk up looking for `node_modules`. A component in `packages/tiptap`
+     *   importing `@tiptap/suggestion` finds it in `packages/tiptap/node_modules`; from a mirror
+     *   under the app being checked, the walk reaches only the app's — which under pnpm holds
+     *   none of another package's dependencies. That alone was 239 `Cannot find module` errors
+     *   for packages that are installed and resolve perfectly well in the editor.
+     * - **Subpath imports** (`#lib/*`) resolve against the nearest package.json, which from a
+     *   foreign mirror is the app's, and it has never heard of `#lib`. Another 356.
+     *
+     * Putting each package's mirror *inside that package* makes both resolve natively, with no
+     * aliasing at all: the walk up from `<pkg>/.svelte-ls-overlay/svelte/...` reaches `<pkg>`
+     * before anything else. The alternative — declaring these in the overlay's `paths` — cannot
+     * work, because `paths` is one flat table for the whole project while `imports` is
+     * per-package, so a global `#*` on one package's behalf retargets every other package's.
+     */
+    private mirrorRootFor(filePath: string): string {
+        return this.mirrorRootIn(this.packageRootOf(filePath));
+    }
+
+    /** The mirror belonging to a package root, registering it the first time it is asked for. */
+    private mirrorRootIn(packageRoot: string): string {
+        packageRoot = normalizePath(packageRoot);
+        let mirror = this.mirrorRoots.get(packageRoot);
+        if (!mirror) {
+            mirror = normalizePath(join(packageRoot, OVERLAY_DIR, SHADOW_ROOT));
+            this.mirrorRoots.set(packageRoot, mirror);
+        }
+        return mirror;
+    }
+
+    private packageRootOf(filePath: string): string {
+        const dir = normalizePath(dirname(filePath));
+        let cached = this.packageRootByDir.get(dir);
+        if (!cached) {
+            cached = findPackageRoot(dir, this.options.sourceRoot);
+            this.packageRootByDir.set(dir, cached);
+        }
+        return cached;
+    }
+
+    /**
      * Where a `.svelte` file's generated twin lives.
      *
      * Deliberately *not* alongside the original: project selection in tsgo is decided purely by
      * the path of the opened file, so a shadow sitting in the user's own source tree would be
      * assigned to the user's tsconfig — where `.svelte` imports fall back to the ambient
-     * `declare module '*.svelte'` and every component's props degrade to `any`.
+     * `declare module '*.svelte'` and every component's props degrade to `any`. The path within
+     * the mirror is relative to the file's `rootDirs` entry, which is what lets a failed relative
+     * import bridge back to the real tree.
      */
     getShadowPath(svelteFilePath: string): string {
         const rel = relative(this.rootDirFor(svelteFilePath), svelteFilePath);
-        return normalizePath(join(this.shadowRoot, `${rel}.tsx`));
+        const shadowPath = normalizePath(join(this.mirrorRootFor(svelteFilePath), `${rel}.tsx`));
+        this.originalByShadowPath.set(shadowPath, normalizePath(svelteFilePath));
+        return shadowPath;
     }
 
     /** Inverse of {@link getShadowPath}. Returns undefined for paths that aren't shadows. */
     getOriginalPath(shadowPath: string): string | undefined {
         const normalized = normalizePath(shadowPath);
-        const root = normalizePath(this.shadowRoot);
-        if (!normalized.startsWith(root + '/') || !normalized.endsWith('.tsx')) {
+        const kit = this.kitShadowsByShadowPath.get(normalized);
+        if (kit) {
+            return kit.originalPath;
+        }
+        const known = this.originalByShadowPath.get(normalized);
+        if (known) {
+            return known;
+        }
+        if (!normalized.endsWith('.tsx')) {
             return undefined;
         }
-        const rel = normalized.slice(root.length + 1, -'.tsx'.length);
-        // Try each source root; the shadow tree is flat across them, so the first one that has
-        // the file on disk is the right owner.
-        for (const candidate of this.rootDirsLongestFirst) {
-            const guess = normalizePath(join(candidate, rel));
-            if (this.snapshots.has(guess) || fs.existsSync(guess)) {
-                return guess;
+        // Not seen this run — a shadow left over from a previous one, or a path arriving from
+        // the client. Work it back out from whichever mirror contains it.
+        for (const mirror of this.mirrorRoots.values()) {
+            if (!normalized.startsWith(mirror + '/')) {
+                continue;
+            }
+            const rel = normalized.slice(mirror.length + 1, -'.tsx'.length);
+            for (const candidate of this.rootDirsLongestFirst) {
+                const guess = normalizePath(join(candidate, rel));
+                if (this.snapshots.has(guess) || fs.existsSync(guess)) {
+                    return guess;
+                }
             }
         }
-        return normalizePath(join(this.options.sourceRoot, rel));
+        return undefined;
     }
 
     getSnapshot(svelteFilePath: string): SvelteDocumentSnapshot | undefined {
@@ -160,6 +267,18 @@ export class ShadowManager {
     }
 
     /**
+     * Drop every cached snapshot.
+     *
+     * For a batch check the cache is a liability rather than a help: transforming a whole
+     * monorepo populates one entry per file and each holds generated text plus decoded mappings,
+     * none of which is needed again unless the compiler reports something on that file.
+     * Re-transforming those few costs about a millisecond each.
+     */
+    clearSnapshots() {
+        this.snapshots.clear();
+    }
+
+    /**
      * Write a shadow to disk.
      *
      * Shadows *can* be delivered purely as `didOpen` overlays — that was the original design,
@@ -200,12 +319,12 @@ export class ShadowManager {
             }
             for (const entry of entries) {
                 const full = join(dir, entry.name);
+                if (entry.isSymbolicLink()) {
+                    continue;
+                }
                 if (entry.isDirectory()) {
                     walk(full);
-                } else if (
-                    entry.name.endsWith('.tsx') &&
-                    !liveShadowPaths.has(normalizePath(full))
-                ) {
+                } else if (!liveShadowPaths.has(normalizePath(full))) {
                     try {
                         fs.unlinkSync(full);
                     } catch {
@@ -214,7 +333,9 @@ export class ShadowManager {
                 }
             }
         };
-        walk(this.shadowRoot);
+        for (const mirror of this.mirrorRoots.values()) {
+            walk(mirror);
+        }
     }
 
     /**
@@ -245,13 +366,13 @@ export class ShadowManager {
      * allowArbitraryExtensions resolve `./Foo.svelte` straight to the `.tsx`.
      */
     writeOverlayTsconfig(shimFiles: string[]) {
-        fs.mkdirSync(this.shadowRoot, { recursive: true });
-        // Self-ignoring, so no project has to remember to add this to its own .gitignore.
-        try {
-            fs.writeFileSync(join(this.overlayPath, '.gitignore'), '*\n');
-        } catch {
-            // Not being able to write the ignore file is not worth failing over.
+        fs.mkdirSync(this.overlayPath, { recursive: true });
+        // Discovering the mirrors has to happen before the config is written, since every one of
+        // them is a rootDirs entry.
+        for (const packagePath of this.svelteOwningPackages()) {
+            this.ensureMirror(this.mirrorRootIn(packagePath));
         }
+        this.ensureMirror(this.shadowRoot);
 
         const base = this.parseBaseConfig();
 
@@ -267,7 +388,15 @@ export class ShadowManager {
                 // `rootDirs` must be *merged*, not replaced. SvelteKit's generated config
                 // declares its own (`["..", "./types"]`) and dropping those breaks `$app/types`
                 // and every route's `./$types` import.
-                rootDirs: [...base.rootDirs, this.options.sourceRoot, this.shadowRoot]
+                // Each mirror is paired with the real tree by the same relative path, so a
+                // failed relative import inside a shadow bridges straight back. Base entries
+                // come first: SvelteKit declares its own (`["..", "./types"]`) and a route's
+                // `./$types` has to reach `.svelte-kit/types` before anything else is tried.
+                rootDirs: [
+                    ...base.rootDirs,
+                    this.options.sourceRoot,
+                    ...new Set(this.mirrorRoots.values())
+                ]
             },
             // `files` carries the base's resolved file list with each .svelte entry replaced
             // by its shadow. Deliberately no `include` glob over the shadow root: in a monorepo
@@ -279,27 +408,18 @@ export class ShadowManager {
             files: [...base.fileNames, ...shimFiles]
         };
 
-        // Node subpath imports (`#lib/*`) resolve through package.json's `imports` field, which
-        // `rootDirs` has no effect on — so `#lib/x.svelte` bypasses the shadow tree entirely and
-        // lands on svelte's ambient `declare module '*.svelte'`, silently typing the component
-        // `any`. Barrel files re-exporting named members from a component are the usual casualty.
-        // Only emitted when there is something to add, and merged with the base's own paths:
-        // like `include` and `rootDirs`, a derived config's `paths` REPLACES the base's, and
-        // dropping SvelteKit's `$lib`/`$app` mappings breaks the project outright.
-        const subpathPaths = this.subpathImportPaths();
-        if (Object.keys(subpathPaths).length) {
-            // The base's path values are relative to the config that declared them, and would
-            // otherwise be re-interpreted relative to this one. `baseUrl` would express that,
-            // but TypeScript 7 removed it (TS5102), so the values are made absolute instead.
-            const inherited: Record<string, string[]> = {};
-            for (const [pattern, targets] of Object.entries(base.paths)) {
-                inherited[pattern] = targets.map((target) =>
-                    base.pathsBasePath && !isAbsolute(target)
-                        ? normalizePath(resolve(base.pathsBasePath, target))
-                        : target
-                );
-            }
-            config.compilerOptions.paths = { ...inherited, ...subpathPaths };
+        // `rootDirs` only ever rescues a *relative* specifier that failed to resolve. An alias —
+        // `$lib/Foo.svelte`, `#lib/Foo.svelte` — is resolved through `paths` or through
+        // package.json's `imports` field instead, never reaches the rootDirs fallback, and so
+        // bypasses the shadow tree entirely. Svelte's ambient `declare module '*.svelte'` then
+        // absorbs the failure and the component types as `SvelteComponent<Record<string, any>>`
+        // with no error of any kind. `$lib` being the canonical SvelteKit import, that alone is
+        // enough to silently disable prop checking across an entire project.
+        //
+        // So every alias gets a shadow-tree target ahead of its real one.
+        const paths = this.overlayPaths(base);
+        if (Object.keys(paths).length) {
+            config.compilerOptions.paths = paths;
         }
 
         if (this.options.tsconfigPath) {
@@ -322,33 +442,200 @@ export class ShadowManager {
     }
 
     /**
-     * `paths` entries mirroring the project package.json's `imports` field, each resolving to
-     * the shadow tree first and the real tree second.
+     * The overlay's `paths`: every alias the project already had, each pointing at the shadow
+     * tree before it points at the real one, plus the project's package.json `imports`.
+     *
+     * This has to carry the base config's own mappings verbatim as well, because — like
+     * `include` and `rootDirs` — a derived config's `paths` REPLACES the base's rather than
+     * merging with it. Dropping SvelteKit's `$lib`/`$app`/`$env` entries breaks the project
+     * outright, which at least fails loudly; getting the rewriting wrong does not.
      */
-    private subpathImportPaths(): Record<string, string[]> {
+    private overlayPaths(base: {
+        paths: Record<string, string[]>;
+        pathsBasePath: string | undefined;
+    }): Record<string, string[]> {
         const paths: Record<string, string[]> = {};
-        let pkg: any;
-        try {
-            pkg = JSON.parse(
-                fs.readFileSync(join(this.options.projectPath, 'package.json'), 'utf8')
-            );
-        } catch {
-            return paths;
+
+        // The base's own mappings, carried over untouched apart from being made absolute: they
+        // are relative to whichever config declared them and would otherwise be re-read relative
+        // to this one. `baseUrl` used to express that, but TypeScript 7 removed it (TS5102).
+        for (const [pattern, targets] of Object.entries(base.paths)) {
+            const expanded: string[] = [];
+            for (const target of targets) {
+                const absolute =
+                    base.pathsBasePath && !isAbsolute(target)
+                        ? normalizePath(resolve(base.pathsBasePath, target))
+                        : target;
+                // The mirror first, so `$lib/Foo.svelte` finds the shadow; the real path after,
+                // so everything else resolves as it always did. Extending the pattern the
+                // project already has, rather than adding a `.svelte`-specific sibling, because
+                // TypeScript breaks ties between patterns on *prefix* length alone — `$lib/*`
+                // and `$lib/*.svelte` tie, and the winner is then whichever was declared first.
+                const shadowed = this.shadowEquivalent(absolute);
+                if (shadowed) {
+                    expanded.push(shadowed);
+                }
+                expanded.push(absolute);
+            }
+            paths[pattern] = expanded;
         }
 
-        for (const [pattern, target] of Object.entries(pkg.imports ?? {})) {
-            // Conditional exports can nest; take the first string we find.
-            const resolved = firstStringTarget(target);
-            if (!resolved?.startsWith('./')) {
+        // A package's own `.ts` files import its components through its subpath imports too —
+        // a barrel doing `import GroupLabel from '#lib/.../label.svelte'` sits at its real
+        // location, resolves `#lib` against its real package.json, and lands on the real
+        // `.svelte` file, which is not something TypeScript can read. Subpath imports get no
+        // `rootDirs` fallback, so without an entry here that import quietly becomes `any` and
+        // takes the component's whole props type with it.
+        //
+        // Only the `.svelte`-suffixed form is injected; see {@link addSvelteVariant}. Everything
+        // else resolves natively, because each mirror sits inside the package it mirrors.
+        for (const packagePath of this.svelteOwningPackages()) {
+            let pkg: any;
+            try {
+                pkg = JSON.parse(fs.readFileSync(join(packagePath, 'package.json'), 'utf8'));
+            } catch {
                 continue;
             }
-            const real = normalizePath(join(this.options.projectPath, resolved.slice(2)));
-            const shadowed = normalizePath(
-                join(this.shadowRoot, relative(this.rootDirFor(real), real))
-            );
-            paths[pattern] = [shadowed, real];
+            for (const [pattern, target] of Object.entries(pkg.imports ?? {})) {
+                const resolved = firstStringTarget(target);
+                if (resolved?.startsWith('./')) {
+                    this.addSvelteVariant(paths, pattern, [
+                        normalizePath(join(packagePath, resolved.slice(2)))
+                    ]);
+                }
+            }
         }
+
         return paths;
+    }
+
+    /**
+     * Add a `.svelte`-only sibling of an alias pattern, resolving to the shadow tree.
+     *
+     * Restricting the injected entry to specifiers that end in `.svelte` is what keeps this from
+     * doing damage. `paths` is a single flat table for the whole project, while package.json
+     * `imports` is per-package — so injecting a bare `#*` on one package's behalf silently
+     * retargets every *other* package's `#*` at it, and TypeScript reports the resulting
+     * wrong-module errors as missing exports. A pattern like `#*.svelte` cannot match anything
+     * but a component import, so every other specifier keeps resolving exactly as it did.
+     *
+     * The real path is repeated as a fallback because TypeScript commits to one pattern and does
+     * not reconsider: a target list that misses means the ambient `declare module '*.svelte'`
+     * takes over, silently.
+     *
+     * This is only safe where no bare form of the same pattern is also emitted. Ties between
+     * patterns are broken on prefix length alone, so `#lib/*` and `#lib/*.svelte` would tie and
+     * the winner would be whichever happened to be declared first.
+     */
+    private addSvelteVariant(paths: Record<string, string[]>, pattern: string, targets: string[]) {
+        if (!pattern.includes('*')) {
+            return;
+        }
+        const svelteTargets: string[] = [];
+        for (const target of targets) {
+            if (!target.includes('*')) {
+                continue;
+            }
+            const shadowed = this.shadowEquivalent(target);
+            if (shadowed) {
+                svelteTargets.push(`${shadowed}.svelte`);
+            }
+            svelteTargets.push(`${target}.svelte`);
+        }
+        if (!svelteTargets.length) {
+            return;
+        }
+        const key = `${pattern}.svelte`;
+        // Two packages can define the same pattern (`#lib/*` is popular). Both target sets go in
+        // and TypeScript takes the first that exists on disk.
+        paths[key] = [...(paths[key] ?? []), ...svelteTargets];
+    }
+
+    /**
+     * Create a mirror directory and mark it ignored.
+     *
+     * Deliberately nothing else: no package.json, no links. The mirror sits inside the package
+     * it mirrors, so the upward walk for `node_modules` and for the nearest package.json passes
+     * straight through it and lands on the real ones.
+     */
+    private ensureMirror(mirrorRoot: string) {
+        try {
+            fs.mkdirSync(mirrorRoot, { recursive: true });
+            // Self-ignoring, so no package has to remember to add this to its own .gitignore.
+            const ignore = join(dirname(mirrorRoot), '.gitignore');
+            if (!fs.existsSync(ignore)) {
+                fs.writeFileSync(ignore, '*\n');
+            }
+        } catch (e) {
+            Logger.debug(`[tsgo] could not create mirror ${mirrorRoot}`, e);
+        }
+    }
+
+    /**
+     * Packages that own at least one of the `.svelte` files being shadowed, nearest package.json
+     * first, with the project itself always included.
+     *
+     * These are the packages whose subpath imports have to be mirrored. A component's `#lib/*`
+     * import normally resolves against the package.json above it on disk — but its shadow lives
+     * in this project's overlay tree, where the package.json above it is *this* project's, so
+     * the import resolves to nothing and the ambient `declare module '*.svelte'` swallows it.
+     *
+     * Deliberately restricted to packages that actually contribute components rather than every
+     * package.json in the workspace: a monorepo where nine packages each define `#*` differently
+     * would otherwise turn one flat `paths` table into a lottery.
+     */
+    private svelteOwningPackages(): string[] {
+        if (this.owningPackages) {
+            return this.owningPackages;
+        }
+        const roots = new Set<string>([normalizePath(this.packageRoot)]);
+        const sourceRoot = normalizePath(this.options.sourceRoot);
+        const seenDirs = new Set<string>();
+
+        // Dependencies count too. A library shipping a raw `.svelte` file needs its shadow in a
+        // mirror of its own, and that mirror only takes part in resolution if it is a `rootDirs`
+        // entry — which means discovering it before the config is written, not while shadows are
+        // being materialised afterwards.
+        for (const filePath of [
+            ...this.findProjectSvelteFiles(),
+            ...this.findDependencySvelteFiles()
+        ]) {
+            let dir = dirname(filePath);
+            while (dir.length >= sourceRoot.length && !seenDirs.has(dir)) {
+                seenDirs.add(dir);
+                if (fs.existsSync(join(dir, 'package.json'))) {
+                    roots.add(normalizePath(dir));
+                    break;
+                }
+                const parent = dirname(dir);
+                if (parent === dir) {
+                    break;
+                }
+                dir = parent;
+            }
+        }
+        this.owningPackages = [...roots];
+        return this.owningPackages;
+    }
+
+    /**
+     * Where an aliased path would live in the shadow tree, or undefined when it points outside
+     * every source root and so has no shadow. Wildcards survive: this is plain path arithmetic,
+     * so `<root>/src/lib/*` maps to `<shadowRoot>/src/lib/*`.
+     */
+    private shadowEquivalent(absolutePath: string): string | undefined {
+        if (!isAbsolute(absolutePath)) {
+            return undefined;
+        }
+        const normalized = normalizePath(absolutePath);
+        if (normalized.includes(`/${OVERLAY_DIR}/`)) {
+            return undefined;
+        }
+        const rel = relative(this.rootDirFor(normalized), normalized);
+        if (rel.startsWith('..')) {
+            return undefined;
+        }
+        return normalizePath(join(this.mirrorRootFor(normalized), rel));
     }
 
     /**
@@ -409,9 +696,18 @@ export class ShadowManager {
             // otherwise fall outside the project entirely — landing in an inferred project
             // where the svelte2tsx shims, `jsx` and `rootDirs` all stop applying, which shows
             // up as "Cannot find name 'svelteHTML'" on every such file.
-            const fileNames = parsed.fileNames.map((f) =>
-                f.endsWith('.svelte') ? this.getShadowPath(normalizePath(f)) : normalizePath(f)
-            );
+            // Kit shadows are written here rather than later because the file list has to name
+            // them, and only the transform knows which files actually produced one.
+            const fileNames = parsed.fileNames.map((f) => {
+                const normalized = normalizePath(f);
+                return f.endsWith('.svelte')
+                    ? this.getShadowPath(normalized)
+                    : (this.writeKitShadow(normalized) ?? normalized);
+            });
+
+            this.projectSvelteFiles = parsed.fileNames
+                .filter((f) => f.endsWith('.svelte'))
+                .map((f) => normalizePath(f));
 
             return {
                 rootDirs,
@@ -438,6 +734,9 @@ export class ShadowManager {
      * ~2000 rather than all of them.
      */
     findDependencySvelteFiles(): string[] {
+        if (this.dependencySvelteFileScan) {
+            return this.dependencySvelteFileScan;
+        }
         const found: string[] = [];
         const seen = new Set<string>();
 
@@ -472,6 +771,7 @@ export class ShadowManager {
             };
             walk(packageRoot, 0);
         }
+        this.dependencySvelteFileScan = found;
         return found;
     }
 
@@ -479,9 +779,7 @@ export class ShadowManager {
     private dependencyRoots(): string[] {
         let pkg: any;
         try {
-            pkg = JSON.parse(
-                fs.readFileSync(join(this.options.projectPath, 'package.json'), 'utf8')
-            );
+            pkg = JSON.parse(fs.readFileSync(join(this.packageRoot, 'package.json'), 'utf8'));
         } catch {
             return [];
         }
@@ -494,7 +792,7 @@ export class ShadowManager {
         for (const name of names) {
             try {
                 const manifest = require.resolve(`${name}/package.json`, {
-                    paths: [this.options.projectPath]
+                    paths: [this.packageRoot]
                 });
                 roots.push(dirname(manifest));
             } catch {
@@ -505,8 +803,92 @@ export class ShadowManager {
         return roots;
     }
 
-    /** Every `.svelte` file in the project, which all need eagerly-opened shadows. */
+    /**
+     * The `.svelte` files the user's tsconfig actually pulls in — the set a whole-project check
+     * is answerable for. Only meaningful once {@link writeOverlayTsconfig} has run, since that
+     * is what resolves the base config.
+     */
+    getProjectSvelteFileNames(): string[] {
+        return this.projectSvelteFiles;
+    }
+
+    /** The kit shadow standing in for a generated path, if that path is one. */
+    getKitShadowByShadowPath(shadowPath: string): KitShadow | undefined {
+        return this.kitShadowsByShadowPath.get(normalizePath(shadowPath));
+    }
+
+    /** Whether a real file has been replaced by a kit shadow in this project. */
+    hasKitShadow(filePath: string): boolean {
+        return this.kitShadows.has(normalizePath(filePath));
+    }
+
+    /** Paths of all kit shadows written so far, so pruning doesn't delete them. */
+    getKitShadowPaths(): string[] {
+        return [...this.kitShadowsByShadowPath.keys()];
+    }
+
+    /**
+     * Transform a SvelteKit route, hook or params file into its shadow and write it, returning
+     * the shadow's path — or undefined when the file needs no transformation.
+     *
+     * SvelteKit's "zero-effort types" work by the language tooling *rewriting* these files:
+     * `export function load({ params })` gets a `satisfies` annotation naming the generated
+     * `./$types`, which is what gives `params` a type at all. A project checked without that
+     * rewriting reports an implicit-`any` error on every destructured argument of every load
+     * function and request handler — errors that do not exist in the user's editor and cannot be
+     * fixed in their source.
+     */
+    private writeKitShadow(filePath: string): string | undefined {
+        const kitFiles = this.options.kitFiles;
+        if (!kitFiles || !internalHelpers.isKitFile(filePath, kitFiles)) {
+            return undefined;
+        }
+
+        let text: string;
+        try {
+            text = fs.readFileSync(filePath, 'utf8');
+        } catch {
+            return undefined;
+        }
+
+        const result = internalHelpers.upsertKitFile(ts, filePath, kitFiles, () =>
+            ts.createSourceFile(
+                filePath,
+                text,
+                ts.ScriptTarget.Latest,
+                true,
+                filePath.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS
+            )
+        );
+        // A file that matches the naming convention but exports nothing Kit cares about.
+        if (!result) {
+            return undefined;
+        }
+
+        // Same layout as a `.svelte` shadow, minus the added extension — the name has to stay
+        // `+page.ts` because `upsertKitFile` keys its behaviour off the basename.
+        const shadowPath = normalizePath(
+            join(this.mirrorRootFor(filePath), relative(this.rootDirFor(filePath), filePath))
+        );
+        this.writeShadow(shadowPath, result.text);
+
+        const entry: KitShadow = {
+            originalPath: normalizePath(filePath),
+            shadowPath,
+            addedCode: result.addedCode
+        };
+        this.kitShadows.set(entry.originalPath, entry);
+        this.kitShadowsByShadowPath.set(shadowPath, entry);
+        return shadowPath;
+    }
+
+    /** Every `.svelte` file under the source root, which all need shadows. */
     findProjectSvelteFiles(): string[] {
+        // Memoised: the overlay config needs this list to work out which packages' subpath
+        // imports to mirror, and the caller needs it again to write the shadows.
+        if (this.projectSvelteFileScan) {
+            return this.projectSvelteFileScan;
+        }
         const found: string[] = [];
         const excluded = new Set(['node_modules', '.git', '.svelte-kit', 'dist', 'build']);
         const walk = (dir: string, depth: number) => {
@@ -534,7 +916,24 @@ export class ShadowManager {
             }
         };
         walk(this.options.sourceRoot, 0);
+        this.projectSvelteFileScan = found;
         return found;
+    }
+}
+
+/** Nearest ancestor of `from` (inclusive) holding a package.json, bounded by `stopAt`. */
+function findPackageRoot(from: string, stopAt: string): string {
+    let current = normalizePath(from);
+    const boundary = normalizePath(stopAt);
+    for (;;) {
+        if (fs.existsSync(join(current, 'package.json'))) {
+            return current;
+        }
+        const parent = dirname(current);
+        if (parent === current || current === boundary) {
+            return normalizePath(from);
+        }
+        current = parent;
     }
 }
 

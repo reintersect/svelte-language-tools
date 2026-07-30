@@ -44,14 +44,10 @@ export function parseOptions(cb: (opts: SvelteCheckCliOptions) => any) {
         )
         .option(
             '--tsgo',
-            'Use tsgo for TypeScript diagnostics. Requires writing transpiled Svelte files to disk (.svelte-kit if available, else .svelte-check)',
+            'Use tsgo for TypeScript diagnostics, through the same overlay the language server uses. Requires a tsconfig/jsconfig and writes transpiled Svelte files to a .svelte-ls-overlay directory in each package that has components',
             false
         )
-        .option(
-            '--tsgo-experimental-api',
-            'Use tsgo for TypeScript diagnostics with the experimental API. Cannot be used with --incremental. Experimental feature, might break without warning.',
-            false
-        )
+        .option('--tsgo-experimental-api', 'Deprecated alias for --tsgo.', false)
         .option(
             '--tsconfig',
             'Pass a path to a tsconfig or jsconfig file. The path can be relative to the workspace path or absolute. Doing this means that only files matched by the files/include/exclude pattern of the config file are diagnosed. It also means that errors from TypeScript and JavaScript files are reported. When not given, searches for the next upper tsconfig/jsconfig in the workspace path.'

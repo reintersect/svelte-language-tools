@@ -25,12 +25,7 @@ import {
     writeOverlayTsconfig
 } from './incremental';
 import { createIgnored, findFiles } from './utils';
-import {
-    formatTsGoNotFoundError,
-    tryLoadApi as tryLoadTsApi,
-    tryLoadAst as tryLoadTsAst,
-    tryParseTsGoVersion
-} from './tsgo';
+import { runTsGoCheck } from './tsgo-overlay';
 
 type Result = {
     fileCount: number;
@@ -441,12 +436,24 @@ async function getSvelteDiagnosticsForIncremental(
     };
 }
 
+/**
+ * `--tsgo`: check the whole project through the language server's tsgo overlay.
+ *
+ * Separate from {@link runWithVirtualFiles}, which is the `--incremental` (tsc) path. They used
+ * to share an overlay; they no longer do, because the tsgo one has to solve module resolution
+ * problems tsc does not have — see `tsgo-overlay.ts`.
+ */
+async function runWithTsGo(opts: SvelteCheckCliOptions, writer: Writer): Promise<Result | null> {
+    const diagnostics = await runTsGoCheck(opts);
+    return writeDiagnostics(opts.workspaceUri, writer, diagnostics);
+}
+
 async function runWithVirtualFiles(
     opts: SvelteCheckCliOptions,
     writer: Writer
 ): Promise<Result | null> {
     if (!opts.tsconfig) {
-        throw new Error('`--incremental` / `--tsgo` requires a tsconfig/jsconfig file');
+        throw new Error('`--incremental` requires a tsconfig/jsconfig file');
     }
 
     const emitResult = await emitSvelteFiles(
@@ -455,19 +462,9 @@ async function runWithVirtualFiles(
         opts.incremental,
         opts.config
     );
-    const overlayTsconfig = writeOverlayTsconfig(
-        opts.tsconfig,
-        emitResult,
-        opts.incremental,
-        opts.tsgo
-    );
+    const overlayTsconfig = writeOverlayTsconfig(opts.tsconfig, emitResult, opts.incremental);
     const tsDiagnostics = mapCliDiagnosticsToLsp(
-        await runTypeScriptDiagnostics(
-            overlayTsconfig,
-            opts.tsgo,
-            opts.incremental,
-            opts.workspaceUri.fsPath
-        ),
+        await runTypeScriptDiagnostics(overlayTsconfig, opts.incremental, opts.workspaceUri.fsPath),
         emitResult,
         opts.tsconfig
     );
@@ -509,7 +506,11 @@ async function runWithVirtualFiles(
     return writeDiagnostics(opts.workspaceUri, writer, Array.from(diagnosticsByFile.values()));
 }
 
-async function watchWithVirtualFiles(opts: SvelteCheckCliOptions, writer: Writer) {
+async function watchWithVirtualFiles(
+    opts: SvelteCheckCliOptions,
+    writer: Writer,
+    runOnce: (opts: SvelteCheckCliOptions, writer: Writer) => Promise<Result | null>
+) {
     let pending: NodeJS.Timeout | undefined;
     let running = false;
     let rerun = false;
@@ -522,7 +523,7 @@ async function watchWithVirtualFiles(opts: SvelteCheckCliOptions, writer: Writer
         }
         running = true;
         try {
-            await runWithVirtualFiles(opts, writer);
+            await runOnce(opts, writer);
         } catch (err: any) {
             writer.failure(err);
         } finally {
@@ -597,50 +598,25 @@ parseOptions(async (opts) => {
             watch: opts.watch
         };
 
-        if (opts.tsgoExperimental) {
-            if (!opts.tsconfig) {
-                throw new Error('--tsgo-experimental-api requires a tsconfig/jsconfig file');
-            }
-            if (opts.incremental) {
-                throw new Error('--tsgo-experimental-api cannot be used with --incremental');
-            }
-            const pkg = tryParseTsGoVersion(opts.tsconfig);
-            if (!pkg) {
-                throw new Error(formatTsGoNotFoundError('--tsgo-experimental-api'));
-            }
-
-            const minPre7_0Nightly = 'dev.20260614.1';
-            if (
-                pkg.major === 7 &&
-                pkg.minor === 0 &&
-                pkg.patch === 0 &&
-                pkg.preRelease?.includes('dev')
-            ) {
-                // ex: 7.0.0-dev.20260518.1
-                if (pkg.preRelease.localeCompare(minPre7_0Nightly) < 0) {
-                    throw new Error(
-                        'Unsupported @typescript/native-preview version. Please upgrade to at least 7.0.0-' +
-                            minPre7_0Nightly
-                    );
-                }
-            }
-
-            const apiModule = await tryLoadTsApi(opts.tsconfig, pkg);
-            const astModule = await tryLoadTsAst(opts.tsconfig, pkg);
-            if (!apiModule || !astModule) {
-                throw new Error(
-                    `Unsupported ${pkg.pkgJsonName} version. Please ensure you have the latest version installed.` +
-                        'If the problem persists, please report an issue in https://github.com/sveltejs/language-tools/issues.'
-                );
-            }
-            svelteCheckOptions.experimental = { tsgo: { apiModule, astModule } };
+        // `--tsgo-experimental-api` used to drive tsgo through its in-process API with an
+        // overlay of its own, which mis-resolved `.svelte` imports and reported 41 phantom
+        // errors on a package the classic engine finds clean. It now means `--tsgo`.
+        const useTsGo = opts.tsgo || opts.tsgoExperimental;
+        if (opts.tsgoExperimental && !opts.tsgo) {
+            console.warn(
+                '`--tsgo-experimental-api` is deprecated and now behaves exactly like `--tsgo`.'
+            );
+        }
+        if (useTsGo && !opts.tsconfig) {
+            throw new Error('`--tsgo` requires a tsconfig/jsconfig file');
         }
 
-        const useVirtualFiles = opts.incremental || opts.tsgo;
+        const runOnce = useTsGo ? runWithTsGo : runWithVirtualFiles;
+        const useVirtualFiles = opts.incremental || useTsGo;
         if (useVirtualFiles && opts.watch) {
-            await watchWithVirtualFiles(opts, writer);
+            await watchWithVirtualFiles(opts, writer, runOnce);
         } else if (useVirtualFiles) {
-            const result = await runWithVirtualFiles(opts, writer);
+            const result = await runOnce(opts, writer);
             const exitCode =
                 result &&
                 result.errorCount === 0 &&

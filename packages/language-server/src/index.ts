@@ -7,3 +7,9 @@ export {
     SvelteCheckDiagnosticSource,
     SvelteCheckOptions
 } from './svelte-check';
+export {
+    TsGoBatchOverlay,
+    FileDiagnostics,
+    GeneratedDiagnostic,
+    TsGoBatchOverlayOptions
+} from './plugins/typescript-go/lsp';

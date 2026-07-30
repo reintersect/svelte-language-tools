@@ -26,6 +26,12 @@ export {
     findProjectTsconfig,
     findWorkspaceRoot
 } from './ShadowManager';
+export {
+    TsGoBatchOverlay,
+    FileDiagnostics,
+    GeneratedDiagnostic,
+    TsGoBatchOverlayOptions
+} from './BatchOverlay';
 
 /**
  * Feature flag for the tsgo engine.

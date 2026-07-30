@@ -13,7 +13,6 @@ import {
 } from 'svelte-language-server';
 import { loadConfig } from '@sveltejs/load-config';
 import { findFiles } from './utils';
-import { formatTsGoNotFoundError, tryParseTsGoVersion } from './tsgo';
 
 type ManifestEntry = {
     sourcePath: string;
@@ -356,14 +355,12 @@ export async function emitSvelteFiles(
  * @param tsconfigPath - Path to the project's original tsconfig.json
  * @param emitResult - Result from emitSvelteFiles containing cache directory paths
  * @param incremental - Whether to enable TypeScript incremental compilation
- * @param useTsgo - Whether to configure for tsgo
  * @returns Path to the generated overlay tsconfig.json
  */
 export function writeOverlayTsconfig(
     tsconfigPath: string,
     emitResult: EmitResult,
-    incremental: boolean,
-    useTsgo: boolean
+    incremental: boolean
 ): string {
     const cacheDir = emitResult.cacheDir;
     const overlayPath = path.join(cacheDir, 'tsconfig.json');
@@ -424,7 +421,7 @@ export function writeOverlayTsconfig(
         path: toRelativePosix(overlayDir, path.resolve(tsconfigDir, ref.path))
     }));
 
-    const rebasedPaths = rebasePathsConfig(parsed.options, tsconfigDir, overlayDir, useTsgo);
+    const rebasedPaths = rebasePathsConfig(parsed.options, tsconfigDir, overlayDir);
 
     const overlay = {
         extends: toRelativePosix(overlayDir, tsconfigPath),
@@ -447,22 +444,22 @@ export function writeOverlayTsconfig(
 }
 
 /**
- * Spawns a TypeScript compiler process (tsc or tsgo) to perform type-checking
- * and collects the diagnostics from its output.
+ * Spawns `tsc` to perform type-checking and collects the diagnostics from its output.
+ *
+ * tsgo has its own path — see `tsgo-overlay.ts` — because it needs a different overlay, not
+ * just a different binary.
  *
  * @param tsconfigPath - Path to the tsconfig.json to use for compilation
- * @param useTsgo - When true, uses the experimental native TypeScript compiler (tsgo)
  * @param incremental - Whether to enable incremental compilation for faster subsequent runs
  * @param cwd - Working directory for the TypeScript compiler process
  * @returns Parsed diagnostics containing file paths, positions, severity, and messages
  */
 export function runTypeScriptDiagnostics(
     tsconfigPath: string,
-    useTsgo: boolean,
     incremental: boolean,
     cwd: string
 ): Promise<ParsedDiagnostic[]> {
-    const binPath = useTsgo ? getTsGoBinPath(tsconfigPath) : require.resolve('typescript/bin/tsc');
+    const binPath = require.resolve('typescript/bin/tsc');
 
     if (!binPath || !fs.existsSync(binPath) || !fs.statSync(binPath).isFile()) {
         throw new Error('Failed to locate TypeScript command-line executable.');
@@ -511,18 +508,6 @@ export function runTypeScriptDiagnostics(
             }
         });
     });
-}
-
-function getTsGoBinPath(tsconfigPath: string): string | undefined {
-    const pkg = tryParseTsGoVersion(tsconfigPath);
-    if (!pkg) {
-        throw new Error(formatTsGoNotFoundError('--tsgo'));
-    }
-
-    const binPathRelative =
-        pkg.bin[pkg.pkgJsonName === '@typescript/native-preview' ? 'tsgo' : 'tsc'];
-
-    return binPathRelative ? path.join(path.dirname(pkg.path), binPathRelative) : undefined;
 }
 
 /**
@@ -693,7 +678,7 @@ function stripAnsi(str: string): string {
  * @param baseDir - Base directory for resolving relative file paths
  * @returns Array of parsed diagnostics with absolute file paths and 0-based positions
  */
-function parseDiagnostics(output: string, baseDir: string): ParsedDiagnostic[] {
+export function parseDiagnostics(output: string, baseDir: string): ParsedDiagnostic[] {
     const clean = stripAnsi(output);
     const diagnostics: ParsedDiagnostic[] = [];
     const lines = clean.split(/\r?\n/);
@@ -918,8 +903,7 @@ function normalizeConfigSpecs(specs: unknown): string[] | undefined {
 function rebasePathsConfig(
     options: ts.CompilerOptions,
     tsconfigDir: string,
-    overlayDir: string,
-    useTsgo: boolean
+    overlayDir: string
 ): Record<string, string[]> | undefined {
     if (!options.paths) {
         return;
@@ -927,7 +911,7 @@ function rebasePathsConfig(
 
     const rebased: Record<string, string[]> = {};
     let pathsBaseDir = tsconfigDir;
-    let baseUrlAbsolute = useTsgo ? undefined : options.baseUrl;
+    let baseUrlAbsolute = options.baseUrl;
     if (baseUrlAbsolute != null) {
         // should already be absolute, just to be sure.
         if (!path.isAbsolute(baseUrlAbsolute)) {
