@@ -307,6 +307,16 @@ export class TsGoPlugin implements Plugin {
         this.stats.served++;
         const tMap = TIMING ? Date.now() : 0;
 
+        if (TIMING) {
+            // Severity 1=Error 2=Warning 3=Information 4=Hint. Anything above 2 is a suggestion:
+            // tsgo computed it and the squiggle path throws it away, so it is latency we are
+            // paying for output nobody reads.
+            for (const item of items) {
+                timing(`sev${item.severity ?? 0}`, 1);
+            }
+            timing('items', items.length);
+        }
+
         const generatedText = snapshot.getFullText();
 
         const mapped = items
@@ -1206,6 +1216,9 @@ function timing(phase: string, ms: number) {
     if (phase === 'total' && xs.length % 5 === 0) {
         const line = [...timings.entries()]
             .map(([name, values]) => {
+                if (name.startsWith('sev') || name === 'items') {
+                    return `${name}=${values.reduce((a, b) => a + b, 0)}`;
+                }
                 const sorted = [...values].sort((a, b) => a - b);
                 return `${name} ${sorted[Math.floor(sorted.length / 2)]}ms`;
             })
