@@ -1,73 +1,73 @@
 {
-  "label": "phase1-delays",
-  "project": "/Users/brunostjohn/Development/Projects/reintersect/apps/dashboard",
-  "file": "src/lib/components/composer/Composer.svelte",
-  "iterations": 20,
-  "coldStartMs": 6193,
-  "methods": {
-    "keystroke -> diagnostics": {
-      "n": 20,
-      "min": 1023.4,
-      "p50": 1039.1,
-      "p95": 1171.4,
-      "max": 1171.4,
-      "stdev": 35.1
-    },
-    "completion": {
-      "n": 20,
-      "min": 1.2,
-      "p50": 1.5,
-      "p95": 2.7,
-      "max": 2.7,
-      "stdev": 0.3
-    },
-    "hover": {
-      "n": 20,
-      "min": 83.3,
-      "p50": 86.7,
-      "p95": 134.8,
-      "max": 134.8,
-      "stdev": 11.1
-    },
-    "definition": {
-      "n": 20,
-      "min": 0.5,
-      "p50": 0.6,
-      "p95": 30.1,
-      "max": 30.1,
-      "stdev": 6.4
-    },
-    "semanticTokens/full": {
-      "n": 20,
-      "min": 6.5,
-      "p50": 7.2,
-      "p95": 10.8,
-      "max": 10.8,
-      "stdev": 1.2
-    },
-    "documentSymbol": {
-      "n": 20,
-      "min": 2.5,
-      "p50": 2.8,
-      "p95": 6.7,
-      "max": 6.7,
-      "stdev": 0.9
-    },
-    "codeAction": {
-      "n": 20,
-      "min": 0.3,
-      "p50": 0.4,
-      "p95": 0.6,
-      "max": 0.6,
-      "stdev": 0.1
-    },
-    "inlayHint": {
-      "n": 20,
-      "min": 0.1,
-      "p50": 0.1,
-      "p95": 0.2,
-      "max": 0.2,
-      "stdev": 0
+    "label": "phase1-delays",
+    "project": "<a ~800-component SvelteKit app in a pnpm monorepo>",
+    "file": "src/lib/components/composer/Composer.svelte",
+    "iterations": 20,
+    "coldStartMs": 6193,
+    "methods": {
+        "keystroke -> diagnostics": {
+            "n": 20,
+            "min": 1023.4,
+            "p50": 1039.1,
+            "p95": 1171.4,
+            "max": 1171.4,
+            "stdev": 35.1
+        },
+        "completion": {
+            "n": 20,
+            "min": 1.2,
+            "p50": 1.5,
+            "p95": 2.7,
+            "max": 2.7,
+            "stdev": 0.3
+        },
+        "hover": {
+            "n": 20,
+            "min": 83.3,
+            "p50": 86.7,
+            "p95": 134.8,
+            "max": 134.8,
+            "stdev": 11.1
+        },
+        "definition": {
+            "n": 20,
+            "min": 0.5,
+            "p50": 0.6,
+            "p95": 30.1,
+            "max": 30.1,
+            "stdev": 6.4
+        },
+        "semanticTokens/full": {
+            "n": 20,
+            "min": 6.5,
+            "p50": 7.2,
+            "p95": 10.8,
+            "max": 10.8,
+            "stdev": 1.2
+        },
+        "documentSymbol": {
+            "n": 20,
+            "min": 2.5,
+            "p50": 2.8,
+            "p95": 6.7,
+            "max": 6.7,
+            "stdev": 0.9
+        },
+        "codeAction": {
+            "n": 20,
+            "min": 0.3,
+            "p50": 0.4,
+            "p95": 0.6,
+            "max": 0.6,
+            "stdev": 0.1
+        },
+        "inlayHint": {
+            "n": 20,
+            "min": 0.1,
+            "p50": 0.1,
+            "p95": 0.2,
+            "max": 0.2,
+            "stdev": 0
+        }
     }
-  }
 }

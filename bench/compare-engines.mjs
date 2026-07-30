@@ -20,7 +20,7 @@ const argOf = (name, dflt) => {
     const i = args.indexOf(name);
     return i === -1 ? dflt : args[i + 1];
 };
-const PROJECT = path.resolve(argOf('--project', path.join(REPO, '../reintersect/apps/dashboard')));
+const PROJECT = path.resolve(argOf('--project', process.env.SVELTE_LS_BENCH_PROJECT ?? '.'));
 const MAX_FILES = Number(argOf('--files', 15));
 
 const uri = (p) => pathToFileURL(p).href;

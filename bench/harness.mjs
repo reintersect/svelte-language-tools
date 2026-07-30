@@ -9,7 +9,7 @@
 //   node bench/harness.mjs [--project <dir>] [--file <rel.svelte>] [--iterations N]
 //                          [--label NAME] [--json out.json] [--compare base.json]
 //
-// Defaults target ../reintersect/apps/dashboard, a ~800-component SvelteKit project.
+// Point --project at a real SvelteKit app; the numbers below came from a ~800-component one.
 import { LspClient, sleep } from './lsp-client.mjs';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
@@ -21,7 +21,7 @@ const SERVER = path.join(REPO, 'packages/language-server/bin/server.js');
 
 function parseArgs(argv) {
     const out = {
-        project: path.resolve(REPO, '../reintersect/apps/dashboard'),
+        project: process.env.SVELTE_LS_BENCH_PROJECT ?? '',
         file: 'src/lib/components/composer/Composer.svelte',
         iterations: 12,
         warmup: 3,

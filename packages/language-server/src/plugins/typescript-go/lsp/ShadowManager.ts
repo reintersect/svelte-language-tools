@@ -27,7 +27,7 @@ export interface ShadowManagerOptions {
     /**
      * Outermost directory whose `.svelte` files can end up in this project's program. In a
      * monorepo that is the workspace root, not the app directory: components imported from a
-     * linked workspace package (`packages/ui`) are reached through node_modules symlinks and
+     * linked workspace package are reached through node_modules symlinks and
      * never appear in the app's tsconfig, so basing shadows on the app directory leaves them
      * with no shadow at all — and svelte's ambient `declare module '*.svelte'` then quietly
      * types every one of them `any`.
@@ -131,8 +131,8 @@ export class ShadowManager {
      * Two things about a module specifier depend on where the *importing file* physically sits,
      * and both silently break if a component is type-checked from somewhere else:
      *
-     * - **Bare specifiers** walk up looking for `node_modules`. A component in `packages/tiptap`
-     *   importing `@tiptap/suggestion` finds it in `packages/tiptap/node_modules`; from a mirror
+     * - **Bare specifiers** walk up looking for `node_modules`. A component in a sibling
+     *   package finds that package's own dependencies in its `node_modules`; from a mirror
      *   under the app being checked, the walk reaches only the app's — which under pnpm holds
      *   none of another package's dependencies. That alone was 239 `Cannot find module` errors
      *   for packages that are installed and resolve perfectly well in the editor.
@@ -402,7 +402,7 @@ export class ShadowManager {
             // by its shadow. Deliberately no `include` glob over the shadow root: in a monorepo
             // the shadow tree holds components from every workspace package, and globbing them
             // all in makes them roots of *this* project — where their own `$lib`/`#lib` aliases
-            // and workspace deps do not resolve. On packages/ui that turned 18 real errors into
+            // and workspace deps do not resolve. On one such package that turned 18 real errors into
             // 1277. Shadows for other packages still resolve when imported, because they exist
             // on disk and rootDirs bridges to them; they just are not roots.
             files: [...base.fileNames, ...shimFiles]
