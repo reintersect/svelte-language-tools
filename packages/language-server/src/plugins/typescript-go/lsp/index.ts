@@ -34,12 +34,21 @@ export {
 } from './BatchOverlay';
 
 /**
- * Feature flag for the tsgo engine.
+ * Feature flag for the tsgo engine, off by default.
  *
- * Off by default. The JS `TypeScriptPlugin` stays registered underneath either way — see
- * {@link createTsGoBackedPlugin} — so turning this on can add speed but cannot remove features.
+ * Reads `svelte.language-server.tsgo` from the client's initialization options first, falling back
+ * to `SVELTE_LS_TSGO` in the environment. The setting exists because the environment variable
+ * alone is unusable from an editor: VS Code gives no way to set one for the extension host, so
+ * turning the engine on would mean launching the whole editor from a shell that has it. The
+ * variable stays for `svelte-check`, benchmarks and CI, where it is the natural interface.
  */
-export function isTsGoEnabled(): boolean {
+export function isTsGoEnabled(initializationOptions?: any): boolean {
+    const fromClient =
+        initializationOptions?.configuration?.svelte?.['language-server']?.tsgo ??
+        initializationOptions?.config?.['language-server']?.tsgo;
+    if (typeof fromClient === 'boolean') {
+        return fromClient;
+    }
     const value = process.env.SVELTE_LS_TSGO;
     return value === '1' || value === 'true';
 }

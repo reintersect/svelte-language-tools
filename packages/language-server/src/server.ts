@@ -214,7 +214,7 @@ export function startServer(options?: LSOptions) {
         // Full tsgo: when enabled, the JS TypeScript engine is not constructed at all. Building
         // it registers document listeners and its own snapshot pipeline, so merely having it
         // around means paying for a second engine even when nothing queries it.
-        const tsGoPlugin = isTsGoEnabled()
+        const tsGoPlugin = isTsGoEnabled(evt.initializationOptions)
             ? createTsGoPlugin({
                   workspacePath: urlToPath(normalizedWorkspaceUris[0] ?? '') ?? process.cwd(),
                   docManager
