@@ -456,7 +456,7 @@ export class TsGoPlugin implements Plugin {
         const result: any = await this.server.sendRequest('textDocument/completion', {
             textDocument: { uri: pathToUrl(shadowPath) },
             position: generated,
-            context: completionContext
+            context: sanitizeCompletionContext(completionContext)
         });
         if (!result) {
             return null;
@@ -464,8 +464,18 @@ export class TsGoPlugin implements Plugin {
         this.stats.served++;
 
         const rawItems: any[] = Array.isArray(result) ? result : (result.items ?? []);
+        const uri = document.uri;
         const items: CompletionItem[] = rawItems.map((item) => {
             const mapped: CompletionItem = { ...item };
+            // `connection.onCompletionResolve` reads `item.data` as a TextDocumentIdentifier to
+            // find the document the item belongs to, so an item whose data is tsgo's own payload
+            // resolves against `undefined` and throws "Cannot call methods on an unopened
+            // document". That is not cosmetic: `additionalTextEdits` — the auto-import statement —
+            // only arrive from resolve, so every auto-import silently did nothing.
+            //
+            // tsgo's payload is nested rather than merged, so it round-trips back to tsgo exactly
+            // as issued rather than with an extra key it never emitted.
+            mapped.data = { uri, [TSGO_DATA]: item.data };
             // Component completions surface as `Button__SvelteComponent_`; the user wants to
             // see and insert `Button`.
             if (typeof mapped.label === 'string') {
@@ -933,9 +943,14 @@ export class TsGoPlugin implements Plugin {
         completionItem: AppCompletionItem
     ): Promise<AppCompletionItem> {
         try {
+            const data: any = completionItem.data;
+            const forwarded =
+                data && typeof data === 'object' && TSGO_DATA in data
+                    ? { ...completionItem, data: data[TSGO_DATA] }
+                    : completionItem;
             const resolved: any = await this.server.sendRequest(
                 'completionItem/resolve',
-                completionItem
+                forwarded
             );
             if (!resolved) {
                 return completionItem;
@@ -945,7 +960,13 @@ export class TsGoPlugin implements Plugin {
             const additionalTextEdits = resolved.additionalTextEdits
                 ? this.mapEditsForDocument(_document, resolved.additionalTextEdits)
                 : undefined;
-            return { ...completionItem, ...resolved, additionalTextEdits };
+            // Keep our own `data` so a second resolve of the same item still finds the document.
+            return {
+                ...completionItem,
+                ...resolved,
+                data: completionItem.data,
+                additionalTextEdits
+            };
         } catch (e) {
             Logger.debug('[tsgo] completionItem/resolve failed', e);
             return completionItem;
@@ -1246,6 +1267,27 @@ function timing(phase: string, ms: number) {
             fs.appendFileSync(TIMING_FILE!, `n=${xs.length}  ${line}\n`);
         } catch {}
     }
+}
+
+/** Where tsgo's own completion payload is parked while `data` carries the document uri. */
+const TSGO_DATA = '__tsgoData';
+
+/**
+ * Trigger characters tsgo will accept on `textDocument/completion`.
+ *
+ * Anything else makes it panic outright — `panic handling request textDocument/completion:
+ * Unknown trigger character: >` — which loses the whole request. The Svelte server advertises a
+ * wider set than TypeScript does because it also completes markup, so `>`, `(` and friends do
+ * reach here in normal editing. They are reported as an explicit invocation instead, which is
+ * what the character would have produced anyway.
+ */
+const TSGO_TRIGGER_CHARACTERS = new Set(['.', '"', "'", '`', '/', '@', '<', '#', ' ']);
+
+function sanitizeCompletionContext(context?: CompletionContext): CompletionContext | undefined {
+    if (!context?.triggerCharacter || TSGO_TRIGGER_CHARACTERS.has(context.triggerCharacter)) {
+        return context;
+    }
+    return { triggerKind: 1 as CompletionContext['triggerKind'] };
 }
 
 const ENSURE_COMPONENT = '__sveltets_2_ensureComponent(';
