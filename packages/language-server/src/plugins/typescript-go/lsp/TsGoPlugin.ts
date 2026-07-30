@@ -231,7 +231,9 @@ export class TsGoPlugin implements Plugin {
         }
         await this.ensureProjectOpened();
 
+        const t0 = TIMING ? Date.now() : 0;
         const snapshot = this.shadows.transform(document);
+        const t1 = TIMING ? Date.now() : 0;
         const shadowPath = this.shadows.getShadowPath(filePath);
 
         // Only documents the editor actually has open become LSP overlays; everything else
@@ -246,6 +248,10 @@ export class TsGoPlugin implements Plugin {
             this.shadows.ensureShadowDirectory(shadowPath);
             await this.server.openDocument(shadowPath, text);
         }
+        if (TIMING) {
+            timing('transform', t1 - t0);
+            timing('sync', Date.now() - t1);
+        }
         return { snapshot, shadowPath };
     }
 
@@ -253,6 +259,7 @@ export class TsGoPlugin implements Plugin {
         document: Document,
         cancellationToken?: CancellationToken
     ): Promise<Diagnostic[]> {
+        const tStart = TIMING ? Date.now() : 0;
         const synced = await this.syncDocument(document);
         if (!synced) {
             return [];
@@ -278,6 +285,7 @@ export class TsGoPlugin implements Plugin {
         }
 
         let report: any;
+        const tCheck = TIMING ? Date.now() : 0;
         try {
             report = await this.server.sendRequest('textDocument/diagnostic', {
                 textDocument: { uri: pathToUrl(shadowPath) }
@@ -290,10 +298,11 @@ export class TsGoPlugin implements Plugin {
 
         const items: any[] = report?.items ?? [];
         this.stats.served++;
+        const tMap = TIMING ? Date.now() : 0;
 
         const generatedText = snapshot.getFullText();
 
-        return items
+        const mapped = items
             .map((diagnostic) => {
                 // svelte2tsx wraps its own scaffolding in Ω ignore markers. Diagnostics inside
                 // those regions are about generated code the user never wrote — reporting them
@@ -318,6 +327,13 @@ export class TsGoPlugin implements Plugin {
                 } as Diagnostic;
             })
             .filter(isNotNullOrUndefined);
+
+        if (TIMING) {
+            timing('tsgo', tMap - tCheck);
+            timing('mapback', Date.now() - tMap);
+            timing('total', Date.now() - tStart);
+        }
+        return mapped;
     }
 
     async doHover(document: Document, position: Position): Promise<Hover | null> {
@@ -1165,6 +1181,31 @@ const SYNTHETIC_SYMBOLS = new Set([
 ]);
 
 /** svelte2tsx wraps every component usage in this call; the argument is the real component. */
+/**
+ * Phase timings for the keystroke path, behind SVELTE_LS_TIMING=1.
+ *
+ * The interesting question about a 400ms round trip is which of the four things it does owns it,
+ * and that is not answerable from the outside: the client only sees didChange in and
+ * publishDiagnostics out. Off by default — reading Date.now() twice per request is cheap, but
+ * accumulating and printing it is not free either.
+ */
+const TIMING = process.env.SVELTE_LS_TIMING === '1';
+const timings = new Map<string, number[]>();
+function timing(phase: string, ms: number) {
+    const xs = timings.get(phase) ?? [];
+    xs.push(ms);
+    timings.set(phase, xs);
+    if (phase === 'total' && xs.length % 5 === 0) {
+        const line = [...timings.entries()]
+            .map(([name, values]) => {
+                const sorted = [...values].sort((a, b) => a - b);
+                return `${name} ${sorted[Math.floor(sorted.length / 2)]}ms`;
+            })
+            .join('  ');
+        Logger.log(`[tsgo:timing] n=${xs.length}  ${line}`);
+    }
+}
+
 const ENSURE_COMPONENT = '__sveltets_2_ensureComponent(';
 /** How far past the mapped offset to look before giving up, in characters. */
 const ENSURE_COMPONENT_SEARCH_WINDOW = 400;
