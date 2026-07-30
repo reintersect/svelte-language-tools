@@ -49,6 +49,7 @@ import {
     OnWatchFileChangesPara,
     LSAndTSDocResolver
 } from './plugins';
+import { createTsGoPlugin, isTsGoEnabled } from './plugins/typescript-go/lsp';
 import { debounceThrottle, isNotNullOrUndefined, normalizeUri, urlToPath } from './utils';
 import { FallbackWatcher } from './lib/FallbackWatcher';
 import { configLoader } from './lib/documents/configLoader';
@@ -209,8 +210,25 @@ export function startServer(options?: LSOptions) {
             new CSSPlugin(docManager, configManager, workspaceFolders, cssLanguageServices)
         );
         const normalizedWorkspaceUris = workspaceUris.map(normalizeUri);
-        pluginHost.register(
-            new TypeScriptPlugin(
+
+        // Full tsgo: when enabled, the JS TypeScript engine is not constructed at all. Building
+        // it registers document listeners and its own snapshot pipeline, so merely having it
+        // around means paying for a second engine even when nothing queries it.
+        const tsGoPlugin = isTsGoEnabled()
+            ? createTsGoPlugin({
+                  workspacePath: urlToPath(normalizedWorkspaceUris[0] ?? '') ?? process.cwd(),
+                  docManager
+              })
+            : undefined;
+
+        if (tsGoPlugin) {
+            pluginHost.register(tsGoPlugin);
+        } else {
+            pluginHost.register(createTypeScriptPlugin());
+        }
+
+        function createTypeScriptPlugin() {
+            return new TypeScriptPlugin(
                 configManager,
                 new LSAndTSDocResolver(docManager, normalizedWorkspaceUris, configManager, {
                     notifyExceedSizeLimit: notifyTsServiceExceedSizeLimit,
@@ -224,8 +242,8 @@ export function startServer(options?: LSOptions) {
                 }),
                 normalizedWorkspaceUris,
                 docManager
-            )
-        );
+            );
+        }
 
         const clientSupportApplyEditCommand = !!evt.capabilities.workspace?.applyEdit;
         const clientCodeActionCapabilities = evt.capabilities.textDocument?.codeAction;
@@ -247,7 +265,6 @@ export function startServer(options?: LSOptions) {
                     evt: DocumentDiagnosticParams,
                     token
                 ): Promise<DocumentDiagnosticReport | null> => {
-                    await new Promise((resolve) => setTimeout(resolve, 200));
                     if (token.isCancellationRequested) {
                         return null;
                     }
