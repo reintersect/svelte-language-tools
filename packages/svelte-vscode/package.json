@@ -780,7 +780,7 @@
         "textmate-grammar-test": "^0.6.0"
     },
     "dependencies": {
-        "svelte-language-server": "workspace:*",
+        "svelte-language-server": "workspace:@reintersect/svelte-language-server@*",
         "typescript-svelte-plugin": "workspace:*",
         "vscode-languageclient": "^9.0.1",
         "vscode-languageserver-protocol": "3.17.5",

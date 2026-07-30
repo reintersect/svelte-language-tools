@@ -1,5 +1,5 @@
 {
-    "name": "svelte-language-server",
+    "name": "@reintersect/svelte-language-server",
     "version": "0.18.3",
     "description": "A language server for Svelte",
     "main": "dist/src/index.js",
@@ -53,7 +53,7 @@
     },
     "dependencies": {
         "@jridgewell/trace-mapping": "^0.3.25",
-        "@sveltejs/load-config": "workspace:^",
+        "@sveltejs/load-config": "^0.2.1",
         "@vscode/emmet-helper": "2.8.4",
         "chokidar": "^4.0.1",
         "defu": "^6.1.7",
@@ -63,7 +63,7 @@
         "prettier": "~3.3.3",
         "prettier-plugin-svelte": "^3.5.0",
         "svelte": "^4.2.19",
-        "svelte2tsx": "workspace:~",
+        "svelte2tsx": "~0.7.59",
         "typescript-auto-import-cache": "^0.3.6",
         "vscode-css-languageservice": "~6.3.5",
         "vscode-html-languageservice": "~5.4.0",
