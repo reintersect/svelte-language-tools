@@ -131,28 +131,50 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
     // in svelte2tsx's shim d.ts files. get_global_types copies them into the project's
     // node_modules and returns their paths; without them every component reports
     // "Cannot find name 'svelteHTML'".
-    const sveltePackageInfo = getPackageInfo('svelte', tsconfigPath || options.workspacePath);
     let svelteTsPath: string;
     try {
         svelteTsPath = dirname(require.resolve('svelte2tsx'));
     } catch {
         svelteTsPath = __dirname;
     }
-    const shimFiles = internalHelpers.get_global_types(
-        ts.sys,
-        sveltePackageInfo.version.major === 3,
-        sveltePackageInfo.path,
-        svelteTsPath,
-        tsconfigPath || options.workspacePath
-    );
-    shadows.writeOverlayTsconfig(shimFiles);
+
+    // Per package, because the shims are written against whichever Svelte they resolve from and a
+    // monorepo root frequently has none. Cached: get_global_types copies files on every call.
+    const shimCache = new Map<string, string[]>();
+    const resolveShims = (packageRoot: string): string[] => {
+        const cached = shimCache.get(packageRoot);
+        if (cached) {
+            return cached;
+        }
+        let shims: string[] = [];
+        try {
+            const info = getPackageInfo('svelte', packageRoot);
+            shims = internalHelpers.get_global_types(
+                ts.sys,
+                info.version.major === 3,
+                info.path,
+                svelteTsPath,
+                packageRoot
+            );
+        } catch (e) {
+            Logger.debug(`[tsgo] no Svelte resolvable from ${packageRoot}`, e);
+        }
+        shimCache.set(packageRoot, shims);
+        return shims;
+    };
+    shadows.setShimResolver(resolveShims);
+    shadows.writeOverlayTsconfig(resolveShims(projectPath));
 
     const server = new TsGoServer({
         tsgoPath,
-        // Root tsgo at the overlay, not the user's project: project selection is decided by the
-        // path of the opened file, and the overlay tsconfig is the one that knows how to
-        // resolve `.svelte` imports to their shadows.
-        workspacePath: shadows.overlayPath,
+        // Root tsgo at the source root, which is the one directory guaranteed to contain every
+        // mirror. Project selection is per-file — tsgo walks up from the opened file until it
+        // finds a tsconfig, landing on that package's overlay — but a file *outside* the server's
+        // workspace gets no project at all and therefore no diagnostics. Rooting at this
+        // project's own overlay was fine while the editor was opened on a single app, and silently
+        // broke everything the moment it was opened on a monorepo: every shadow then lives under
+        // `<package>/.svelte-ls-overlay/`, none of which is inside `<monorepo>/.svelte-ls-overlay`.
+        workspacePath: shadows.sourceRoot,
         onRestart: () =>
             Logger.error('[tsgo] server exited; documents will be replayed on next request')
     });

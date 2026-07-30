@@ -47,6 +47,16 @@ export interface ShadowManagerOptions {
      * batch path does — an unwritten file named in `files` is TS6053.
      */
     kitFiles?: InternalHelpers.KitFilesSettings;
+    /**
+     * The svelte2tsx shim `.d.ts` files a given package should be checked against.
+     *
+     * Per package, not per workspace. The shims are written relative to whichever Svelte they are
+     * resolved against, and in a monorepo the editor's root often has no `svelte` at all — only
+     * the packages do. Computing them once from the root then yields shims built against nothing,
+     * which does not fail loudly: `svelte-html.d.ts` is silently absent, so every intrinsic
+     * element mismatches `HTMLProps<...>` and every component's props degrade to `any`.
+     */
+    resolveShims?: (packageRoot: string) => string[];
 }
 
 /** A SvelteKit file's generated twin, with what's needed to map positions back. */
@@ -116,6 +126,16 @@ export class ShadowManager {
         // sits beside, and the one the LSP writes editor-open shadows into.
         this.shadowRoot = normalizePath(join(this.packageRoot, OVERLAY_DIR, SHADOW_ROOT));
         this.mirrorRoots.set(normalizePath(this.packageRoot), this.shadowRoot);
+    }
+
+    /** Set the per-package shim resolver after construction (it needs the manager's paths). */
+    setShimResolver(resolve: (packageRoot: string) => string[]) {
+        (this.options as ShadowManagerOptions).resolveShims = resolve;
+    }
+
+    /** Outermost directory whose components this manager shadows. */
+    get sourceRoot(): string {
+        return normalizePath(this.options.sourceRoot);
     }
 
     /** The rootDir a file resolves against: the longest one that contains it. */
@@ -448,7 +468,8 @@ export class ShadowManager {
      * Note there is deliberately no `.d.ts` re-export shim: over LSP, rootDirs plus
      * allowArbitraryExtensions resolve `./Foo.svelte` straight to the `.tsx`.
      */
-    writeOverlayTsconfig(shimFiles: string[]) {
+    writeOverlayTsconfig(fallbackShims: string[]) {
+        const shimFiles = this.shimsFor(this.packageRoot, fallbackShims);
         fs.mkdirSync(this.overlayPath, { recursive: true });
         this.fingerprintValid = this.checkFingerprint();
         // Discovering the mirrors has to happen before the config is written, since every one of
@@ -507,7 +528,7 @@ export class ShadowManager {
         }
 
         this.writeTsSupportConfig(base, shimFiles, paths);
-        this.writeSiblingOverlays(shimFiles);
+        this.writeSiblingOverlays(fallbackShims);
 
         if (this.options.tsconfigPath) {
             config.extends = this.options.tsconfigPath;
@@ -723,7 +744,12 @@ export class ShadowManager {
      * Skips anything under `node_modules`: a dependency's components are never opened in the
      * editor, so they need a mirror to resolve into but not a project of their own.
      */
-    private writeSiblingOverlays(shimFiles: string[]) {
+    private shimsFor(packageRoot: string, fallback: string[]): string[] {
+        const resolved = this.options.resolveShims?.(packageRoot);
+        return resolved?.length ? resolved : fallback;
+    }
+
+    private writeSiblingOverlays(fallbackShims: string[]) {
         for (const packageRoot of this.svelteOwningPackages()) {
             if (
                 normalizePath(packageRoot) === normalizePath(this.packageRoot) ||
@@ -754,7 +780,7 @@ export class ShadowManager {
                             ...new Set(this.mirrorRoots.values())
                         ]
                     },
-                    files: [...base.fileNames, ...shimFiles]
+                    files: [...base.fileNames, ...this.shimsFor(packageRoot, fallbackShims)]
                 };
                 const paths = this.overlayPaths(base);
                 if (Object.keys(paths).length) {
