@@ -1,9 +1,117 @@
+> ### This is a fork
+>
+> [`reintersect/svelte-language-tools`](https://github.com/reintersect/svelte-language-tools), forked from
+> [`sveltejs/language-tools`](https://github.com/sveltejs/language-tools). It moves TypeScript work off
+> the JavaScript compiler and onto **tsgo** (TypeScript 7, native) — in the **editor language server**,
+> which upstream does not do at all, and in **`svelte-check`**, replacing the two experimental tsgo
+> modes that were there.
+>
+> Measured against upstream's classic engine as the oracle, on a ~800-component SvelteKit app in a
+> pnpm monorepo:
+>
+> | | upstream | this fork |
+> |---|---|---|
+> | `svelte-check` on a component library | 4.3s | **2.3s** |
+> | `svelte-check` on a SvelteKit app | 15.5s | **3.9s** |
+> | editor: cold project load | 7.7s | **3.6s** |
+> | editor: keystroke → diagnostics | 948ms | **420ms** |
+>
+> Same diagnostics in every case — the check is diffed against the classic engine file by file, and
+> converges on it exactly.
+>
+> **It is also vibecoded as hell.** Essentially all of it was written by Claude in a handful of
+> sessions, against real measurements rather than a design doc, and it drifts from upstream wherever
+> that was faster. It is not a Svelte project, is not endorsed by the Svelte team, and comes with no
+> support. It exists because it is quicker than upstream for one specific monorepo. If you are not
+> that monorepo, use the real [`svelte-check`](https://www.npmjs.com/package/svelte-check) and
+> [`svelte-language-server`](https://www.npmjs.com/package/svelte-language-server).
+>
+> Known gaps versus upstream: no `refactor` code actions (TypeScript 7 does not implement them yet),
+> partial quickfix coverage, and `typescript-svelte-plugin` is untouched — it still runs on the
+> JavaScript engine.
+
+Published as **`@reintersect/svelte-language-server`**. Point your editor at it with
+`svelte.language-server.ls-path`, and set `SVELTE_LS_TSGO=1` to turn the tsgo engine on — with the
+flag unset it behaves exactly like upstream.
+
 # Svelte Language Server
 
 A language server (implementing the [language server protocol](https://microsoft.github.io/language-server-protocol/))
 for Svelte.
 
 Requires Node 12 or later.
+
+
+## Using this fork in VS Code
+
+The official **Svelte for VS Code** extension can be pointed at a different language server binary,
+so there is nothing to build or sideload — keep the extension you already have and redirect it.
+
+**1. Install the server** somewhere stable. Global is simplest:
+
+```bash
+npm i -g @reintersect/svelte-language-server
+```
+
+**2. Find where it landed** — you need the absolute path to the package directory, not the bin:
+
+```bash
+npm root -g
+```
+
+Append `/@reintersect/svelte-language-server` to that.
+
+**3. Point the extension at it**, in your *user* settings (`settings.json`), and turn the engine on:
+
+```jsonc
+{
+    // Absolute path to the package directory from step 2.
+    "svelte.language-server.ls-path": "/usr/local/lib/node_modules/@reintersect/svelte-language-server",
+
+    // Without this the fork behaves exactly like upstream — the tsgo engine is opt-in.
+    "svelte.language-server.runtime-args": ["--env", "SVELTE_LS_TSGO=1"]
+}
+```
+
+If `runtime-args` does not take (it is passed to the Node runtime, not the server), set
+`SVELTE_LS_TSGO=1` in the environment VS Code itself is launched from instead — on macOS that means
+launching it from a shell that has the variable, since GUI-launched apps do not read your shell
+profile:
+
+```bash
+SVELTE_LS_TSGO=1 code .
+```
+
+**4. Restart the extension host** — `Developer: Reload Window`. Confirm it took by opening
+**Output → Svelte**; the log says `[tsgo] enabled, using <path>` and, on the first request,
+`[tsgo] materialising N shadows`.
+
+### What you should notice
+
+Diagnostics after a keystroke land in roughly 400ms instead of roughly 950ms, and opening a large
+project takes about 3.5s instead of about 7.5s. Hover, completion, go-to-definition and rename all
+go through tsgo too.
+
+### What to expect that is different
+
+- **No refactorings.** TypeScript 7 does not implement `refactor` code actions yet, so "Extract to
+  function", "Move to file" and friends are absent. Quickfixes work, but not all of them.
+- **A `.svelte-ls-overlay` directory** appears in each package that has components. It holds the
+  generated `.tsx` twins tsgo type-checks, and it gitignores itself. Deleting it is always safe.
+- **`.ts` files still use the JavaScript engine.** `typescript-svelte-plugin` has no tsgo migration
+  path, so Svelte intellisense inside plain `.ts` files is unchanged from upstream.
+
+### Turning it off
+
+Remove `ls-path` to go back to the extension's bundled server, or drop `SVELTE_LS_TSGO=1` to keep
+this build but run it on the upstream JavaScript engine. Both are one-line reverts, which is the
+point — the flag was kept so a bad day is a settings change rather than a reinstall.
+
+### Requirements
+
+`@reintersect/effect-tsgo` (preferred) or `@typescript/native-preview` installed in the workspace
+being edited. The server resolves the binary from the project, not from itself, so each project can
+pin its own. With neither present it logs an error and falls back to the JavaScript engine.
 
 ## What is a language server?
 

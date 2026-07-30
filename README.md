@@ -14,6 +14,40 @@
 
 [IDE docs and troubleshooting](docs)
 
+
+> ### This is a fork
+>
+> [`reintersect/svelte-language-tools`](https://github.com/reintersect/svelte-language-tools), forked from
+> [`sveltejs/language-tools`](https://github.com/sveltejs/language-tools). It moves TypeScript work off
+> the JavaScript compiler and onto **tsgo** (TypeScript 7, native) — in the **editor language server**,
+> which upstream does not do at all, and in **`svelte-check`**, replacing the two experimental tsgo
+> modes that were there.
+>
+> Measured against upstream's classic engine as the oracle, on a ~800-component SvelteKit app in a
+> pnpm monorepo:
+>
+> | | upstream | this fork |
+> |---|---|---|
+> | `svelte-check` on a component library | 4.3s | **2.3s** |
+> | `svelte-check` on a SvelteKit app | 15.5s | **3.9s** |
+> | editor: cold project load | 7.7s | **3.6s** |
+> | editor: keystroke → diagnostics | 948ms | **420ms** |
+>
+> Same diagnostics in every case — the check is diffed against the classic engine file by file, and
+> converges on it exactly.
+>
+> **It is also vibecoded as hell.** Essentially all of it was written by Claude in a handful of
+> sessions, against real measurements rather than a design doc, and it drifts from upstream wherever
+> that was faster. It is not a Svelte project, is not endorsed by the Svelte team, and comes with no
+> support. It exists because it is quicker than upstream for one specific monorepo. If you are not
+> that monorepo, use the real [`svelte-check`](https://www.npmjs.com/package/svelte-check) and
+> [`svelte-language-server`](https://www.npmjs.com/package/svelte-language-server).
+>
+> Known gaps versus upstream: no `refactor` code actions (TypeScript 7 does not implement them yet),
+> partial quickfix coverage, and `typescript-svelte-plugin` is untouched — it still runs on the
+> JavaScript engine.
+
+
 ## What is Svelte Language Tools?
 
 Svelte Language Tools contains a library implementing the Language Server Protocol (LSP). LSP powers the [VSCode extension](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode), which is also hosted in this repository. Additionally, LSP is capable of powering plugins for [numerous other IDEs](https://microsoft.github.io/language-server-protocol/implementors/tools/).
