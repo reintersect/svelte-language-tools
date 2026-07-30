@@ -248,6 +248,13 @@ export class TsGoPlugin implements Plugin {
             this.shadows.ensureShadowDirectory(shadowPath);
             await this.server.openDocument(shadowPath, text);
         }
+
+        // Keep the on-disk shadow current with the unsaved buffer, not just with the last save.
+        // Our own tsgo session reads the overlay above and does not need this — the reader is the
+        // editor's *TypeScript* server, which resolves `.svelte` imports from `.ts` files through
+        // the shadow tree (see ShadowManager.writeTsSupportConfig) and only ever sees disk.
+        this.shadows.writeShadow(shadowPath, text);
+
         if (TIMING) {
             timing('transform', t1 - t0);
             timing('sync', Date.now() - t1);
@@ -1189,7 +1196,8 @@ const SYNTHETIC_SYMBOLS = new Set([
  * publishDiagnostics out. Off by default — reading Date.now() twice per request is cheap, but
  * accumulating and printing it is not free either.
  */
-const TIMING = process.env.SVELTE_LS_TIMING === '1';
+const TIMING_FILE = process.env.SVELTE_LS_TIMING;
+const TIMING = !!TIMING_FILE;
 const timings = new Map<string, number[]>();
 function timing(phase: string, ms: number) {
     const xs = timings.get(phase) ?? [];
@@ -1202,7 +1210,11 @@ function timing(phase: string, ms: number) {
                 return `${name} ${sorted[Math.floor(sorted.length / 2)]}ms`;
             })
             .join('  ');
-        Logger.log(`[tsgo:timing] n=${xs.length}  ${line}`);
+        // Not the Logger: on an stdio server that either goes nowhere useful or into the
+        // protocol stream. A file is boring and always readable.
+        try {
+            fs.appendFileSync(TIMING_FILE!, `n=${xs.length}  ${line}\n`);
+        } catch {}
     }
 }
 

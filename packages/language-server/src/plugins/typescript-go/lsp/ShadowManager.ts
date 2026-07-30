@@ -422,6 +422,8 @@ export class ShadowManager {
             config.compilerOptions.paths = paths;
         }
 
+        this.writeTsSupportConfig(base, shimFiles, paths);
+
         if (this.options.tsconfigPath) {
             config.extends = this.options.tsconfigPath;
         }
@@ -549,6 +551,72 @@ export class ShadowManager {
         // Two packages can define the same pattern (`#lib/*` is popular). Both target sets go in
         // and TypeScript takes the first that exists on disk.
         paths[key] = [...(paths[key] ?? []), ...svelteTargets];
+    }
+
+    /**
+     * Emit a config fragment that lets the user's *own* TypeScript project resolve `.svelte`
+     * imports from `.ts` and `.js` files.
+     *
+     * This is what `typescript-svelte-plugin` does, without the plugin. That plugin exists
+     * because TypeScript cannot read `.svelte` — but it never needed to, it needed to find
+     * *something* type-checkable at that specifier, and the shadow tree is exactly that. Four
+     * compiler options connect the two, and then a plain `.ts` file gets a component's real props
+     * type: verified end to end against unpatched tsgo, where `label: 123` on a `label: string`
+     * prop reports TS2322 rather than passing silently.
+     *
+     * Worth preferring over patching the compiler. It needs no fork, survives tsgo's daily churn,
+     * and works identically on stock TypeScript 6 — whereas teaching a Go compiler about Svelte
+     * means a parser *and* the svelte2tsx projection in Go.
+     *
+     * Add to the project's tsconfig (TypeScript 5+ takes an array, so a SvelteKit project keeps
+     * its generated config):
+     *
+     * ```jsonc
+     * { "extends": ["./.svelte-kit/tsconfig.json", "./.svelte-ls-overlay/tsconfig.ts-support.json"] }
+     * ```
+     *
+     * Freshness is save-granular: shadows are rewritten when a file changes on disk, so a `.ts`
+     * file sees a component's props as of its last save.
+     */
+    private writeTsSupportConfig(
+        base: { rootDirs: string[] },
+        shimFiles: string[],
+        paths: Record<string, string[]>
+    ) {
+        const config = {
+            compilerOptions: {
+                // Everything here is additive. `extends` merges compilerOptions key by key, so
+                // anything the project already sets and this does not is untouched.
+                allowArbitraryExtensions: true,
+                allowImportingTsExtensions: true,
+                jsx: 'preserve',
+                // Replaces rather than merges, hence carrying the project's own entries through.
+                rootDirs: [
+                    ...base.rootDirs,
+                    this.options.sourceRoot,
+                    ...new Set(this.mirrorRoots.values())
+                ],
+                ...(Object.keys(paths).length ? { paths } : {})
+            },
+            // The svelte2tsx shims. `files` and `include` are independent, so a project that
+            // declares `include` still gets these as extra roots rather than losing its sources.
+            //
+            // Resolved from the *project's* node_modules, never this package's: the shims contain
+            // `import('svelte')` type references, and a second copy of Svelte in the program means
+            // two ambient `declare module 'svelte'` blocks. Svelte 4's `ComponentProps` wins that
+            // merge and collapses every Svelte 5 component to `never`.
+            files: shimFiles
+        };
+
+        const target = join(this.overlayPath, 'tsconfig.ts-support.json');
+        const contents = JSON.stringify(config, null, 4);
+        try {
+            if (!fs.existsSync(target) || fs.readFileSync(target, 'utf8') !== contents) {
+                fs.writeFileSync(target, contents);
+            }
+        } catch (e) {
+            Logger.debug('[tsgo] could not write the .ts-support config', e);
+        }
     }
 
     /**
