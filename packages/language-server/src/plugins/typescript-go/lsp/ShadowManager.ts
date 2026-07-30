@@ -39,6 +39,17 @@ export interface ShadowManagerOptions {
     tsconfigPath: string | undefined;
     snapshotOptions: SvelteSnapshotOptions;
     /**
+     * Snapshot options for a specific package, whose Svelte compiler must be that package's own.
+     *
+     * `importSvelte` falls back to the copy bundled with this language server when the directory
+     * it is asked about has no `svelte` — and a monorepo root usually does not, only its packages
+     * do. The fallback is Svelte 4, so every component in a Svelte 5 workspace was being parsed
+     * by the wrong major: runes are not understood, the generated TSX is wrong, its mappings do
+     * not line up, and every diagnostic maps onto nothing and is dropped. Silent, and it presents
+     * as "everything is `any`".
+     */
+    resolveSnapshotOptions?: (packageRoot: string) => SvelteSnapshotOptions | undefined;
+    /**
      * When set, SvelteKit route/hook/param files get shadows too, carrying the type annotations
      * that give `load({ params })` and friends their inferred parameter types. Without it those
      * parameters are implicitly `any` and a strict project reports an error on every one.
@@ -131,6 +142,13 @@ export class ShadowManager {
     /** Set the per-package shim resolver after construction (it needs the manager's paths). */
     setShimResolver(resolve: (packageRoot: string) => string[]) {
         (this.options as ShadowManagerOptions).resolveShims = resolve;
+    }
+
+    /** See {@link ShadowManagerOptions.resolveSnapshotOptions}. */
+    setSnapshotOptionsResolver(
+        resolve: (packageRoot: string) => SvelteSnapshotOptions | undefined
+    ) {
+        (this.options as ShadowManagerOptions).resolveSnapshotOptions = resolve;
     }
 
     /** Outermost directory whose components this manager shadows. */
@@ -350,6 +368,9 @@ export class ShadowManager {
         if (!filePath) {
             throw new Error('cannot create a shadow for a document without a file path');
         }
+        const options =
+            this.options.resolveSnapshotOptions?.(this.packageRootOf(filePath)) ??
+            this.options.snapshotOptions;
         const key = normalizePath(filePath);
         const text = document.getText();
         const previous = this.snapshots.get(key);
@@ -357,10 +378,7 @@ export class ShadowManager {
             return previous.snapshot;
         }
 
-        const snapshot = DocumentSnapshot.fromDocument(
-            document,
-            this.options.snapshotOptions
-        ) as SvelteDocumentSnapshot;
+        const snapshot = DocumentSnapshot.fromDocument(document, options) as SvelteDocumentSnapshot;
         this.snapshots.set(key, { sourceText: text, snapshot });
         return snapshot;
     }

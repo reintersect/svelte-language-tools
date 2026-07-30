@@ -162,6 +162,23 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
         shimCache.set(packageRoot, shims);
         return shims;
     };
+    // Same reasoning as the shims: resolved per package, because the compiler must be the one
+    // that package builds with. Cached — importSvelte does real module resolution.
+    const optionsCache = new Map<string, SvelteSnapshotOptions>();
+    shadows.setSnapshotOptionsResolver((packageRoot) => {
+        const cached = optionsCache.get(packageRoot);
+        if (cached) {
+            return cached;
+        }
+        const compiler = importSvelte(packageRoot);
+        const resolved: SvelteSnapshotOptions = {
+            ...snapshotOptions,
+            parse: compiler?.parse,
+            version: compiler?.VERSION
+        };
+        optionsCache.set(packageRoot, resolved);
+        return resolved;
+    });
     shadows.setShimResolver(resolveShims);
     shadows.writeOverlayTsconfig(resolveShims(projectPath));
 
@@ -174,7 +191,7 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
         // project's own overlay was fine while the editor was opened on a single app, and silently
         // broke everything the moment it was opened on a monorepo: every shadow then lives under
         // `<package>/.svelte-ls-overlay/`, none of which is inside `<monorepo>/.svelte-ls-overlay`.
-        workspacePath: shadows.sourceRoot,
+        workspacePath: shadows.overlayPath,
         onRestart: () =>
             Logger.error('[tsgo] server exited; documents will be replayed on next request')
     });
