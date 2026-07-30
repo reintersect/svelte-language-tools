@@ -1,4 +1,4 @@
-import { dirname } from 'path';
+import { dirname, join } from 'path';
 import ts from 'typescript';
 import { internalHelpers } from 'svelte2tsx';
 import { DocumentManager } from '../../../lib/documents';
@@ -13,6 +13,7 @@ import {
     resolveTsGoPath,
     ShadowManager
 } from './ShadowManager';
+import { ProjectRegistry } from './ProjectRegistry';
 import { TsGoPlugin } from './TsGoPlugin';
 import { TsGoApiSession } from './TsGoApiSession';
 import { TsGoComponentInfo } from './TsGoComponentInfo';
@@ -120,17 +121,6 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
         Logger.log(`[tsgo] workspace root detected at ${sourceRoot}`);
     }
 
-    const shadows = new ShadowManager({
-        projectPath,
-        sourceRoot,
-        tsconfigPath,
-        snapshotOptions
-    });
-
-    // The generated code references `svelteHTML`, `__sveltets_*` and friends, all of which live
-    // in svelte2tsx's shim d.ts files. get_global_types copies them into the project's
-    // node_modules and returns their paths; without them every component reports
-    // "Cannot find name 'svelteHTML'".
     let svelteTsPath: string;
     try {
         svelteTsPath = dirname(require.resolve('svelte2tsx'));
@@ -138,8 +128,10 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
         svelteTsPath = __dirname;
     }
 
-    // Per package, because the shims are written against whichever Svelte they resolve from and a
-    // monorepo root frequently has none. Cached: get_global_types copies files on every call.
+    // Shims and the Svelte compiler are both resolved per package: they are written against, and
+    // must match, the Svelte that package builds with. Resolving either from the editor's root
+    // silently yields the wrong one in a monorepo — the root usually has no `svelte` at all, and
+    // `importSvelte` then falls back to the copy bundled with this server, which is Svelte 4.
     const shimCache = new Map<string, string[]>();
     const resolveShims = (packageRoot: string): string[] => {
         const cached = shimCache.get(packageRoot);
@@ -162,25 +154,42 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
         shimCache.set(packageRoot, shims);
         return shims;
     };
-    // Same reasoning as the shims: resolved per package, because the compiler must be the one
-    // that package builds with. Cached — importSvelte does real module resolution.
+
     const optionsCache = new Map<string, SvelteSnapshotOptions>();
-    shadows.setSnapshotOptionsResolver((packageRoot) => {
+    const resolveSnapshotOptions = (packageRoot: string): SvelteSnapshotOptions => {
         const cached = optionsCache.get(packageRoot);
         if (cached) {
             return cached;
         }
         const compiler = importSvelte(packageRoot);
         const resolved: SvelteSnapshotOptions = {
-            ...snapshotOptions,
             parse: compiler?.parse,
-            version: compiler?.VERSION
+            version: compiler?.VERSION,
+            // Keep emitting usable TSX while the template is mid-edit and momentarily unbalanced;
+            // without this every keystroke inside markup would blank the file's types.
+            transformOnTemplateError: true,
+            typingsNamespace: 'svelteHTML',
+            emitJsDoc: true
         };
         optionsCache.set(packageRoot, resolved);
         return resolved;
-    });
-    shadows.setShimResolver(resolveShims);
-    shadows.writeOverlayTsconfig(resolveShims(projectPath));
+    };
+
+    // One ShadowManager per TypeScript project, built on demand for whichever project the file
+    // being edited belongs to. A workspace is not a project: deriving one from the editor's root
+    // only works when they happen to coincide.
+    const projects = new ProjectRegistry((root: string, configPath: string | undefined) => {
+        const shadows = new ShadowManager({
+            projectPath: root,
+            sourceRoot: findWorkspaceRoot(root),
+            tsconfigPath: configPath,
+            snapshotOptions: resolveSnapshotOptions(root)
+        });
+        shadows.setShimResolver(resolveShims);
+        shadows.setSnapshotOptionsResolver(resolveSnapshotOptions);
+        shadows.writeOverlayTsconfig(resolveShims(root));
+        return shadows;
+    }, projectPath);
 
     const server = new TsGoServer({
         tsgoPath,
@@ -191,19 +200,26 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
         // project's own overlay was fine while the editor was opened on a single app, and silently
         // broke everything the moment it was opened on a monorepo: every shadow then lives under
         // `<package>/.svelte-ls-overlay/`, none of which is inside `<monorepo>/.svelte-ls-overlay`.
-        workspacePath: shadows.overlayPath,
+        // The source root, which is the one directory containing every project's overlay. A file
+        // outside the server's workspace gets no project and therefore no diagnostics, and with a
+        // manager per project there is no single overlay that contains them all.
+        workspacePath: sourceRoot,
         onRestart: () =>
             Logger.error('[tsgo] server exited; documents will be replayed on next request')
     });
 
     // Component props/events/slots are read off the *type*, which no LSP request exposes.
     // The session attaches a checker to the same programs tsgo is already serving.
-    const apiSession = new TsGoApiSession(server, projectPath, shadows.overlayTsconfigPath);
+    const apiSession = new TsGoApiSession(
+        server,
+        projectPath,
+        projects.forFile(join(projectPath, 'x.svelte')).overlayTsconfigPath
+    );
     const componentInfo = new TsGoComponentInfo(apiSession, async (shadowPath, offset) => {
         // Ask the LSP side where the identifier is declared, then translate that back into a
         // (file, offset) the checker can be queried at.
         try {
-            const snapshot = shadows.getSnapshotByShadowPath(shadowPath);
+            const snapshot = projects.getSnapshotByShadowPath(shadowPath);
             const position = snapshot?.positionAt(offset);
             if (!position) {
                 return undefined;
@@ -222,7 +238,7 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
             if (!filePath || !targetRange) {
                 return undefined;
             }
-            const targetSnapshot = shadows.getSnapshotByShadowPath(filePath);
+            const targetSnapshot = projects.getSnapshotByShadowPath(filePath);
             if (!targetSnapshot) {
                 return undefined;
             }
@@ -233,5 +249,5 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
     });
 
     Logger.log(`[tsgo] enabled, using ${tsgoPath}`);
-    return new TsGoPlugin({ server, shadows, docManager: options.docManager, componentInfo });
+    return new TsGoPlugin({ server, projects, docManager: options.docManager, componentInfo });
 }

@@ -64,6 +64,7 @@ import {
     mapWorkspaceEditBack
 } from './mapping';
 import { ShadowManager } from './ShadowManager';
+import { ProjectRegistry } from './ProjectRegistry';
 import { TsGoComponentInfo } from './TsGoComponentInfo';
 import { TsGoServer } from './TsGoServer';
 
@@ -76,7 +77,7 @@ export interface TsGoStats {
 
 interface TsGoPluginOptions {
     server: TsGoServer;
-    shadows: ShadowManager;
+    projects: ProjectRegistry;
     docManager: DocumentManager;
     componentInfo?: TsGoComponentInfo;
 }
@@ -94,16 +95,18 @@ export class TsGoPlugin implements Plugin {
     readonly stats: TsGoStats = { served: 0, fellBack: 0, fallbackReasons: new Map() };
 
     private readonly server: TsGoServer;
-    private readonly shadows: ShadowManager;
+    /** One ShadowManager per TypeScript project, resolved from the file being edited. */
+    private readonly projects: ProjectRegistry;
     private readonly docManager: DocumentManager;
     private readonly componentInfo: TsGoComponentInfo | undefined;
-    private eagerOpenDone: Promise<void> | undefined;
+    /** Materialisation is per project: opening a second app must not skip its own shadows. */
+    private readonly opened = new Map<ShadowManager, Promise<void>>();
     /** null once we've looked and found no legend to translate through. */
     private legendMap: number[] | null | undefined;
 
     constructor(options: TsGoPluginOptions) {
         this.server = options.server;
-        this.shadows = options.shadows;
+        this.projects = options.projects;
         this.docManager = options.docManager;
         this.componentInfo = options.componentInfo;
     }
@@ -187,55 +190,59 @@ export class TsGoPlugin implements Plugin {
      * `declare module '*.svelte'` absorbs the failed resolution: no TS2307, no error, just
      * every import silently typed `any`. Lazy opening cannot detect its own failure.
      */
-    private async ensureProjectOpened(): Promise<void> {
-        this.eagerOpenDone ??= (async () => {
-            const files = [
-                ...this.shadows.findProjectSvelteFiles(),
-                ...this.shadows.findDependencySvelteFiles()
-            ];
-            Logger.log(`[tsgo] materialising ${files.length} shadows`);
-            const started = Date.now();
-            const written = new Set<string>();
-            let reused = 0;
-            for (const filePath of files) {
-                try {
-                    const shadowPathIfFresh = this.shadows.getShadowPath(filePath);
-                    // A shadow newer than its source is already what the transform would produce,
-                    // so re-deriving it is pure startup cost. The editor is usually reopened on an
-                    // unchanged tree, which makes this nearly the whole loop. Correctness comes
-                    // from the fingerprint: a Svelte or svelte2tsx upgrade invalidates all of them.
-                    if (
-                        !this.docManager.get(pathToUrl(filePath)) &&
-                        this.shadows.isShadowFresh(filePath, shadowPathIfFresh)
-                    ) {
-                        written.add(shadowPathIfFresh);
-                        reused++;
-                        continue;
+    private async ensureProjectOpened(shadows: ShadowManager): Promise<void> {
+        let done = this.opened.get(shadows);
+        if (!done) {
+            done = (async () => {
+                const files = [
+                    ...shadows.findProjectSvelteFiles(),
+                    ...shadows.findDependencySvelteFiles()
+                ];
+                Logger.log(`[tsgo] materialising ${files.length} shadows`);
+                const started = Date.now();
+                const written = new Set<string>();
+                let reused = 0;
+                for (const filePath of files) {
+                    try {
+                        const shadowPathIfFresh = shadows.getShadowPath(filePath);
+                        // A shadow newer than its source is already what the transform would produce,
+                        // so re-deriving it is pure startup cost. The editor is usually reopened on an
+                        // unchanged tree, which makes this nearly the whole loop. Correctness comes
+                        // from the fingerprint: a Svelte or svelte2tsx upgrade invalidates all of them.
+                        if (
+                            !this.docManager.get(pathToUrl(filePath)) &&
+                            shadows.isShadowFresh(filePath, shadowPathIfFresh)
+                        ) {
+                            written.add(shadowPathIfFresh);
+                            reused++;
+                            continue;
+                        }
+                        const uri = pathToUrl(filePath);
+                        // Reuse the client's buffer when the file is already open in the editor so
+                        // an unsaved edit isn't clobbered by the on-disk text — but otherwise build
+                        // a detached Document rather than registering it with the DocumentManager.
+                        // Registering would emit documentOpen/documentChange, which the JS engine
+                        // listens to, making *both* engines eagerly load the entire project.
+                        const document =
+                            this.docManager.get(uri) ??
+                            new Document(uri, fs.readFileSync(filePath, 'utf8'));
+                        const snapshot = shadows.transform(document);
+                        const shadowPath = shadows.getShadowPath(filePath);
+                        shadows.writeShadow(shadowPath, snapshot.getFullText());
+                        written.add(shadowPath);
+                    } catch (e) {
+                        Logger.debug(`[tsgo] could not materialise shadow for ${filePath}`, e);
                     }
-                    const uri = pathToUrl(filePath);
-                    // Reuse the client's buffer when the file is already open in the editor so
-                    // an unsaved edit isn't clobbered by the on-disk text — but otherwise build
-                    // a detached Document rather than registering it with the DocumentManager.
-                    // Registering would emit documentOpen/documentChange, which the JS engine
-                    // listens to, making *both* engines eagerly load the entire project.
-                    const document =
-                        this.docManager.get(uri) ??
-                        new Document(uri, fs.readFileSync(filePath, 'utf8'));
-                    const snapshot = this.shadows.transform(document);
-                    const shadowPath = this.shadows.getShadowPath(filePath);
-                    this.shadows.writeShadow(shadowPath, snapshot.getFullText());
-                    written.add(shadowPath);
-                } catch (e) {
-                    Logger.debug(`[tsgo] could not materialise shadow for ${filePath}`, e);
                 }
-            }
-            this.shadows.pruneOrphanedShadows(written);
-            Logger.log(
-                `[tsgo] materialised ${written.size} shadows in ${Date.now() - started}ms ` +
-                    `(${reused} reused from disk)`
-            );
-        })();
-        return this.eagerOpenDone;
+                shadows.pruneOrphanedShadows(written);
+                Logger.log(
+                    `[tsgo] materialised ${written.size} shadows in ${Date.now() - started}ms ` +
+                        `(${reused} reused from disk)`
+                );
+            })();
+            this.opened.set(shadows, done);
+        }
+        return done;
     }
 
     /** Bring a document's shadow up to date and hand back what's needed to map positions. */
@@ -246,12 +253,13 @@ export class TsGoPlugin implements Plugin {
         if (!filePath || !filePath.endsWith('.svelte')) {
             return null;
         }
-        await this.ensureProjectOpened();
+        const shadows = this.projects.forFile(filePath);
+        await this.ensureProjectOpened(shadows);
 
         const t0 = TIMING ? Date.now() : 0;
-        const snapshot = this.shadows.transform(document);
+        const snapshot = shadows.transform(document);
         const t1 = TIMING ? Date.now() : 0;
-        const shadowPath = this.shadows.getShadowPath(filePath);
+        const shadowPath = shadows.getShadowPath(filePath);
 
         // Only documents the editor actually has open become LSP overlays; everything else
         // lives on disk. Each didOpen costs tsgo a synchronous snapshot rebuild, so this stays
@@ -262,7 +270,7 @@ export class TsGoPlugin implements Plugin {
             // later optimisation; correctness first.
             await this.server.updateDocument(shadowPath, [{ text }], text);
         } else {
-            this.shadows.ensureShadowDirectory(shadowPath);
+            shadows.ensureShadowDirectory(shadowPath);
             await this.server.openDocument(shadowPath, text);
         }
 
@@ -270,7 +278,7 @@ export class TsGoPlugin implements Plugin {
         // Our own tsgo session reads the overlay above and does not need this — the reader is the
         // editor's *TypeScript* server, which resolves `.svelte` imports from `.ts` files through
         // the shadow tree (see ShadowManager.writeTsSupportConfig) and only ever sees disk.
-        this.shadows.writeShadow(shadowPath, text);
+        shadows.writeShadow(shadowPath, text);
 
         if (TIMING) {
             timing('transform', t1 - t0);
@@ -552,7 +560,7 @@ export class TsGoPlugin implements Plugin {
                 if (!uri || !range) {
                     return undefined;
                 }
-                return mapLocationBack(this.shadows, uri, range);
+                return mapLocationBack(this.projects, uri, range);
             })
             .filter(isNotNullOrUndefined);
     }
@@ -871,7 +879,7 @@ export class TsGoPlugin implements Plugin {
             'textDocument/rename',
             { newName }
         );
-        return response ? mapWorkspaceEditBack(this.shadows, response.result) : null;
+        return response ? mapWorkspaceEditBack(this.projects, response.result) : null;
     }
 
     async getCodeActions(
@@ -921,7 +929,7 @@ export class TsGoPlugin implements Plugin {
                     // Unresolved actions carry a `data` payload we hand back verbatim on resolve.
                     return action as CodeAction;
                 }
-                const edit = mapWorkspaceEditBack(this.shadows, action.edit);
+                const edit = mapWorkspaceEditBack(this.projects, action.edit);
                 return edit ? { ...action, edit } : undefined;
             })
             .filter(isNotNullOrUndefined);
@@ -930,7 +938,7 @@ export class TsGoPlugin implements Plugin {
     async resolveCodeAction(_document: Document, codeAction: CodeAction): Promise<CodeAction> {
         try {
             const resolved: any = await this.server.sendRequest('codeAction/resolve', codeAction);
-            const edit = mapWorkspaceEditBack(this.shadows, resolved?.edit);
+            const edit = mapWorkspaceEditBack(this.projects, resolved?.edit);
             return edit ? { ...resolved, edit } : codeAction;
         } catch (e) {
             Logger.debug('[tsgo] codeAction/resolve failed', e);
@@ -975,7 +983,7 @@ export class TsGoPlugin implements Plugin {
 
     private mapEditsForDocument(document: Document, edits: TextEdit[]): TextEdit[] | undefined {
         const filePath = document.getFilePath();
-        const snapshot = filePath ? this.shadows.getSnapshot(filePath) : undefined;
+        const snapshot = filePath ? this.projects.ensureSnapshot(filePath) : undefined;
         if (!snapshot) {
             return undefined;
         }
@@ -1001,13 +1009,15 @@ export class TsGoPlugin implements Plugin {
                 {
                     files: [
                         {
-                            oldUri: pathToUrl(this.shadows.getShadowPath(oldPath)),
-                            newUri: pathToUrl(this.shadows.getShadowPath(newPath))
+                            oldUri: pathToUrl(
+                                this.projects.forFile(oldPath).getShadowPath(oldPath)
+                            ),
+                            newUri: pathToUrl(this.projects.forFile(newPath).getShadowPath(newPath))
                         }
                     ]
                 }
             );
-            return mapWorkspaceEditBack(this.shadows, result);
+            return mapWorkspaceEditBack(this.projects, result);
         } catch (e) {
             Logger.debug('[tsgo] willRenameFiles failed', e);
             return null;
@@ -1019,7 +1029,9 @@ export class TsGoPlugin implements Plugin {
     // ---------------------------------------------------------------------------------------
 
     async getWorkspaceSymbols(query: string): Promise<WorkspaceSymbol[] | null> {
-        await this.ensureProjectOpened();
+        // Workspace-wide, so every project opened so far has to have been materialised. Projects
+        // nobody has touched are not searched, which matches what the JS engine does.
+        await Promise.all(this.projects.all().map((s) => this.ensureProjectOpened(s)));
         try {
             const result: any = await this.server.sendRequest('workspace/symbol', { query });
             if (!Array.isArray(result)) {
@@ -1033,7 +1045,7 @@ export class TsGoPlugin implements Plugin {
                         return undefined;
                     }
                     const mappedLocation = mapLocationBack(
-                        this.shadows,
+                        this.projects,
                         location.uri,
                         location.range
                     );
@@ -1057,8 +1069,8 @@ export class TsGoPlugin implements Plugin {
         if (!filePath) {
             return null;
         }
-        await this.ensureProjectOpened();
-        const snapshot = this.shadows.getSnapshot(filePath);
+        await this.ensureProjectOpened(this.projects.forFile(filePath));
+        const snapshot = this.projects.ensureSnapshot(filePath);
         if (!snapshot) {
             return null;
         }
@@ -1072,7 +1084,9 @@ export class TsGoPlugin implements Plugin {
         const position = snapshot.positionAt(marker + 'export default class '.length);
         try {
             const result: any = await this.server.sendRequest('textDocument/references', {
-                textDocument: { uri: pathToUrl(this.shadows.getShadowPath(filePath)) },
+                textDocument: {
+                    uri: pathToUrl(this.projects.forFile(filePath).getShadowPath(filePath))
+                },
                 position,
                 context: { includeDeclaration: false }
             });
@@ -1101,11 +1115,15 @@ export class TsGoPlugin implements Plugin {
     }
 
     private mapCallHierarchyItem(item: any): CallHierarchyItem | undefined {
-        const location = mapLocationBack(this.shadows, item.uri, item.selectionRange ?? item.range);
+        const location = mapLocationBack(
+            this.projects,
+            item.uri,
+            item.selectionRange ?? item.range
+        );
         if (!location) {
             return undefined;
         }
-        const full = mapLocationBack(this.shadows, item.uri, item.range) ?? location;
+        const full = mapLocationBack(this.projects, item.uri, item.range) ?? location;
         return { ...item, uri: location.uri, range: full.range, selectionRange: location.range };
     }
 
@@ -1120,11 +1138,11 @@ export class TsGoPlugin implements Plugin {
     private async callHierarchyCalls(method: string, item: CallHierarchyItem, key: 'from' | 'to') {
         // Send the item back in generated coordinates, which is where tsgo left it.
         const filePath = urlToPath(item.uri);
-        const snapshot = filePath ? this.shadows.getSnapshot(filePath) : undefined;
+        const snapshot = filePath ? this.projects.ensureSnapshot(filePath) : undefined;
         const generatedItem = snapshot
             ? {
                   ...item,
-                  uri: pathToUrl(this.shadows.getShadowPath(filePath!)),
+                  uri: pathToUrl(this.projects.forFile(filePath!).getShadowPath(filePath!)),
                   range: mapRangeToGenerated(snapshot, item.range),
                   selectionRange: mapRangeToGenerated(snapshot, item.selectionRange)
               }
@@ -1143,10 +1161,10 @@ export class TsGoPlugin implements Plugin {
                     }
                     const target = urlToPath(call[key].uri);
                     const targetOriginal = target
-                        ? this.shadows.getOriginalPath(target)
+                        ? this.projects.getOriginalPath(target)
                         : undefined;
                     const targetSnapshot = targetOriginal
-                        ? this.shadows.getSnapshot(targetOriginal)
+                        ? this.projects.ensureSnapshot(targetOriginal)
                         : undefined;
                     const fromRanges = (call.fromRanges ?? [])
                         .map((r: Range) =>
@@ -1191,18 +1209,19 @@ export class TsGoPlugin implements Plugin {
             if (!change.fileName.endsWith('.svelte')) {
                 continue;
             }
-            const shadowPath = this.shadows.getShadowPath(change.fileName);
+            const shadows = this.projects.forFile(change.fileName);
+            const shadowPath = shadows.getShadowPath(change.fileName);
             if (change.changeType === FileChangeType.Deleted) {
-                this.shadows.deleteSnapshot(change.fileName);
-                this.shadows.removeShadow(shadowPath);
+                shadows.deleteSnapshot(change.fileName);
+                shadows.removeShadow(shadowPath);
                 void this.server.closeDocument(shadowPath);
                 continue;
             }
             try {
                 const text = fs.readFileSync(change.fileName, 'utf8');
                 const document = new Document(pathToUrl(change.fileName), text);
-                const snapshot = this.shadows.transform(document);
-                this.shadows.writeShadow(shadowPath, snapshot.getFullText());
+                const snapshot = shadows.transform(document);
+                shadows.writeShadow(shadowPath, snapshot.getFullText());
             } catch (e) {
                 Logger.debug(`[tsgo] could not refresh shadow for ${change.fileName}`, e);
             }

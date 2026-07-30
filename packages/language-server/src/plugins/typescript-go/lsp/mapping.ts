@@ -2,7 +2,7 @@ import { Location, Range, TextEdit, WorkspaceEdit } from 'vscode-languageserver'
 import { mapRangeToOriginal } from '../../../lib/documents';
 import { pathToUrl, urlToPath } from '../../../utils';
 import { SvelteDocumentSnapshot } from '../../typescript/DocumentSnapshot';
-import { ShadowManager } from './ShadowManager';
+import { ShadowLookup } from './ProjectRegistry';
 
 /** A range that failed to map has a negative line; see SourceMapDocumentMapper. */
 export function isMapped(range: Range | undefined | null): range is Range {
@@ -17,7 +17,7 @@ export function isMapped(range: Range | undefined | null): range is Range {
  * signal to drop the result rather than send the user somewhere arbitrary.
  */
 export function mapLocationBack(
-    shadows: ShadowManager,
+    shadows: ShadowLookup,
     uri: string,
     range: Range
 ): Location | undefined {
@@ -40,7 +40,7 @@ export function mapLocationBack(
 
 /** Map a whole WorkspaceEdit's `changes` back to original files, dropping unmappable edits. */
 export function mapWorkspaceEditBack(
-    shadows: ShadowManager,
+    shadows: ShadowLookup,
     edit: WorkspaceEdit | null | undefined
 ): WorkspaceEdit | null {
     if (!edit) {
