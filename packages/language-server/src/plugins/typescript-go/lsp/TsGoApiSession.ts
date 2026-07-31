@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { dirname } from 'path';
 import { pathToFileURL } from 'url';
 import { Logger } from '../../../logger';
@@ -66,13 +67,20 @@ export class TsGoApiSession {
 
     private async doConnect(): Promise<boolean> {
         try {
-            // The JS API client ships with @typescript/native-preview. It is deliberately
-            // resolved independently of the tsgo *binary* — a native-preview client attaches
-            // fine to an effect-tsgo server, which is the combination we actually run.
-            const pkgJson = require.resolve('@typescript/native-preview/package.json', {
-                paths: [this.resolveFrom, __dirname]
-            });
-            const entry = `${dirname(pkgJson)}/dist/api/async/api.js`;
+            // The JS API client, from whichever package actually ships `dist/api/async/api.js`.
+            // effect-tsgo first — when a release starts bundling the client it is the exact
+            // match for the running binary — then stock TypeScript 7. The existence check is
+            // load-bearing: pnpm's virtual store can resolve a *transitive* native-preview
+            // whose published files don't include the async API at all, which is precisely how
+            // component-level features silently vanished from the published package while
+            // working in the checkout.
+            const entry = this.resolveApiEntry();
+            if (!entry) {
+                throw new Error(
+                    'no package with dist/api/async/api.js found ' +
+                        '(tried @reintersect/effect-tsgo, @typescript/native, @typescript/native-preview)'
+                );
+            }
             this.module = await importESM(pathToFileURL(entry).href);
 
             const session = await this.server.sendRequest<{ pipe?: string }>(
@@ -94,6 +102,28 @@ export class TsGoApiSession {
             this.failed = true;
             return false;
         }
+    }
+
+    private resolveApiEntry(): string | undefined {
+        const candidates = [
+            '@reintersect/effect-tsgo',
+            '@typescript/native',
+            '@typescript/native-preview'
+        ];
+        for (const name of candidates) {
+            try {
+                const pkgJson = require.resolve(`${name}/package.json`, {
+                    paths: [this.resolveFrom, __dirname]
+                });
+                const entry = `${dirname(pkgJson)}/dist/api/async/api.js`;
+                if (fs.existsSync(entry)) {
+                    return entry;
+                }
+            } catch {
+                // Try the next candidate.
+            }
+        }
+        return undefined;
     }
 
     /**

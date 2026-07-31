@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.19.1
+
+### Patch Changes
+
+-   Resolve the checker API client from a package that actually ships it
+
+    The component-props checker resolved `@typescript/native-preview` blindly, which
+    worked in the development checkout but not from the published package: pnpm's
+    virtual store offers a transitive dev build whose files don't include
+    `dist/api/async/api.js`, so the API session silently failed to attach and prop
+    completions inside component tags disappeared. The client is now taken from the
+    first of `@reintersect/effect-tsgo`, `@typescript/native`,
+    `@typescript/native-preview` whose published files really contain it.
+
 ## 0.19.0
 
 ### Minor Changes
