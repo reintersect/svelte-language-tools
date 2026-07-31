@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.8.2
+
+### Patch Changes
+
+-   Document setup: per-workspace install with `ls-path` + the `tsgo` setting for
+    the editor (monorepos work opened at the root), the npm-alias install and
+    `--tsgo` script for svelte-check, tunables, and the experimental rsvelte flag.
+
 ## 4.8.1
 
 ### Patch Changes
