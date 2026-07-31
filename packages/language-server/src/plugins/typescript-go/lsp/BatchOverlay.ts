@@ -10,7 +10,7 @@ import { Logger } from '../../../logger';
 import { normalizePath, pathToUrl } from '../../../utils';
 import { SvelteDocumentSnapshot, SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
 import { mapAndFilterDiagnostics } from '../../typescript/features/DiagnosticsProvider';
-import { preloadRsvelte } from '../rsvelte';
+import { isRsvelteEnabled, preloadRsvelte } from '../rsvelte';
 import {
     findProjectTsconfig,
     findWorkspaceRoot,
@@ -130,7 +130,7 @@ export class TsGoBatchOverlay {
         const svelteCompiler = importSvelte(tsconfigPath || options.workspacePath);
         // Svelte 5 + `lang="ts"` only — the Rust JSDoc emission and version-4 mode produce
         // semantically different TSX (verified against this package's own sanity fixtures).
-        const rsvelte = await preloadRsvelte();
+        const rsvelte = await preloadRsvelte(isRsvelteEnabled());
         const svelteMajor = Number((svelteCompiler?.VERSION ?? '5').split('.')[0]);
         const useRust = !!rsvelte && svelteMajor >= 5;
         const snapshotOptions: SvelteSnapshotOptions = {

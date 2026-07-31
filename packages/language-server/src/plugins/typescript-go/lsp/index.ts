@@ -10,7 +10,7 @@ import { SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
 import { getRsvelte } from '../rsvelte';
 import { findWorkspaceRoot, resolveTsGoPath, ShadowManager } from './ShadowManager';
 
-export { preloadRsvelte } from '../rsvelte';
+export { isRsvelteEnabled, preloadRsvelte } from '../rsvelte';
 import { ProjectRegistry } from './ProjectRegistry';
 import { TsGoPlugin } from './TsGoPlugin';
 import { TsGoApiSession } from './TsGoApiSession';

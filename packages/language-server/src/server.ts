@@ -49,7 +49,12 @@ import {
     OnWatchFileChangesPara,
     LSAndTSDocResolver
 } from './plugins';
-import { createTsGoPlugin, isTsGoEnabled, preloadRsvelte } from './plugins/typescript-go/lsp';
+import {
+    createTsGoPlugin,
+    isRsvelteEnabled,
+    isTsGoEnabled,
+    preloadRsvelte
+} from './plugins/typescript-go/lsp';
 import { debounceThrottle, isNotNullOrUndefined, normalizeUri, urlToPath } from './utils';
 import { FallbackWatcher } from './lib/FallbackWatcher';
 import { configLoader } from './lib/documents/configLoader';
@@ -130,7 +135,8 @@ export function startServer(options?: LSOptions) {
         // exists. Deciding the engine once per session also keeps the shadow fingerprint
         // stable; a mid-session switch would split it between engines.
         if (isTsGoEnabled(evt.initializationOptions)) {
-            await preloadRsvelte();
+            // Opt-in: `svelte.language-server.rsvelte` setting or SVELTE_LS_RSVELTE=1.
+            await preloadRsvelte(isRsvelteEnabled(evt.initializationOptions));
         }
         const workspaceUris = evt.workspaceFolders?.map((folder) => folder.uri.toString()) ?? [
             evt.rootUri ?? ''

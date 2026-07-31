@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.19.2
+
+### Patch Changes
+
+-   Make the rsvelte transform opt-in instead of on-by-default
+
+    The repaired rsvelte source maps are exact for script content but still lose
+    template-level positions: a diagnostic on an unimported `<Component>` in
+    markup mapped to nothing and silently disappeared. Until the upstream
+    generated-column bug is fixed, the Rust transform must be asked for
+    explicitly — `svelte.language-server.rsvelte: true` in the editor or
+    `SVELTE_LS_RSVELTE=1` for svelte-check/benchmarks. The default is the JS
+    transform, which reports template diagnostics correctly.
+
 ## 0.19.1
 
 ### Patch Changes

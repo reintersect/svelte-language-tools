@@ -204,12 +204,30 @@ export function repairRsvelteMap(
 }
 
 /**
- * Load the Rust svelte2tsx if it is installed and not opted out of. Await this once at
- * startup (initialize / batch-overlay creation); after that {@link getRsvelte} is synchronous,
- * which matters because the transform itself runs inside synchronous snapshot code.
+ * Whether the Rust transform is opted into. **Off by default**: the repaired maps are exact
+ * for script content but still lose template-level positions — a diagnostic on an unimported
+ * `<Component>` maps to nothing and silently disappears. Until the upstream generated-column
+ * bug is fixed (at which point the maps need no repair at all), rsvelte is an experiment you
+ * turn on, not a default you trust.
  */
-export function preloadRsvelte(): Promise<RsvelteModule | undefined> {
-    if (process.env.SVELTE_LS_NO_RSVELTE === '1' || process.env.SVELTE_LS_NO_RSVELTE === 'true') {
+export function isRsvelteEnabled(initializationOptions?: any): boolean {
+    const fromClient =
+        initializationOptions?.configuration?.svelte?.['language-server']?.rsvelte ??
+        initializationOptions?.config?.['language-server']?.rsvelte;
+    if (typeof fromClient === 'boolean') {
+        return fromClient;
+    }
+    const value = process.env.SVELTE_LS_RSVELTE;
+    return value === '1' || value === 'true';
+}
+
+/**
+ * Load the Rust svelte2tsx if it is installed and opted into. Await this once at startup
+ * (initialize / batch-overlay creation); after that {@link getRsvelte} is synchronous, which
+ * matters because the transform itself runs inside synchronous snapshot code.
+ */
+export function preloadRsvelte(enabled: boolean): Promise<RsvelteModule | undefined> {
+    if (!enabled) {
         return Promise.resolve(undefined);
     }
     loading ??= (async () => {
