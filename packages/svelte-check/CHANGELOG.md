@@ -1,5 +1,23 @@
 # Changelog
 
+## 4.8.0
+
+### Minor Changes
+
+-   Make the tsgo engine work in monorepos and cut its latency
+
+    -   Canonical, manager-independent shadow layout with one writer per overlay
+        tsconfig; project resolution bounded by workspace roots and node_modules.
+    -   Generated files move from `.svelte-ls-overlay/` to
+        `node_modules/.cache/svelte-lsp/` (legacy directories are removed on sight).
+    -   Pull-mode diagnostics (VS Code showed no TypeScript squiggles at all before),
+        per-file checker projects, cancellation forwarding, crash-restart replay.
+    -   Components transform through rsvelte's Rust svelte2tsx (Svelte 5 +
+        `lang="ts"`, with per-file JS fallback and repaired source maps); diagnostics
+        pulls debounce to typing pauses; semantic tokens are viewport-scoped;
+        completion lists are no longer cloned per item. `SVELTE_LS_NO_RSVELTE=1`
+        restores the JS transform.
+
 ## 4.7.4
 
 ### Patch Changes
