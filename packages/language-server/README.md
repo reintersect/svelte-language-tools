@@ -31,8 +31,8 @@
 > JavaScript engine.
 
 Published as **`@reintersect/svelte-language-server`**. Point your editor at it with
-`svelte.language-server.ls-path`, and set `SVELTE_LS_TSGO=1` to turn the tsgo engine on — with the
-flag unset it behaves exactly like upstream.
+`svelte.language-server.ls-path`, and set `"svelte.language-server.tsgo": true` to turn the tsgo
+engine on — without it the fork behaves exactly like upstream.
 
 # Svelte Language Server
 
@@ -47,44 +47,48 @@ Requires Node 12 or later.
 The official **Svelte for VS Code** extension can be pointed at a different language server binary,
 so there is nothing to build or sideload — keep the extension you already have and redirect it.
 
-**1. Install the server** somewhere stable. Global is simplest:
+**1. Install the server and a tsgo binary** as dev dependencies of the workspace you edit:
 
 ```bash
-npm i -g @reintersect/svelte-language-server
+pnpm add -D @reintersect/svelte-language-server @reintersect/effect-tsgo
 ```
 
-**2. Find where it landed** — you need the absolute path to the package directory, not the bin:
+(`@typescript/native` works in place of `@reintersect/effect-tsgo`; the server resolves the binary
+from the project, so each project pins its own. In a pnpm workspace, install both at the root.)
 
-```bash
-npm root -g
-```
-
-Append `/@reintersect/svelte-language-server` to that.
-
-**3. Point the extension at it**, in your *user* settings (`settings.json`), and turn the engine on:
+**2. Point the extension at it and turn the engine on**, in the workspace's
+`.vscode/settings.json`:
 
 ```jsonc
 {
-    // Absolute path to the package directory from step 2.
-    "svelte.language-server.ls-path": "/usr/local/lib/node_modules/@reintersect/svelte-language-server",
-
-    // Without this the fork behaves exactly like upstream — the tsgo engine is opt-in.
-    "svelte.language-server.runtime-args": ["--env", "SVELTE_LS_TSGO=1"]
+    "svelte.language-server.ls-path": "./node_modules/@reintersect/svelte-language-server/bin/server.js",
+    "svelte.language-server.tsgo": true,
+    // The classic TS plugin still runs the JavaScript engine; keep it out of the way.
+    "svelte.enable-ts-plugin": false
 }
 ```
 
-If `runtime-args` does not take (it is passed to the Node runtime, not the server), set
-`SVELTE_LS_TSGO=1` in the environment VS Code itself is launched from instead — on macOS that means
-launching it from a shell that has the variable, since GUI-launched apps do not read your shell
-profile:
+A global install with an absolute `ls-path` works too; the per-workspace install just keeps the
+server version pinned with the repo. (`SVELTE_LS_TSGO=1` in the environment does the same as the
+setting, for CI and benchmarks where there is no settings.json.)
 
-```bash
-SVELTE_LS_TSGO=1 code .
-```
+**3. Restart the extension host** — `Developer: Reload Window`. Confirm it took by opening
+**Output → Svelte**; the log says `[tsgo] enabled, using <path>`, names the project it resolved
+(`[tsgo] project <dir>`), and reports `[tsgo] materialised N shadows` on the first request.
 
-**4. Restart the extension host** — `Developer: Reload Window`. Confirm it took by opening
-**Output → Svelte**; the log says `[tsgo] enabled, using <path>` and, on the first request,
-`[tsgo] materialising N shadows`.
+**Monorepos work opened at the root.** Projects are resolved per file from the nearest tsconfig —
+open the workspace root and every app and package gets its own program, its own Svelte version and
+its own shims. You do not need to open individual apps as workspace folders.
+
+### Experimental: the Rust transform
+
+With `@rsvelte/svelte2tsx` installed, `"svelte.language-server.rsvelte": true` (or
+`SVELTE_LS_RSVELTE=1`) transforms Svelte 5 `lang="ts"` components through
+[rsvelte](https://github.com/baseballyama/rsvelte)'s native svelte2tsx — several times faster than
+the JS transform. **Off by default**: rsvelte's source maps currently ship a generated-column bug,
+and even repaired they lose template-level positions, so diagnostics on markup (an unimported
+`<Component>`, a bad prop) can silently disappear. Turn it on only if that trade is acceptable;
+the default JS transform reports everything.
 
 ### What you should notice
 
@@ -111,9 +115,23 @@ point — the flag was kept so a bad day is a settings change rather than a rein
 
 ### Requirements
 
-`@reintersect/effect-tsgo` (preferred) or `@typescript/native-preview` installed in the workspace
-being edited. The server resolves the binary from the project, not from itself, so each project can
-pin its own. With neither present it logs an error and falls back to the JavaScript engine.
+`@reintersect/effect-tsgo` (preferred), `@typescript/native` or `@typescript/native-preview`
+installed in the workspace being edited. The server resolves the binary from the project, not from
+itself, so each project can pin its own; `SVELTE_LS_TSGO_PACKAGE` pins a specific one for A/B runs.
+With none present it logs an error and falls back to the JavaScript engine. Component-props
+completions additionally need the checker API client (`dist/api/async/api.js`), which ships with
+`@typescript/native`; without it the server logs that component-level features are limited and
+everything else keeps working.
+
+### Tunables
+
+| environment variable | effect |
+|---|---|
+| `SVELTE_LS_TSGO=1` | turn the tsgo engine on without the editor setting |
+| `SVELTE_LS_TSGO_PACKAGE` | pin which package provides the tsgo binary |
+| `SVELTE_LS_RSVELTE=1` | opt into the Rust transform (see above) |
+| `SVELTE_LS_DIAGNOSTICS_DEBOUNCE_MS` | how long a diagnostics pull waits for typing to settle (default 150) |
+| `SVELTE_LS_TIMING=<file>` | append per-phase keystroke timings to a file |
 
 ## What is a language server?
 

@@ -46,6 +46,38 @@
 > Known gaps versus upstream: no `refactor` code actions (TypeScript 7 does not implement them yet),
 > partial quickfix coverage, and `typescript-svelte-plugin` is untouched — it still runs on the
 > JavaScript engine.
+>
+> ### Setup
+>
+> **Editor (VS Code, keeps the official extension):**
+>
+> ```bash
+> pnpm add -D @reintersect/svelte-language-server @reintersect/effect-tsgo
+> ```
+>
+> ```jsonc
+> // .vscode/settings.json
+> {
+>     "svelte.language-server.ls-path": "./node_modules/@reintersect/svelte-language-server/bin/server.js",
+>     "svelte.language-server.tsgo": true,
+>     "svelte.enable-ts-plugin": false
+> }
+> ```
+>
+> Reload the window; **Output → Svelte** should log `[tsgo] enabled`. Monorepos work opened at the
+> root — projects resolve per file from the nearest tsconfig. Full instructions, tunables and the
+> experimental Rust-transform flag: [`packages/language-server`](packages/language-server/README.md).
+>
+> **CLI / CI:**
+>
+> ```bash
+> pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.1 @reintersect/effect-tsgo
+> svelte-check --tsgo --tsconfig ./tsconfig.json
+> ```
+>
+> Details: [`packages/svelte-check`](packages/svelte-check/README.md). For pull requests,
+> [`reintersect/svelte-check-action`](https://github.com/reintersect/svelte-check-action) runs this
+> fork with `tsgo: true` and comments the diagnostics.
 
 
 ## What is Svelte Language Tools?

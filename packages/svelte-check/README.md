@@ -31,8 +31,39 @@
 > JavaScript engine.
 
 Published as **`@reintersect/svelte-check`**. Run it with `--tsgo` to use the native engine; without
-the flag it behaves exactly like upstream. `--tsgo` needs a tsconfig/jsconfig and either
-`@reintersect/effect-tsgo` or `@typescript/native-preview` installed in the workspace.
+the flag it behaves exactly like upstream.
+
+## Using this fork
+
+**1. Install it in place of upstream**, together with a tsgo binary. The npm alias keeps every
+`svelte-check` script and tool working unchanged (in a pnpm workspace, a catalog entry does the
+same for every package at once):
+
+```bash
+pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.1 @reintersect/effect-tsgo
+```
+
+**2. Add `--tsgo` to your check script.** It requires an explicit tsconfig:
+
+```json
+{
+    "scripts": {
+        "check": "svelte-kit sync && svelte-check --tsgo --tsconfig ./tsconfig.json"
+    }
+}
+```
+
+Generated `.tsx` twins land in `node_modules/.cache/svelte-lsp/` in each package that has
+components — already ignored by git and search tools, safe to delete, reused across runs so warm
+checks skip the transform entirely.
+
+**Requirements:** a tsconfig/jsconfig, and `@reintersect/effect-tsgo`, `@typescript/native` or
+`@typescript/native-preview` in the workspace. `SVELTE_LS_RSVELTE=1` opts the transform into
+rsvelte's Rust svelte2tsx (fast, but its source-map bug can lose template-level diagnostics —
+off by default).
+
+**In CI**, [`reintersect/svelte-check-action`](https://github.com/reintersect/svelte-check-action)
+runs this fork with `tsgo: true` and comments diagnostics on the pull request.
 
 # Check your code with svelte-check
 
