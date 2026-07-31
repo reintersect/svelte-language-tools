@@ -3,8 +3,10 @@ import {
     CodeDescription,
     Diagnostic,
     DiagnosticSeverity,
+    LSPErrorCodes,
     Position,
-    Range
+    Range,
+    ResponseError
 } from 'vscode-languageserver';
 import {
     Document,
@@ -28,17 +30,17 @@ export async function getDiagnostics(
     cancellationToken?: CancellationToken
 ): Promise<Diagnostic[]> {
     const config = await svelteDoc.config;
+    throwIfCancelled(cancellationToken);
     if (config?.loadConfigError) {
         return getConfigLoadErrorDiagnostics(config.loadConfigError, config.configSource);
-    }
-
-    if (cancellationToken?.isCancellationRequested) {
-        return [];
     }
 
     try {
         return await tryGetDiagnostics(document, svelteDoc, settings, cancellationToken);
     } catch (error) {
+        if (isRequestCancelled(error)) {
+            throw error;
+        }
         return getPreprocessErrorDiagnostics(document, error);
     }
 }
@@ -53,15 +55,11 @@ async function tryGetDiagnostics(
     cancellationToken: CancellationToken | undefined
 ): Promise<Diagnostic[]> {
     const transpiled = await svelteDoc.getTranspiled();
-    if (cancellationToken?.isCancellationRequested) {
-        return [];
-    }
+    throwIfCancelled(cancellationToken);
 
     try {
         const res = await svelteDoc.getCompiled();
-        if (cancellationToken?.isCancellationRequested) {
-            return [];
-        }
+        throwIfCancelled(cancellationToken);
 
         let ignoreScriptWarnings = false;
         let ignoreStyleWarnings = false;
@@ -109,10 +107,23 @@ async function tryGetDiagnostics(
                 )
             );
     } catch (err) {
+        if (isRequestCancelled(err)) {
+            throw err;
+        }
         return createParserErrorDiagnostic(err, document)
             .map((diag) => mapObjWithRangeToOriginal(transpiled, diag))
             .map((diag) => adjustMappings(diag, document));
     }
+}
+
+function throwIfCancelled(cancellationToken: CancellationToken | undefined): void {
+    if (cancellationToken?.isCancellationRequested) {
+        throw new ResponseError(LSPErrorCodes.RequestCancelled, 'Request cancelled');
+    }
+}
+
+function isRequestCancelled(error: unknown): error is ResponseError {
+    return error instanceof ResponseError && error.code === LSPErrorCodes.RequestCancelled;
 }
 
 /**
@@ -136,9 +147,19 @@ function createParserErrorDiagnostic(error: any, document: Document) {
             document.scriptInfo || document.moduleScriptInfo
         );
 
+        // A language attribute elsewhere in the component cannot explain a parser error in
+        // plain markup. The old whole-document check hid real template errors whenever the file
+        // happened to contain `<script lang="ts">`, including malformed typed snippets which
+        // Svelte 5 parses natively. Only defer to an absent preprocessor when the failing region
+        // itself uses a non-default language.
+        const hasRelevantLanguageAttribute = isInStyle
+            ? !!document.getLanguageAttribute('style')
+            : isInScript
+              ? !!document.getLanguageAttribute('script')
+              : !!document.getLanguageAttribute('template');
         if (
             (!document.config?.preprocess || document.config.isFallbackConfig) &&
-            document.hasLanguageAttribute()
+            hasRelevantLanguageAttribute
         ) {
             Logger.error(
                 `Parsing ${document.getFilePath()} failed. No preprocess config found but lang tag exists. Skip showing error because they likely use other preprocessors.`

@@ -14,7 +14,6 @@
 
 [IDE docs and troubleshooting](docs)
 
-
 > ### This is a fork
 >
 > [`reintersect/svelte-language-tools`](https://github.com/reintersect/svelte-language-tools), forked from
@@ -23,18 +22,21 @@
 > which upstream does not do at all, and in **`svelte-check`**, replacing the two experimental tsgo
 > modes that were there.
 >
-> Measured against upstream's classic engine as the oracle, on a ~800-component SvelteKit app in a
-> pnpm monorepo:
+> One recorded comparison against upstream's classic engine, on the Reintersect ~800-component
+> SvelteKit app in its pnpm monorepo:
 >
-> | | upstream | this fork |
-> |---|---|---|
-> | `svelte-check` on a component library | 4.3s | **2.3s** |
-> | `svelte-check` on a SvelteKit app | 15.5s | **3.9s** |
-> | editor: cold project load | 7.7s | **3.6s** |
-> | editor: keystroke → diagnostics | 948ms | **420ms** |
+> |                                       | upstream | this fork |
+> | ------------------------------------- | -------- | --------- |
+> | `svelte-check` on a component library | 4.3s     | **2.3s**  |
+> | `svelte-check` on a SvelteKit app     | 15.5s    | **3.9s**  |
+> | editor: cold project load             | 7.7s     | **3.6s**  |
+> | editor: keystroke → diagnostics       | 948ms    | **420ms** |
 >
-> Same diagnostics in every case — the check is diffed against the classic engine file by file, and
-> converges on it exactly.
+> The repository runs the strict `pnpm test:tsgo-oracle` editor-feature oracle and the whole-project
+> `pnpm test:tsgo-checker-oracle -- --project <project>` checker oracle. Exact parity is an invariant
+> we test, not a blanket guarantee: TypeScript 6 and the evolving TypeScript 7 native compiler can
+> intentionally differ, and an engine update is accepted only after any difference is understood and
+> explicitly covered.
 >
 > **It is also vibecoded as hell.** Essentially all of it was written by Claude in a handful of
 > sessions, against real measurements rather than a design doc, and it drifts from upstream wherever
@@ -71,14 +73,13 @@
 > **CLI / CI:**
 >
 > ```bash
-> pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.1 @reintersect/effect-tsgo
+> pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.2 @reintersect/effect-tsgo
 > svelte-check --tsgo --tsconfig ./tsconfig.json
 > ```
 >
 > Details: [`packages/svelte-check`](packages/svelte-check/README.md). For pull requests,
 > [`reintersect/svelte-check-action`](https://github.com/reintersect/svelte-check-action) runs this
 > fork with `tsgo: true` and comments the diagnostics.
-
 
 ## What is Svelte Language Tools?
 

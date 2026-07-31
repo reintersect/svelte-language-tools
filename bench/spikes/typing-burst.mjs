@@ -1,55 +1,51 @@
 /**
- * What a burst of typing actually costs.
+ * Pull-diagnostic typing-burst benchmark.
  *
- * The latency harness sends one edit and waits, which flatters a short debounce: there is never a
- * second keystroke to collide with the first. Real typing is a burst, and the two settings
- * interact — with an *uncancellable* ~300ms check (measured: tsgo discards its checker on any
- * program change, and `$/cancelRequest` is a no-op), a short debounce lets every keystroke start a
- * full check that is obsolete before it finishes. The debounce is not just latency, it is also the
- * only thing currently coalescing that work.
- *
- * So this measures the number that matters: from the LAST keystroke of a burst, how long until the
- * diagnostics describing that final text arrive.
+ * A request is issued after every keystroke, just as a pull-diagnostic editor does. That is
+ * essential: the tsgo quiescence budget is only on the pull path, and a benchmark which waits
+ * until the final edit (or uses legacy publishDiagnostics) cannot measure redundant native
+ * checks at all.
  *
  * Usage:
- *   node bench/spikes/typing-burst.mjs --project <dir> --file <rel.svelte> [--burst 6] [--gap 60]
+ *   node bench/spikes/typing-burst.mjs --project <dir> --file <rel.svelte> \
+ *     [--package @typescript/native-preview] [--debounce 150] [--gap 60] [--rounds 20]
  */
-import fs from 'fs';
-import path from 'path';
-import { pathToFileURL } from 'url';
-import { LspClient } from '../lsp-client.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+    ProcessTreeMonitor,
+    formatBytes,
+    getTsGoStats,
+    now,
+    shutdownLanguageServer,
+    startLanguageServer,
+    summarize,
+    uri
+} from '../perf-utils.mjs';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '../..');
-const SERVER = path.join(REPO, 'packages/language-server/bin/server.js');
-
-const args = process.argv.slice(2);
-const argOf = (name, dflt) => {
-    const i = args.indexOf(name);
-    return i === -1 ? dflt : args[i + 1];
-};
-const PROJECT = path.resolve(argOf('--project', process.env.SVELTE_LS_BENCH_PROJECT ?? '.'));
-const FILE = argOf('--file', null);
-const BURST = Number(argOf('--burst', 6));
-const GAP = Number(argOf('--gap', 60)); // ms between keystrokes; 60ms ~= 200 wpm
-const ROUNDS = Number(argOf('--rounds', 6));
-
-const uri = (p) => pathToFileURL(p).href;
-const now = () => Number(process.hrtime.bigint()) / 1e6;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DEFAULT_SERVER = path.join(REPO, 'packages/language-server/bin/server.js');
 
 function findFile(root) {
     const skip = new Set(['node_modules', '.git', '.svelte-kit', 'dist', 'build']);
-    const walk = (dir, depth) => {
+    const walk = (directory, depth) => {
         if (depth > 8) return null;
-        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-            if (e.name.startsWith('.')) continue;
-            const full = path.join(dir, e.name);
-            if (e.isDirectory()) {
-                if (skip.has(e.name)) continue;
-                const found = walk(full, depth + 1);
-                if (found) return found;
-            } else if (e.name.endsWith('.svelte') && fs.statSync(full).size > 4000) {
+        let entries;
+        try {
+            entries = fs.readdirSync(directory, { withFileTypes: true });
+        } catch {
+            return null;
+        }
+        for (const entry of entries) {
+            const full = path.join(directory, entry.name);
+            if (entry.isDirectory()) {
+                if (!entry.name.startsWith('.') && !skip.has(entry.name)) {
+                    const found = walk(full, depth + 1);
+                    if (found) return found;
+                }
+            } else if (entry.name.endsWith('.svelte') && fs.statSync(full).size > 1000) {
                 return full;
             }
         }
@@ -58,101 +54,235 @@ function findFile(root) {
     return walk(path.join(root, 'src'), 0);
 }
 
-const file = FILE ? path.resolve(PROJECT, FILE) : findFile(PROJECT);
-const original = fs.readFileSync(file, 'utf-8');
-
-/** Put a statement at the end of the instance script, where it is guaranteed to be checked. */
-function injectIntoScript(source, text) {
-    const close = source.lastIndexOf('</script>');
-    if (close === -1) throw new Error('no </script> in ' + file);
-    return source.slice(0, close) + '\n' + text + '\n' + source.slice(close);
+/** Put a statement at the start of an instance/module script, where TypeScript must check it. */
+function injectIntoScript(source, text, filePath) {
+    const opening = /<script(?:\s[^>]*)?>/.exec(source);
+    if (!opening) throw new Error(`benchmark file has no <script> block: ${filePath}`);
+    const offset = opening.index + opening[0].length;
+    return source.slice(0, offset) + `\n${text}\n` + source.slice(offset);
 }
 
-const client = new LspClient(process.execPath, [SERVER, '--stdio'], {
-    cwd: PROJECT,
-    env: { ...process.env }
-});
-
-// publishDiagnostics carries no version, so the only reliable way to know which edit a report
-// describes is to make each edit introduce a uniquely named undefined identifier and wait for the
-// diagnostic that names it.
-const pending = new Map();
-client.onNotification('textDocument/publishDiagnostics', (params) => {
-    for (const [marker, resolve] of [...pending]) {
-        if (params.diagnostics?.some((d) => (d.message ?? '').includes(marker))) {
-            pending.delete(marker);
-            resolve();
-        }
+function validateReport(report, marker, context) {
+    if (!report || report.kind !== 'full' || !Array.isArray(report.items)) {
+        throw new Error(`${context} returned malformed diagnostics: ${JSON.stringify(report)}`);
     }
-});
+    if (!report.items.some((diagnostic) => String(diagnostic.message ?? '').includes(marker))) {
+        throw new Error(`${context} completed without the ${marker} diagnostic`);
+    }
+}
 
-const waitFor = (marker, timeoutMs = 120000) =>
-    new Promise((resolve, reject) => {
-        const timer = setTimeout(
-            () => reject(new Error(`timed out waiting for ${marker}`)),
+export async function runBurstTrial({
+    project,
+    file,
+    packageName = '@typescript/native-preview',
+    debounceMs = 150,
+    gapMs = 60,
+    rounds = 20,
+    burst = 6,
+    timeoutMs = 180_000,
+    settleMs = 75,
+    serverPath = DEFAULT_SERVER
+}) {
+    if (!Number.isSafeInteger(rounds) || rounds <= 0) throw new Error('rounds must be positive');
+    if (!Number.isSafeInteger(burst) || burst < 2) throw new Error('burst must be at least 2');
+    if (![debounceMs, gapMs, settleMs].every((value) => Number.isFinite(value) && value >= 0)) {
+        throw new Error('debounce, gap and settle must be non-negative numbers');
+    }
+    const absoluteProject = path.resolve(project);
+    const absoluteFile = file ? path.resolve(absoluteProject, file) : findFile(absoluteProject);
+    if (!absoluteFile || !fs.existsSync(absoluteFile)) {
+        throw new Error(`benchmark file not found: ${absoluteFile ?? '(auto-discovery failed)'}`);
+    }
+    const original = fs.readFileSync(absoluteFile, 'utf8');
+    const fileUri = uri(absoluteFile);
+    const { client, engine } = await startLanguageServer({
+        serverPath,
+        project: absoluteProject,
+        useTsGo: true,
+        packageName,
+        debounceMs
+    });
+
+    let version = 1;
+    let monitor;
+    try {
+        const warmMarker = '__burst_warmup__';
+        client.notify('textDocument/didOpen', {
+            textDocument: {
+                uri: fileUri,
+                languageId: 'svelte',
+                version,
+                text: injectIntoScript(original, `${warmMarker};`, absoluteFile)
+            }
+        });
+        const warmReport = await client.request(
+            'textDocument/diagnostic',
+            { textDocument: { uri: fileUri } },
             timeoutMs
         );
-        pending.set(marker, () => {
-            clearTimeout(timer);
-            resolve();
-        });
-    });
+        validateReport(warmReport, warmMarker, 'warmup');
 
-await client.request('initialize', {
-    processId: process.pid,
-    rootUri: uri(PROJECT),
-    workspaceFolders: [{ uri: uri(PROJECT), name: 'p' }],
-    capabilities: { textDocument: { publishDiagnostics: {} } },
-    initializationOptions: { configuration: { typescript: {}, svelte: {}, javascript: {} } }
-});
-client.notify('initialized', {});
-client.notify('textDocument/didOpen', {
-    textDocument: { uri: uri(file), languageId: 'svelte', version: 1, text: original }
-});
+        const before = await getTsGoStats(client);
+        monitor = new ProcessTreeMonitor(client.proc.pid);
+        monitor.start();
 
-console.log(`project  ${PROJECT}`);
-console.log(`file     ${path.relative(PROJECT, file)}`);
-console.log(`burst    ${BURST} keystrokes ${GAP}ms apart, ${ROUNDS} rounds`);
-console.log(`debounce ${process.env.SVELTE_LS_DIAGNOSTICS_DEBOUNCE_MS ?? '120 (default)'}\n`);
+        const latencies = [];
+        const roundChecks = [];
+        for (let round = 0; round < rounds; round++) {
+            const checksBefore = (await getTsGoStats(client)).projectChecks;
+            const pulls = [];
+            let finalMarker;
+            let finalStarted;
+            for (let key = 0; key < burst; key++) {
+                const marker = `__burst_${round}_${key}__`;
+                version++;
+                const final = key === burst - 1;
+                if (final) {
+                    finalMarker = marker;
+                    finalStarted = now();
+                }
+                client.notify('textDocument/didChange', {
+                    textDocument: { uri: fileUri, version },
+                    contentChanges: [
+                        { text: injectIntoScript(original, `${marker};`, absoluteFile) }
+                    ]
+                });
+                const promise = client.request(
+                    'textDocument/diagnostic',
+                    { textDocument: { uri: fileUri } },
+                    timeoutMs
+                );
+                pulls.push({ marker, final, promise });
+                if (!final) await new Promise((resolve) => setTimeout(resolve, gapMs));
+            }
 
-// Warm up: first diagnostics build the whole program.
-const warm = `__burst_warmup__`;
-client.notify('textDocument/didChange', {
-    textDocument: { uri: uri(file), version: 2 },
-    contentChanges: [{ text: injectIntoScript(original, `${warm};`) }]
-});
-await waitFor(warm, 240000);
+            const finalReport = await pulls.at(-1).promise;
+            validateReport(finalReport, finalMarker, `round ${round + 1}`);
+            latencies.push(now() - finalStarted);
 
-let version = 2;
-const results = [];
-for (let round = 0; round < ROUNDS; round++) {
-    const marker = `__burst_final_${round}__`;
-    // Type BURST-1 throwaway characters, then the one whose diagnostic we wait for.
-    for (let k = 0; k < BURST - 1; k++) {
-        version++;
-        client.notify('textDocument/didChange', {
-            textDocument: { uri: uri(file), version },
-            contentChanges: [{ text: injectIntoScript(original, `__burst_${round}_${k}__;`) }]
-        });
-        await sleep(GAP);
+            const settled = await Promise.allSettled(pulls.map((pull) => pull.promise));
+            const rejected = settled.find((result) => result.status === 'rejected');
+            if (rejected) throw rejected.reason;
+            for (const result of settled) {
+                if (
+                    !result.value ||
+                    !['full', 'unchanged'].includes(result.value.kind) ||
+                    (result.value.kind === 'full' && !Array.isArray(result.value.items))
+                ) {
+                    throw new Error(
+                        `round ${round + 1} returned malformed superseded diagnostics: ${JSON.stringify(result.value)}`
+                    );
+                }
+            }
+            const checksAfter = (await getTsGoStats(client)).projectChecks;
+            roundChecks.push(checksAfter - checksBefore);
+            if (settleMs) await new Promise((resolve) => setTimeout(resolve, settleMs));
+        }
+
+        const after = await getTsGoStats(client);
+        const resources = monitor.stop();
+        monitor = undefined;
+        client.notify('textDocument/didClose', { textDocument: { uri: fileUri } });
+
+        return {
+            engine,
+            project: absoluteProject,
+            file: path.relative(absoluteProject, absoluteFile),
+            cacheState:
+                before.transformedShadows === 0
+                    ? before.reusedShadows > 0
+                        ? 'warm'
+                        : 'empty'
+                    : before.reusedShadows > 0
+                      ? 'mixed'
+                      : 'cold-or-invalidated',
+            debounceMs,
+            gapMs,
+            burst,
+            rounds,
+            latenciesMs: latencies.map((value) => +value.toFixed(1)),
+            latency: summarize(latencies),
+            nativeChecks: after.projectChecks - before.projectChecks,
+            nativeChecksPerRound: roundChecks,
+            cancellations: after.cancellations - before.cancellations,
+            cpuMs: resources.cpuMs,
+            peakRssBytes: resources.peakRssBytes,
+            maxProcessCount: resources.maxProcessCount,
+            phaseTimings: after.phaseTimings
+        };
+    } finally {
+        if (monitor) {
+            try {
+                monitor.stop();
+            } catch {}
+        }
+        await shutdownLanguageServer(client);
     }
-    version++;
-    const t = now();
-    client.notify('textDocument/didChange', {
-        textDocument: { uri: uri(file), version },
-        contentChanges: [{ text: injectIntoScript(original, `${marker};`) }]
-    });
-    await waitFor(marker);
-    results.push(now() - t);
-    // Settle before the next round so rounds do not bleed into each other.
-    await sleep(1500);
 }
 
-const sorted = [...results].sort((a, b) => a - b);
-const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
-console.log(`last keystroke -> its diagnostics`);
-console.log(`  samples  ${results.map((x) => x.toFixed(0)).join(', ')}ms`);
-console.log(`  min ${sorted[0].toFixed(0)}ms   p50 ${at(0.5).toFixed(0)}ms   max ${sorted[sorted.length - 1].toFixed(0)}ms`);
+function parseArgs(argv) {
+    const options = {
+        project: process.env.SVELTE_LS_BENCH_PROJECT ?? '',
+        file: undefined,
+        packageName: process.env.SVELTE_LS_TSGO_PACKAGE ?? '@typescript/native-preview',
+        debounceMs: 150,
+        gapMs: 60,
+        rounds: 20,
+        burst: 6,
+        json: undefined
+    };
+    for (let index = 2; index < argv.length; index++) {
+        const argument = argv[index];
+        if (argument === '--') continue;
+        const next = () => {
+            const value = argv[++index];
+            if (value === undefined) throw new Error(`${argument} requires a value`);
+            return value;
+        };
+        if (argument === '--project') options.project = path.resolve(next());
+        else if (argument === '--file') options.file = next();
+        else if (argument === '--package') options.packageName = next();
+        else if (argument === '--debounce') options.debounceMs = Number(next());
+        else if (argument === '--gap') options.gapMs = Number(next());
+        else if (argument === '--rounds') options.rounds = Number(next());
+        else if (argument === '--burst') options.burst = Number(next());
+        else if (argument === '--json') options.json = next();
+        else if (argument === '--smoke') options.rounds = 2;
+        else throw new Error(`unknown argument: ${argument}`);
+    }
+    if (!options.project) throw new Error('--project is required');
+    return options;
+}
 
-client.dispose();
-process.exit(0);
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+    try {
+        if (process.argv.includes('--help')) {
+            console.log(
+                'Usage: node bench/spikes/typing-burst.mjs --project <dir> [--file rel.svelte] ' +
+                    '[--package name] [--debounce 150] [--gap 60] [--rounds 20] ' +
+                    '[--burst 6] [--json file|-] [--smoke]'
+            );
+            process.exit(0);
+        }
+        const options = parseArgs(process.argv);
+        const result = await runBurstTrial(options);
+        console.log(
+            `${result.engine.packageName}@${result.engine.version}  ` +
+                `debounce=${result.debounceMs}ms gap=${result.gapMs}ms ` +
+                `rounds=${result.rounds} burst=${result.burst}`
+        );
+        console.log(
+            `last key -> diagnostics: p50 ${result.latency.p50}ms, p95 ${result.latency.p95}ms; ` +
+                `${result.nativeChecks} native checks; CPU ${result.cpuMs}ms; ` +
+                `peak RSS ${formatBytes(result.peakRssBytes)}; cache ${result.cacheState}`
+        );
+        if (options.json) {
+            const json = `${JSON.stringify(result, null, 2)}\n`;
+            if (options.json === '-') process.stdout.write(json);
+            else fs.writeFileSync(path.resolve(options.json), json, 'utf8');
+        }
+    } catch (error) {
+        console.error(error instanceof Error ? error.stack : error);
+        process.exitCode = 1;
+    }
+}

@@ -6,18 +6,20 @@
 > which upstream does not do at all, and in **`svelte-check`**, replacing the two experimental tsgo
 > modes that were there.
 >
-> Measured against upstream's classic engine as the oracle, on a ~800-component SvelteKit app in a
-> pnpm monorepo:
+> One recorded comparison against upstream's classic engine, on the Reintersect ~800-component
+> SvelteKit app in its pnpm monorepo:
 >
-> | | upstream | this fork |
-> |---|---|---|
-> | `svelte-check` on a component library | 4.3s | **2.3s** |
-> | `svelte-check` on a SvelteKit app | 15.5s | **3.9s** |
-> | editor: cold project load | 7.7s | **3.6s** |
-> | editor: keystroke → diagnostics | 948ms | **420ms** |
+> |                                       | upstream | this fork |
+> | ------------------------------------- | -------- | --------- |
+> | `svelte-check` on a component library | 4.3s     | **2.3s**  |
+> | `svelte-check` on a SvelteKit app     | 15.5s    | **3.9s**  |
+> | editor: cold project load             | 7.7s     | **3.6s**  |
+> | editor: keystroke → diagnostics       | 948ms    | **420ms** |
 >
-> Same diagnostics in every case — the check is diffed against the classic engine file by file, and
-> converges on it exactly.
+> `pnpm test:tsgo-oracle` compares meaningful editor features against the classic engine, and the
+> whole-project checker oracle compares diagnostics plus normalized program membership. Exact parity
+> is an invariant under test, not a blanket guarantee: TypeScript 6 and the evolving TypeScript 7
+> native compiler can intentionally differ, and updates require reviewing that diff.
 >
 > **It is also vibecoded as hell.** Essentially all of it was written by Claude in a handful of
 > sessions, against real measurements rather than a design doc, and it drifts from upstream wherever
@@ -40,7 +42,6 @@ A language server (implementing the [language server protocol](https://microsoft
 for Svelte.
 
 Requires Node 12 or later.
-
 
 ## Using this fork in VS Code
 
@@ -98,14 +99,14 @@ go through tsgo too.
 
 ### What to expect that is different
 
-- **No refactorings.** TypeScript 7 does not implement `refactor` code actions yet, so "Extract to
-  function", "Move to file" and friends are absent. Quickfixes work, but not all of them.
-- **A `node_modules/.cache/svelte-lsp` directory** appears in each package that has components. It
-  holds the generated `.tsx` twins tsgo type-checks; being under `node_modules/.cache` it is
-  already ignored by git and search tools. Deleting it is always safe. (Older builds used a
-  visible `.svelte-ls-overlay` directory instead — the server removes those on sight.)
-- **`.ts` files still use the JavaScript engine.** `typescript-svelte-plugin` has no tsgo migration
-  path, so Svelte intellisense inside plain `.ts` files is unchanged from upstream.
+-   **No refactorings.** TypeScript 7 does not implement `refactor` code actions yet, so "Extract to
+    function", "Move to file" and friends are absent. Quickfixes work, but not all of them.
+-   **A `node_modules/.cache/svelte-lsp` directory** appears in each package that has components. It
+    holds the generated `.tsx` twins tsgo type-checks; being under `node_modules/.cache` it is
+    already ignored by git and search tools. Deleting it is always safe. (Older builds used a
+    visible `.svelte-ls-overlay` directory instead — the server removes those on sight.)
+-   **`.ts` files still use the JavaScript engine.** `typescript-svelte-plugin` has no tsgo migration
+    path, so Svelte intellisense inside plain `.ts` files is unchanged from upstream.
 
 ### Turning it off
 
@@ -125,13 +126,13 @@ everything else keeps working.
 
 ### Tunables
 
-| environment variable | effect |
-|---|---|
-| `SVELTE_LS_TSGO=1` | turn the tsgo engine on without the editor setting |
-| `SVELTE_LS_TSGO_PACKAGE` | pin which package provides the tsgo binary |
-| `SVELTE_LS_RSVELTE=1` | opt into the Rust transform (see above) |
+| environment variable                | effect                                                               |
+| ----------------------------------- | -------------------------------------------------------------------- |
+| `SVELTE_LS_TSGO=1`                  | turn the tsgo engine on without the editor setting                   |
+| `SVELTE_LS_TSGO_PACKAGE`            | pin which package provides the tsgo binary                           |
+| `SVELTE_LS_RSVELTE=1`               | opt into the Rust transform (see above)                              |
 | `SVELTE_LS_DIAGNOSTICS_DEBOUNCE_MS` | how long a diagnostics pull waits for typing to settle (default 150) |
-| `SVELTE_LS_TIMING=<file>` | append per-phase keystroke timings to a file |
+| `SVELTE_LS_TIMING=<file>`           | append per-phase keystroke timings to a file                         |
 
 ## What is a language server?
 

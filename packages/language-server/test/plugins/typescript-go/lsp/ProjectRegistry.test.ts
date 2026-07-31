@@ -1,5 +1,6 @@
 import assert from 'assert';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { describe, it, afterEach } from 'mocha';
 import { ProjectRegistry } from '../../../../src/plugins/typescript-go/lsp/ProjectRegistry';
@@ -24,7 +25,7 @@ interface Created {
     writeConfig: boolean;
 }
 
-function registry(created: Created[] = []) {
+function registry(created: Created[] = [], workspaceRoots = [monorepo]) {
     return new ProjectRegistry({
         createShadows: (projectRoot, tsconfigPath, writeConfig) => {
             created.push({ projectRoot, tsconfigPath, writeConfig });
@@ -36,8 +37,8 @@ function registry(created: Created[] = []) {
                 writeConfig
             });
         },
-        workspaceRoots: [monorepo],
-        fallbackRoot: monorepo
+        workspaceRoots,
+        fallbackRoot: workspaceRoots[0] ?? monorepo
     });
 }
 
@@ -45,6 +46,7 @@ function cleanOverlays() {
     for (const packageRoot of [monorepo, appRoot, uiRoot, `${monorepo}/packages/nocfg`]) {
         fs.rmSync(path.join(packageRoot, 'node_modules'), { recursive: true, force: true });
     }
+    fs.rmSync(`${monorepo}/packages/nocfg/tsconfig.json`, { force: true });
 }
 
 describe('typescript-go ProjectRegistry', () => {
@@ -80,6 +82,53 @@ describe('typescript-go ProjectRegistry', () => {
         assert.strictEqual(created[0].tsconfigPath, undefined);
         assert.strictEqual(created[0].writeConfig, false);
         assert.strictEqual(created[0].projectRoot, monorepo);
+    });
+
+    it('keeps a config-less workspace project distinct from a mapping-only fallback', () => {
+        const root = normalizePath(fs.mkdtempSync(path.join(os.tmpdir(), 'svelte-inferred-')));
+        const source = `${root}/src/App.svelte`;
+        const dependency = `${root}/node_modules/example/Comp.svelte`;
+        fs.mkdirSync(path.dirname(source), { recursive: true });
+        fs.mkdirSync(path.dirname(dependency), { recursive: true });
+        const created: Created[] = [];
+
+        try {
+            const projects = registry(created, [root]);
+            // Creating the mapping-only dependency manager first must not poison the later
+            // workspace source's project selection.
+            const fallback = projects.forFile(dependency);
+            const inferred = projects.forFile(source);
+
+            assert.notStrictEqual(fallback, inferred);
+            assert.deepStrictEqual(
+                created.map(({ projectRoot, tsconfigPath, writeConfig }) => ({
+                    projectRoot,
+                    tsconfigPath,
+                    writeConfig
+                })),
+                [
+                    { projectRoot: root, tsconfigPath: undefined, writeConfig: false },
+                    { projectRoot: root, tsconfigPath: undefined, writeConfig: true }
+                ]
+            );
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('uses the deepest matching root for a nested multi-root fallback project', () => {
+        const created: Created[] = [];
+        // Keep the outer root first to prove ownership does not depend on client ordering.
+        const projects = registry(created, [monorepo, appRoot]);
+        const depFile = `${appRoot}/node_modules/nested-lib/Comp.svelte`;
+        fs.mkdirSync(path.dirname(depFile), { recursive: true });
+        fs.writeFileSync(depFile, '<p/>');
+
+        projects.forFile(depFile);
+
+        assert.strictEqual(created.length, 1);
+        assert.strictEqual(created[0].tsconfigPath, undefined);
+        assert.strictEqual(created[0].projectRoot, appRoot);
     });
 
     it('rejects configs outside every workspace root', () => {
@@ -124,5 +173,36 @@ describe('typescript-go ProjectRegistry', () => {
         assert.strictEqual(projects.workspaceSvelteFiles(monorepo), first, 'must be memoised');
         projects.invalidateWorkspaceScans();
         assert.notStrictEqual(projects.workspaceSvelteFiles(monorepo), first);
+    });
+
+    it('forgets cached project ownership when a nearer config is created', () => {
+        const created: Created[] = [];
+        const projects = registry(created);
+        const file = `${monorepo}/packages/nocfg/src/Thing.svelte`;
+
+        const before = projects.forFile(file);
+        assert.strictEqual(created[0].tsconfigPath, `${monorepo}/tsconfig.json`);
+
+        const config = `${monorepo}/packages/nocfg/tsconfig.json`;
+        fs.writeFileSync(config, '{"include":["src"]}');
+        const invalidated = projects.invalidateForStructuralChange(config);
+
+        assert.deepStrictEqual(invalidated, [before]);
+        const after = projects.forFile(file);
+        assert.notStrictEqual(after, before);
+        assert.strictEqual(created[1].tsconfigPath, config);
+    });
+
+    it('replaces the manager but preserves ownership on source creation', () => {
+        const projects = registry();
+        const manager = projects.forFile(`${appRoot}/src/lib/Same.svelte`);
+        const firstScan = projects.workspaceSvelteFiles(monorepo);
+
+        assert.deepStrictEqual(
+            projects.invalidateForStructuralChange(`${appRoot}/src/lib/New.svelte`),
+            [manager]
+        );
+        assert.notStrictEqual(projects.forFile(`${appRoot}/src/lib/Same.svelte`), manager);
+        assert.notStrictEqual(projects.workspaceSvelteFiles(monorepo), firstScan);
     });
 });

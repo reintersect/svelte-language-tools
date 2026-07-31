@@ -610,6 +610,13 @@ export class TypeScriptPlugin
         await this.lsAndTsDocResolver.updateExistingTsOrJsFile(fileName, changes);
     }
 
+    async closeTsOrJsFile(fileName: string): Promise<void> {
+        // A standard didClose means the editor overlay is gone. Re-read the saved file so the
+        // classic service does not retain the last dirty buffer forever; this also keeps the
+        // classic oracle honest when it is used as the tsgo lifecycle baseline.
+        await this.lsAndTsDocResolver.updateExistingTsOrJsFile(fileName);
+    }
+
     async getSelectionRange(
         document: Document,
         position: Position

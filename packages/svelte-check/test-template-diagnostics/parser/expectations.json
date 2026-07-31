@@ -1,0 +1,132 @@
+{
+    "schemaVersion": 1,
+    "svelteVersion": "5.55.5",
+    "cases": [
+        {
+            "file": "src/00-unclosed-component.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "block_unclosed",
+                    "range": [0, 0, 0, 1],
+                    "message": "Block was left open\nhttps://svelte.dev/e/block_unclosed",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#block_unclosed"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/01-broken-each-destructure.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "expected_token",
+                    "range": [0, 27, 0, 27],
+                    "message": "Expected token }\nhttps://svelte.dev/e/expected_token",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#expected_token"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/02-broken-snippet-destructure.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "js_parse_error",
+                    "range": [1, 21, 1, 21],
+                    "message": "Unexpected token\nhttps://svelte.dev/e/js_parse_error",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#js_parse_error"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/03-broken-snippet-generic.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "unexpected_eof",
+                    "range": [1, 57, 1, 57],
+                    "message": "Unexpected end of input\nhttps://svelte.dev/e/unexpected_eof",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#unexpected_eof"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/04-render-missing-call.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "render_tag_invalid_expression",
+                    "range": [0, 35, 0, 38],
+                    "message": "`{@render ...}` tags can only contain call expressions\nhttps://svelte.dev/e/render_tag_invalid_expression",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#render_tag_invalid_expression"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/05-const-invalid-placement.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "const_tag_invalid_placement",
+                    "range": [0, 0, 0, 18],
+                    "message": "`{@const}` must be the immediate child of `{#snippet}`, `{#if}`, `{:else if}`, `{:else}`, `{#each}`, `{:then}`, `{:catch}`, `<svelte:fragment>`, `<svelte:boundary>` or `<Component>`\nhttps://svelte.dev/e/const_tag_invalid_placement",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#const_tag_invalid_placement"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/06-bind-invalid-expression.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "bind_invalid_expression",
+                    "range": [1, 7, 1, 29],
+                    "message": "Can only bind to an Identifier or MemberExpression or a `{get, set}` pair\nhttps://svelte.dev/e/bind_invalid_expression",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#bind_invalid_expression"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/07-directive-missing-name.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "directive_missing_name",
+                    "range": [0, 8, 0, 12],
+                    "message": "`use:` name cannot be empty\nhttps://svelte.dev/e/directive_missing_name",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#directive_missing_name"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/08-dynamic-missing-this.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "svelte_component_missing_this",
+                    "range": [0, 0, 0, 0],
+                    "message": "`<svelte:component>` must have a 'this' attribute\nhttps://svelte.dev/e/svelte_component_missing_this",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#svelte_component_missing_this"
+                    }
+                }
+            ]
+        }
+    ]
+}

@@ -27,6 +27,8 @@ export class Document extends WritableDocument {
     private path = urlToPath(this.url);
 
     private _compiler: typeof import('svelte/compiler') | undefined;
+    /** Prevent an older async config lookup from overwriting a later invalidation/reload. */
+    private configRevision = 0;
     get compiler() {
         return this.getCompiler();
     }
@@ -61,6 +63,8 @@ export class Document extends WritableDocument {
     }
 
     private updateDocInfo() {
+        const configRevision = ++this.configRevision;
+        const configPromise = this.configPromise;
         this.html = parseHtml(this.content);
         const update = (config: SvelteConfig | undefined) => {
             const scriptTags = extractScriptTags(this.content, this.html);
@@ -88,8 +92,30 @@ export class Document extends WritableDocument {
             update(config);
         } else {
             update(undefined);
-            this.configPromise.then((c) => update(c));
+            configPromise.then((c) => {
+                if (
+                    configRevision === this.configRevision &&
+                    configPromise === this.configPromise
+                ) {
+                    update(c);
+                }
+            });
         }
+    }
+
+    /** Re-resolve hierarchical Svelte/Vite config after a watched structural change. */
+    async reloadConfig(): Promise<SvelteConfig | undefined> {
+        // Package changes can replace the Svelte compiler selected for this file as well as its
+        // config. Keep the compiler/version cache on the same structural lifecycle.
+        this._compiler = undefined;
+        this.svelteVersion = undefined;
+        const configPromise = configLoader.awaitConfig(this.getFilePath() || '');
+        this.configPromise = configPromise;
+        const config = await configPromise;
+        if (this.configPromise === configPromise) {
+            this.updateDocInfo();
+        }
+        return config;
     }
 
     getSvelteVersion() {

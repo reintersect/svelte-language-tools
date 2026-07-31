@@ -1,0 +1,8 @@
+{
+    "name": "svelte-check-template-diagnostics-semantic",
+    "private": true,
+    "type": "module",
+    "dependencies": {
+        "svelte": "5.55.5"
+    }
+}

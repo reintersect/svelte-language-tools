@@ -41,6 +41,15 @@ interface ViteModule {
 }
 
 const cache = new Map<string, Promise<LoadConfigResult>>();
+/**
+ * Node caches ESM modules by URL independently from this package's result cache. Incrementing
+ * this epoch gives every direct Svelte-config import after `clearCache` a new URL. Keeping one
+ * epoch for the whole invalidation also means configs discovered later in the same rebuild use
+ * the same coherent generation.
+ */
+let configImportEpoch = 0;
+/** Avoid evicting the same CommonJS module repeatedly during one coherent reload generation. */
+const importedConfigEpochByPath = new Map<string, number>();
 
 /**
  * This function encapsulates the import call in a way
@@ -67,7 +76,10 @@ export function loadConfig(
     dirOrFile: string,
     { traverse = true, clearCache = false }: { traverse?: boolean; clearCache?: boolean } = {}
 ): Promise<LoadConfigResult> {
-    if (clearCache) cache.clear();
+    if (clearCache) {
+        cache.clear();
+        configImportEpoch++;
+    }
 
     const resolved = path.resolve(dirOrFile);
     const cached = cache.get(resolved);
@@ -75,9 +87,10 @@ export function loadConfig(
         return cached;
     }
 
+    const epoch = configImportEpoch;
     const loading = isFile(resolved)
-        ? loadConfigFromFile(resolved)
-        : loadConfigUncached(resolved, traverse);
+        ? loadConfigFromFile(resolved, epoch)
+        : loadConfigUncached(resolved, traverse, epoch);
     cache.set(resolved, loading);
     return loading;
 }
@@ -90,12 +103,15 @@ function isFile(filePath: string): boolean {
     }
 }
 
-async function loadConfigFromFile(configFilePath: string): Promise<LoadConfigResult> {
+async function loadConfigFromFile(
+    configFilePath: string,
+    epoch: number
+): Promise<LoadConfigResult> {
     const basename = path.basename(configFilePath);
     const root = path.dirname(configFilePath);
 
     if (/^svelte\.config\./.test(basename)) {
-        return (await loadSvelteConfig(configFilePath)) ?? undefined;
+        return (await loadSvelteConfig(configFilePath, epoch)) ?? undefined;
     }
 
     const viteResult = await loadSvelteConfigFromVite(root, configFilePath);
@@ -103,22 +119,26 @@ async function loadConfigFromFile(configFilePath: string): Promise<LoadConfigRes
         return viteResult;
     }
 
-    return loadSvelteConfig(configFilePath);
+    return loadSvelteConfig(configFilePath, epoch);
 }
 
-async function loadConfigUncached(dir: string, traverse: boolean): Promise<LoadConfigResult> {
+async function loadConfigUncached(
+    dir: string,
+    traverse: boolean,
+    epoch: number
+): Promise<LoadConfigResult> {
     let currentDir = dir;
     const dirs = [dir];
 
     while (true) {
-        const result = await loadConfigFromDirectory(currentDir);
+        const result = await loadConfigFromDirectory(currentDir, epoch);
         if (result) {
-            if (isLoadedConfig(result)) {
+            if (isLoadedConfig(result) && epoch === configImportEpoch) {
                 // Cache the loaded config for all traversed directories
                 for (const d of dirs) {
                     cache.set(d, Promise.resolve(result));
                 }
-            } else {
+            } else if (epoch === configImportEpoch) {
                 cache.delete(dir);
             }
             return result;
@@ -137,7 +157,7 @@ async function loadConfigUncached(dir: string, traverse: boolean): Promise<LoadC
     }
 }
 
-async function loadConfigFromDirectory(dir: string): Promise<LoadConfigResult> {
+async function loadConfigFromDirectory(dir: string, epoch: number): Promise<LoadConfigResult> {
     const viteConfigPath = findConfigInDirectory(dir, 'vite.config', VITE_CONFIG_EXTENSIONS);
     let viteError: FailedConfig | undefined;
 
@@ -160,7 +180,7 @@ async function loadConfigFromDirectory(dir: string): Promise<LoadConfigResult> {
         return viteError;
     }
 
-    return (await loadSvelteConfig(svelteConfigPath)) ?? viteError;
+    return (await loadSvelteConfig(svelteConfigPath, epoch)) ?? viteError;
 }
 
 let resolving: Promise<void> | null = null;
@@ -225,9 +245,25 @@ async function loadSvelteConfigFromVite(
     }
 }
 
-async function loadSvelteConfig(configFilePath: string): Promise<LoadConfigResult> {
+async function loadSvelteConfig(configFilePath: string, epoch: number): Promise<LoadConfigResult> {
     try {
-        const config = (await dynamicImport(pathToFileURL(configFilePath).href))?.default;
+        const moduleUrl = pathToFileURL(configFilePath);
+        if (epoch > 0) {
+            moduleUrl.searchParams.set('svelte-load-config', String(epoch));
+            // A query makes ESM imports fresh, but CommonJS modules have a second cache behind
+            // their ESM wrapper. Clear the exact resolved config there as well. This is harmless
+            // for ESM configs, which do not have a `require.cache` entry.
+            if (importedConfigEpochByPath.get(configFilePath) !== epoch) {
+                importedConfigEpochByPath.set(configFilePath, epoch);
+                try {
+                    delete require.cache[require.resolve(configFilePath)];
+                } catch {
+                    // Resolution/import below will report the useful error.
+                }
+            }
+        }
+
+        const config = (await dynamicImport(moduleUrl.href))?.default;
         if (!config) {
             throw new Error(
                 'Missing exports in the config. Make sure to include "export default config" or "module.exports = config"'

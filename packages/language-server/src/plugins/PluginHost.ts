@@ -21,6 +21,7 @@ import {
     Hover,
     LinkedEditingRanges,
     Location,
+    LSPErrorCodes,
     Position,
     Range,
     ReferenceContext,
@@ -36,9 +37,10 @@ import {
     InlayHint,
     WorkspaceSymbol,
     DocumentSymbol,
-    DocumentDiagnosticReport
+    DocumentDiagnosticReport,
+    ResponseError
 } from 'vscode-languageserver';
-import { Document, DocumentManager, getNodeIfIsInHTMLStartTag } from '../lib/documents';
+import { Document, DocumentManager, getNodeIfIsInHTMLStartTag, isInTag } from '../lib/documents';
 import { Logger } from '../logger';
 import { isNotNullOrUndefined, regexLastIndexOf } from '../utils';
 import {
@@ -48,7 +50,8 @@ import {
     LSProvider,
     OnWatchFileChanges,
     OnWatchFileChangesPara,
-    Plugin
+    Plugin,
+    SVELTE_PARSER_ERROR
 } from './interfaces';
 
 enum ExecuteMode {
@@ -76,6 +79,7 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
     private requestTimings: Record<string, [time: number, lastExecuted: number]> = {};
     /** Keyed by `${uri}@${version}` so duplicate outline/sticky-scroll requests share one computation. */
     private inFlightDocumentSymbols = new Map<string, Promise<SymbolInformation[]>>();
+    private disposed = false;
 
     constructor(private documentsManager: DocumentManager) {}
 
@@ -85,6 +89,20 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
 
     register(plugin: Plugin) {
         this.plugins.push(plugin);
+    }
+
+    dispose() {
+        if (this.disposed) {
+            return;
+        }
+        this.disposed = true;
+        for (const plugin of this.plugins) {
+            try {
+                plugin.dispose?.();
+            } catch (error) {
+                Logger.error(`Failed to dispose plugin ${plugin.__name}`, error);
+            }
+        }
     }
 
     didUpdateDocument() {
@@ -103,14 +121,17 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
             return [];
         }
 
-        return (
-            await this.execute<Diagnostic[]>(
-                'getDiagnostics',
-                [document, cancellationToken],
-                ExecuteMode.Collect,
-                'high'
-            )
-        ).flat();
+        return reconcileSvelteParserDiagnostics(
+            (
+                await this.execute<Diagnostic[]>(
+                    'getDiagnostics',
+                    [document, cancellationToken],
+                    ExecuteMode.Collect,
+                    'high'
+                )
+            ).flat(),
+            document
+        );
     }
 
     private canSkipDiagnostics(document: Document) {
@@ -158,7 +179,8 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
                         plugin,
                         'getDiagnosticsForPullMode',
                         [document, previousResultIdData[plugin.__name], cancellationToken],
-                        { kind: 'full', items: [] }
+                        { kind: 'full', items: [] },
+                        true
                     )
                 ]
             )
@@ -182,7 +204,7 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
             return {
                 kind: 'full',
                 resultId: newResultId,
-                items: fullResults
+                items: reconcileSvelteParserDiagnostics(fullResults, document)
             };
         }
         const unchangedPlugins = plugins.filter((plugin) => unchanged.includes(plugin.__name));
@@ -192,7 +214,8 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
                     plugin,
                     'getDiagnostics',
                     [document, cancellationToken],
-                    []
+                    [],
+                    true
                 );
                 return result;
             })
@@ -201,16 +224,23 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
         return {
             kind: 'full',
             resultId: newResultId,
-            items: fullResults.concat(unchangedResults.flat())
+            items: reconcileSvelteParserDiagnostics(
+                fullResults.concat(unchangedResults.flat()),
+                document
+            )
         };
     }
 
-    async doHover(textDocument: TextDocumentIdentifier, position: Position): Promise<Hover | null> {
+    async doHover(
+        textDocument: TextDocumentIdentifier,
+        position: Position,
+        cancellationToken?: CancellationToken
+    ): Promise<Hover | null> {
         const document = this.getDocument(textDocument.uri);
 
         return this.execute<Hover>(
             'doHover',
-            [document, position],
+            [document, position, ...(cancellationToken ? [cancellationToken] : [])],
             ExecuteMode.FirstNonNull,
             'high'
         );
@@ -239,7 +269,9 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
         ).then((completions) => completions.filter(isNotNullOrUndefined));
 
         const html = completions.find((completion) => completion.plugin === 'html');
-        const ts = completions.find((completion) => completion.plugin === 'ts');
+        const ts = completions.find(
+            (completion) => completion.plugin === 'ts' || completion.plugin === 'tsgo'
+        );
         if (html && ts && getNodeIfIsInHTMLStartTag(document.html, document.offsetAt(position))) {
             // Completion in a component or html start tag and both html and ts
             // suggest something -> filter out all duplicates from TS completions
@@ -479,14 +511,15 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
 
     async getDefinitions(
         textDocument: TextDocumentIdentifier,
-        position: Position
+        position: Position,
+        cancellationToken?: CancellationToken
     ): Promise<DefinitionLink[] | Location[]> {
         const document = this.getDocument(textDocument.uri);
 
         const definitions = (
             await this.execute<DefinitionLink[]>(
                 'getDefinitions',
-                [document, position],
+                [document, position, ...(cancellationToken ? [cancellationToken] : [])],
                 ExecuteMode.Collect,
                 'high'
             )
@@ -569,13 +602,14 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
 
     async prepareRename(
         textDocument: TextDocumentIdentifier,
-        position: Position
+        position: Position,
+        cancellationToken?: CancellationToken
     ): Promise<Range | null> {
         const document = this.getDocument(textDocument.uri);
 
         return await this.execute<any>(
             'prepareRename',
-            [document, position],
+            [document, position, ...(cancellationToken ? [cancellationToken] : [])],
             ExecuteMode.FirstNonNull,
             'high'
         );
@@ -584,13 +618,14 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
     async rename(
         textDocument: TextDocumentIdentifier,
         position: Position,
-        newName: string
+        newName: string,
+        cancellationToken?: CancellationToken
     ): Promise<WorkspaceEdit | null> {
         const document = this.getDocument(textDocument.uri);
 
         return await this.execute<any>(
             'rename',
-            [document, position, newName],
+            [document, position, newName, ...(cancellationToken ? [cancellationToken] : [])],
             ExecuteMode.FirstNonNull,
             'high'
         );
@@ -612,14 +647,25 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
         );
     }
 
-    async fileReferences(uri: string): Promise<Location[] | null> {
-        return await this.execute<any>('fileReferences', [uri], ExecuteMode.FirstNonNull, 'high');
+    async fileReferences(
+        uri: string,
+        cancellationToken?: CancellationToken
+    ): Promise<Location[] | null> {
+        return await this.execute<any>(
+            'fileReferences',
+            [uri, ...(cancellationToken ? [cancellationToken] : [])],
+            ExecuteMode.FirstNonNull,
+            'high'
+        );
     }
 
-    async findComponentReferences(uri: string): Promise<Location[] | null> {
+    async findComponentReferences(
+        uri: string,
+        cancellationToken?: CancellationToken
+    ): Promise<Location[] | null> {
         return await this.execute<any>(
             'findComponentReferences',
-            [uri],
+            [uri, ...(cancellationToken ? [cancellationToken] : [])],
             ExecuteMode.FirstNonNull,
             'high'
         );
@@ -654,7 +700,8 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
      */
     async getSelectionRanges(
         textDocument: TextDocumentIdentifier,
-        positions: Position[]
+        positions: Position[],
+        cancellationToken?: CancellationToken
     ): Promise<SelectionRange[] | null> {
         const document = this.getDocument(textDocument.uri);
 
@@ -662,7 +709,13 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
             return Promise.all(
                 positions.map(async (position) => {
                     for (const plugin of this.plugins) {
-                        const range = await plugin.getSelectionRange?.(document, position);
+                        const range = cancellationToken
+                            ? await plugin.getSelectionRange?.(
+                                  document,
+                                  position,
+                                  cancellationToken
+                              )
+                            : await plugin.getSelectionRange?.(document, position);
 
                         if (range) {
                             return range;
@@ -694,13 +747,14 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
 
     async getLinkedEditingRanges(
         textDocument: TextDocumentIdentifier,
-        position: Position
+        position: Position,
+        cancellationToken?: CancellationToken
     ): Promise<LinkedEditingRanges | null> {
         const document = this.getDocument(textDocument.uri);
 
         return await this.execute<LinkedEditingRanges>(
             'getLinkedEditingRanges',
-            [document, position],
+            [document, position, ...(cancellationToken ? [cancellationToken] : [])],
             ExecuteMode.FirstNonNull,
             'high'
         );
@@ -723,13 +777,14 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
 
     getTypeDefinition(
         textDocument: TextDocumentIdentifier,
-        position: Position
+        position: Position,
+        cancellationToken?: CancellationToken
     ): Promise<Location[] | null> {
         const document = this.getDocument(textDocument.uri);
 
         return this.execute<Location[] | null>(
             'getTypeDefinition',
-            [document, position],
+            [document, position, ...(cancellationToken ? [cancellationToken] : [])],
             ExecuteMode.FirstNonNull,
             'high'
         );
@@ -789,7 +844,7 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
         );
     }
 
-    async getCodeLens(textDocument: TextDocumentIdentifier) {
+    async getCodeLens(textDocument: TextDocumentIdentifier, cancellationToken?: CancellationToken) {
         const document = this.getDocument(textDocument.uri);
         if (!document) {
             throw new Error('Cannot call methods on an unopened document');
@@ -797,20 +852,23 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
 
         const result = await this.execute<CodeLens[]>(
             'getCodeLens',
-            [document],
+            [document, ...(cancellationToken ? [cancellationToken] : [])],
             ExecuteMode.Collect,
             'smart'
         );
         return result?.filter(Boolean).flat();
     }
 
-    async getFoldingRanges(textDocument: TextDocumentIdentifier): Promise<FoldingRange[]> {
+    async getFoldingRanges(
+        textDocument: TextDocumentIdentifier,
+        cancellationToken?: CancellationToken
+    ): Promise<FoldingRange[]> {
         const document = this.getDocument(textDocument.uri);
 
         const result = (
             await this.execute<FoldingRange[]>(
                 'getFoldingRanges',
-                [document],
+                [document, ...(cancellationToken ? [cancellationToken] : [])],
                 ExecuteMode.Collect,
                 'high'
             )
@@ -841,7 +899,8 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
 
     findDocumentHighlight(
         textDocument: TextDocumentIdentifier,
-        position: Position
+        position: Position,
+        cancellationToken?: CancellationToken
     ): Promise<DocumentHighlight[] | null> {
         const document = this.getDocument(textDocument.uri);
         if (!document) {
@@ -851,7 +910,7 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
         return (
             this.execute<DocumentHighlight[] | null>(
                 'findDocumentHighlight',
-                [document, position],
+                [document, position, ...(cancellationToken ? [cancellationToken] : [])],
                 ExecuteMode.FirstNonNull,
                 'high'
             ) ?? [] // fall back to empty array to prevent fallback to word-based highlighting
@@ -876,9 +935,27 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
         }
     }
 
-    updateTsOrJsFile(fileName: string, changes: TextDocumentContentChangeEvent[]): void {
+    openTsOrJsFile(fileName: string, text: string, languageId: string, version?: number): void {
         for (const support of this.plugins) {
-            support.updateTsOrJsFile?.(fileName, changes);
+            support.openTsOrJsFile?.(fileName, text, languageId, version);
+        }
+    }
+
+    updateTsOrJsFile(
+        fileName: string,
+        changes: TextDocumentContentChangeEvent[],
+        text?: string,
+        version?: number,
+        languageId?: string
+    ): void {
+        for (const support of this.plugins) {
+            support.updateTsOrJsFile?.(fileName, changes, text, version, languageId);
+        }
+    }
+
+    closeTsOrJsFile(fileName: string): void {
+        for (const support of this.plugins) {
+            support.closeTsOrJsFile?.(fileName);
         }
     }
 
@@ -1004,12 +1081,104 @@ export class PluginHost implements LSProvider, OnWatchFileChanges {
         }
     }
 
-    private async tryExecutePlugin(plugin: any, fnName: string, args: any[], failValue: any) {
+    private async tryExecutePlugin(
+        plugin: any,
+        fnName: string,
+        args: any[],
+        failValue: any,
+        propagateRequestCancelled = false
+    ) {
         try {
             return await plugin[fnName](...args);
         } catch (e) {
+            if (isRequestCancelled(e)) {
+                if (propagateRequestCancelled) {
+                    throw e;
+                }
+                return failValue;
+            }
             Logger.error(e);
             return failValue;
         }
     }
+}
+
+function isRequestCancelled(error: unknown): error is ResponseError {
+    return error instanceof ResponseError && error.code === LSPErrorCodes.RequestCancelled;
+}
+
+/**
+ * A failed Svelte transform is reported twice when both diagnostic plugins are active: the
+ * compiler supplies the useful named/code-linked error and the generated TypeScript snapshot
+ * supplies a less precise parser fallback. Prefer the compiler result, but retain one fallback
+ * when users deliberately disable Svelte diagnostics and leave JS/TS diagnostics enabled.
+ */
+function reconcileSvelteParserDiagnostics(
+    diagnostics: Diagnostic[],
+    document: Document
+): Diagnostic[] {
+    const compilerParserErrors = diagnostics.filter(
+        (diagnostic) =>
+            diagnostic.source === 'svelte' &&
+            diagnostic.severity === 1 &&
+            diagnostic.codeDescription?.href.includes('/compiler-errors#')
+    );
+    const compilerErrorRegions = new Set(
+        compilerParserErrors.map((diagnostic) => diagnosticRegion(diagnostic.range.start, document))
+    );
+    const generatedSyntaxErrorRegions = new Set(
+        diagnostics
+            .filter(
+                (diagnostic) =>
+                    !!(diagnostic as Diagnostic & { [SVELTE_PARSER_ERROR]?: boolean })[
+                        SVELTE_PARSER_ERROR
+                    ]
+            )
+            .map((diagnostic) => diagnosticRegion(diagnostic.range.start, document))
+    );
+    const brokenGeneratedRegions = new Set(
+        [...compilerErrorRegions].filter((region) => generatedSyntaxErrorRegions.has(region))
+    );
+    const fallbackIdentities = new Set<string>();
+    const result: Diagnostic[] = [];
+
+    for (const diagnostic of diagnostics) {
+        const marked = !!(diagnostic as Diagnostic & { [SVELTE_PARSER_ERROR]?: boolean })[
+            SVELTE_PARSER_ERROR
+        ];
+        if (
+            (diagnostic.source === 'ts' || diagnostic.source === 'js') &&
+            brokenGeneratedRegions.has(diagnosticRegion(diagnostic.range.start, document))
+        ) {
+            continue;
+        }
+        if (!marked) {
+            result.push(diagnostic);
+            continue;
+        }
+
+        const identity = JSON.stringify([
+            diagnostic.range,
+            diagnostic.severity,
+            diagnostic.source,
+            diagnostic.code,
+            diagnostic.message
+        ]);
+        if (fallbackIdentities.has(identity)) {
+            continue;
+        }
+        fallbackIdentities.add(identity);
+        const clean = { ...diagnostic } as Diagnostic & { [SVELTE_PARSER_ERROR]?: boolean };
+        delete clean[SVELTE_PARSER_ERROR];
+        result.push(clean);
+    }
+
+    return result;
+}
+
+function diagnosticRegion(position: Position, document: Document): 'script' | 'style' | 'template' {
+    if (isInTag(position, document.scriptInfo) || isInTag(position, document.moduleScriptInfo)) {
+        return 'script';
+    }
+    return isInTag(position, document.styleInfo) ? 'style' : 'template';
 }

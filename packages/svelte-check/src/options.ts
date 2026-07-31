@@ -18,6 +18,10 @@ export interface SvelteCheckCliOptions {
     compilerWarnings: Record<string, 'error' | 'ignore'>;
     diagnosticSources: DiagnosticSource[];
     threshold: Threshold;
+    /** Internal watch-run flag: force transform-related config modules to reload. */
+    clearConfigCache?: boolean;
+    /** Internal watch-run flag: rebuild shared package/source dependency indexes. */
+    clearTsGoWorkspaceIndex?: boolean;
 }
 
 export function parseOptions(cb: (opts: SvelteCheckCliOptions) => any) {

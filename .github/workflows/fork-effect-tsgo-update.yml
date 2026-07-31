@@ -35,13 +35,20 @@ jobs:
         run: |
           set -euo pipefail
           latest=$(npm view @reintersect/effect-tsgo version)
-          # The engine resolves the binary by package name at runtime, so the "pinned" version is
-          # whatever the language server's devDependency says. Absent means never pinned yet.
+          # Both runtime consumers must test the same engine. A mismatched pin is treated as stale
+          # so the updater repairs it instead of accidentally exercising native-preview in one.
           pinned=$(node -p "
-            const p = require('./packages/language-server/package.json');
-            (p.devDependencies?.['@reintersect/effect-tsgo']
-             ?? p.dependencies?.['@reintersect/effect-tsgo']
-             ?? '').replace(/^[^0-9]*/, '') || 'none'
+            const files = [
+              './packages/language-server/package.json',
+              './packages/svelte-check/package.json'
+            ];
+            const versions = files.map(f => {
+              const p = require(f);
+              return (p.devDependencies?.['@reintersect/effect-tsgo']
+                ?? p.dependencies?.['@reintersect/effect-tsgo']
+                ?? '').replace(/^[^0-9]*/, '') || 'none';
+            });
+            new Set(versions).size === 1 ? versions[0] : 'mismatched'
           ")
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
           echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
@@ -50,12 +57,16 @@ jobs:
       - name: Pin the new version
         if: steps.v.outputs.changed == 'yes'
         run: |
-          node -e "
+          LATEST='${{ steps.v.outputs.latest }}' node -e "
             const fs = require('fs');
-            const f = 'packages/language-server/package.json';
-            const p = JSON.parse(fs.readFileSync(f, 'utf8'));
-            (p.devDependencies ??= {})['@reintersect/effect-tsgo'] = '^${{ steps.v.outputs.latest }}';
-            fs.writeFileSync(f, JSON.stringify(p, null, 4) + '\n');
+            for (const f of [
+              'packages/language-server/package.json',
+              'packages/svelte-check/package.json'
+            ]) {
+              const p = JSON.parse(fs.readFileSync(f, 'utf8'));
+              (p.devDependencies ??= {})['@reintersect/effect-tsgo'] = process.env.LATEST;
+              fs.writeFileSync(f, JSON.stringify(p, null, 4) + '\n');
+            }
           "
 
       - uses: pnpm/action-setup@v4
@@ -63,24 +74,34 @@ jobs:
       - uses: actions/setup-node@v4
         if: steps.v.outputs.changed == 'yes'
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
 
-      # The point of the PR is to find out whether the new tsgo still works, so the run has to
-      # actually exercise it. A red check here is the useful outcome, not a failure of the job.
+      # Resolve and exercise the package explicitly. Falling through to native-preview would make
+      # this updater green without testing the version it proposes.
       - name: Install, build and test against it
         if: steps.v.outputs.changed == 'yes'
-        continue-on-error: true
         id: verify
+        env:
+          SVELTE_LS_TSGO_PACKAGE: '@reintersect/effect-tsgo'
+          EXPECTED_TSGO_VERSION: ${{ steps.v.outputs.latest }}
         run: |
           pnpm install --no-frozen-lockfile
           pnpm --filter svelte2tsx build
           pnpm --filter @reintersect/svelte-language-server build
+          node -e "
+            const { resolveTsGoEngine } = require('./packages/language-server/dist/src/plugins/typescript-go/lsp/TsGoEngine.js');
+            const engine = resolveTsGoEngine(process.cwd());
+            if (!engine) throw new Error('effect-tsgo did not resolve');
+            if (engine.packageName !== process.env.SVELTE_LS_TSGO_PACKAGE) throw new Error('resolved ' + engine.packageName);
+            if (engine.version !== process.env.EXPECTED_TSGO_VERSION) throw new Error('resolved ' + engine.version);
+            console.log(engine.packageName + '@' + engine.version + ' -> ' + engine.binPath);
+          "
           pnpm --filter @reintersect/svelte-language-server test
-          cd packages/svelte-check && npx rollup -c && node test-sanity.js
+          cd packages/svelte-check && npx rollup -c && pnpm test:sanity && pnpm test:flush
 
       - name: Open the PR
-        if: steps.v.outputs.changed == 'yes'
+        if: always() && steps.v.outputs.changed == 'yes'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.FORK_PAT || github.token }}
@@ -93,7 +114,8 @@ jobs:
             `@reintersect/effect-tsgo` went from `${{ steps.v.outputs.pinned }}` to
             `${{ steps.v.outputs.latest }}`.
 
-            Build + tests against the new binary: **${{ steps.verify.outcome }}**
+            Required build + tests against the explicitly resolved new binary:
+            **${{ steps.verify.outcome }}**
 
             tsgo tracks TypeScript 7 nightlies, so the things most likely to break are the ones
             this fork depends on that are not stable API: the undocumented `tsgo --lsp -stdio`

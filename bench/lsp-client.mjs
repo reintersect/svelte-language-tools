@@ -11,16 +11,35 @@ export class LspClient {
         this.buf = Buffer.alloc(0);
         this.stderr = '';
         this.exited = null;
+        this.exitHandlers = new Set();
 
         this.proc.stdout.on('data', (d) => this._onData(d));
         this.proc.stderr.on('data', (d) => (this.stderr += d.toString()));
-        this.proc.on('exit', (code, sig) => {
-            this.exited = { code, sig };
-            for (const { reject } of this.pending.values()) {
-                reject(new Error(`server exited code=${code} sig=${sig}\n${this.stderr}`));
-            }
-            this.pending.clear();
-        });
+        this.proc.stdin.on('error', (error) => this._terminate({ code: null, sig: null, error }));
+        this.proc.on('error', (error) => this._terminate({ code: null, sig: null, error }));
+        this.proc.on('exit', (code, sig) => this._terminate({ code, sig }));
+    }
+
+    _terminate(exit) {
+        if (this.exited) return;
+        if (!exit.error && this.buf.length) {
+            exit = {
+                ...exit,
+                error: new Error(
+                    `server exited with ${this.buf.length} byte(s) of incomplete LSP output ` +
+                        `(code=${exit.code} sig=${exit.sig})\n${this.stderr}`
+                )
+            };
+        }
+        this.exited = exit;
+        const reason =
+            exit.error instanceof Error
+                ? exit.error
+                : new Error(`server exited code=${exit.code} sig=${exit.sig}\n${this.stderr}`);
+        for (const { reject } of this.pending.values()) reject(reason);
+        this.pending.clear();
+        for (const handler of this.exitHandlers) handler(exit, reason);
+        this.exitHandlers.clear();
     }
 
     _onData(chunk) {
@@ -31,10 +50,14 @@ export class LspClient {
             const header = this.buf.subarray(0, sep).toString('ascii');
             const m = /Content-Length:\s*(\d+)/i.exec(header);
             if (!m) {
-                this.buf = this.buf.subarray(sep + 4);
-                continue;
+                this._protocolError(`missing Content-Length header: ${JSON.stringify(header)}`);
+                return;
             }
             const len = Number(m[1]);
+            if (!Number.isSafeInteger(len) || len < 0 || len > 64 * 1024 * 1024) {
+                this._protocolError(`invalid Content-Length: ${m[1]}`);
+                return;
+            }
             const start = sep + 4;
             if (this.buf.length < start + len) return;
             const body = this.buf.subarray(start, start + len).toString('utf8');
@@ -42,11 +65,28 @@ export class LspClient {
             let msg;
             try {
                 msg = JSON.parse(body);
-            } catch {
-                continue;
+            } catch (error) {
+                this._protocolError(
+                    `invalid JSON-RPC payload: ${error instanceof Error ? error.message : error}`
+                );
+                return;
+            }
+            if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+                this._protocolError('JSON-RPC payload was not an object');
+                return;
             }
             this._dispatch(msg);
+            if (this.exited) return;
         }
+    }
+
+    _protocolError(message) {
+        const error = new Error(`malformed LSP output: ${message}\n${this.stderr}`);
+        this.buf = Buffer.alloc(0);
+        this._terminate({ code: null, sig: null, error });
+        try {
+            this.proc.kill();
+        } catch {}
     }
 
     _dispatch(msg) {
@@ -68,10 +108,19 @@ export class LspClient {
         if (msg.method) {
             const list = this.notificationHandlers.get(msg.method) || [];
             for (const h of list) h(msg.params);
+            return;
         }
+        this._protocolError(`message had neither id nor method: ${JSON.stringify(msg)}`);
     }
 
     _send(obj) {
+        if (this.exited) {
+            throw this.exited.error instanceof Error
+                ? this.exited.error
+                : new Error(
+                      `cannot send to exited server code=${this.exited.code} sig=${this.exited.sig}`
+                  );
+        }
         const json = JSON.stringify(obj);
         const buf = Buffer.from(json, 'utf8');
         this.proc.stdin.write(`Content-Length: ${buf.length}\r\n\r\n`);
@@ -85,6 +134,22 @@ export class LspClient {
 
     onRequest(method, handler) {
         this.requestHandlers.set(method, handler);
+    }
+
+    onExit(handler) {
+        if (this.exited) {
+            handler(
+                this.exited,
+                this.exited.error instanceof Error
+                    ? this.exited.error
+                    : new Error(
+                          `server exited code=${this.exited.code} sig=${this.exited.sig}\n${this.stderr}`
+                      )
+            );
+            return () => {};
+        }
+        this.exitHandlers.add(handler);
+        return () => this.exitHandlers.delete(handler);
     }
 
     request(method, params, timeoutMs = 30000) {
@@ -104,7 +169,13 @@ export class LspClient {
                     reject(e);
                 }
             });
-            this._send({ jsonrpc: '2.0', id, method, params });
+            try {
+                this._send({ jsonrpc: '2.0', id, method, params });
+            } catch (error) {
+                clearTimeout(timer);
+                this.pending.delete(id);
+                reject(error);
+            }
         });
     }
 

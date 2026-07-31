@@ -11,11 +11,21 @@ import {
     TextDocumentItem
 } from 'vscode-languageserver-types';
 import { DocumentManager, Document } from '../../src/lib/documents';
-import { DiagnosticsProvider, LSPProviderConfig, PluginHost } from '../../src/plugins';
+import {
+    DiagnosticsProvider,
+    LSPProviderConfig,
+    markSvelteParserError,
+    PluginHost,
+    SVELTE_PARSER_ERROR
+} from '../../src/plugins';
 import {
     CompletionTriggerKind,
     CancellationToken,
-    DocumentDiagnosticReport
+    CancellationTokenSource,
+    DiagnosticSeverity,
+    DocumentDiagnosticReport,
+    LSPErrorCodes,
+    ResponseError
 } from 'vscode-languageserver';
 import assert from 'assert';
 
@@ -62,6 +72,19 @@ describe('PluginHost', () => {
         sinon.assert.calledWithExactly(plugin.getDiagnostics, document, undefined);
     });
 
+    it('keeps request cancellation as an empty fallback for push diagnostics', async () => {
+        const { docManager, pluginHost } = setup({
+            getDiagnostics() {
+                throw new ResponseError(LSPErrorCodes.RequestCancelled, 'Request cancelled');
+            }
+        });
+        docManager.openClientDocument(textDocument);
+
+        const diagnostics = await pluginHost.getDiagnostics(textDocument);
+
+        assert.deepStrictEqual(diagnostics, []);
+    });
+
     it('executes doHover on plugins', async () => {
         const { docManager, pluginHost, plugin } = setup({
             doHover: sinon.stub().returns(null)
@@ -100,6 +123,51 @@ describe('PluginHost', () => {
         );
     });
 
+    it('deduplicates tsgo completions against HTML completions in start tags', async () => {
+        const documentItem: TextDocumentItem = {
+            ...textDocument,
+            text: '<button ></button>'
+        };
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        const pluginHost = new PluginHost(docManager);
+        pluginHost.initialize({
+            definitionLinkSupport: true,
+            filterIncompleteCompletions: false
+        });
+        pluginHost.register({
+            __name: 'html',
+            getCompletions: () => ({
+                isIncomplete: false,
+                items: [{ label: 'aria-label' }, { label: 'on:click' }]
+            })
+        });
+        pluginHost.register({
+            __name: 'tsgo',
+            getCompletions: () => ({
+                isIncomplete: false,
+                items: [
+                    { label: '"aria-label"' },
+                    { label: 'onclick' },
+                    { label: 'customProp', sortText: '1' }
+                ]
+            })
+        });
+        docManager.openClientDocument(documentItem);
+
+        const completions = await pluginHost.getCompletions(
+            documentItem,
+            Position.create(0, '<button '.length)
+        );
+
+        assert.deepStrictEqual(completions.items, [
+            { label: 'aria-label' },
+            { label: 'on:click' },
+            { label: 'customProp', sortText: 'Z1' }
+        ]);
+    });
+
     describe('pull mode diagnostics', () => {
         it('merge pull diagnostics results', async () => {
             const { docManager, pluginHost } = setup({
@@ -135,6 +203,152 @@ describe('PluginHost', () => {
                 kind: 'full',
                 items: [],
                 resultId: JSON.stringify({ test: '1', test2: '2' })
+            });
+        });
+
+        it('prefers a Svelte compiler parser error over generated TypeScript fallbacks', async () => {
+            const compilerError = {
+                range: Range.create(0, 0, 0, 1),
+                severity: DiagnosticSeverity.Error,
+                source: 'svelte',
+                code: 'block_unclosed',
+                codeDescription: {
+                    href: 'https://svelte.dev/docs/svelte/compiler-errors#block_unclosed'
+                },
+                message: 'Block was left open\nhttps://svelte.dev/e/block_unclosed'
+            };
+            const generatedFallback = markSvelteParserError({
+                range: Range.create(0, 7, 0, 8),
+                severity: DiagnosticSeverity.Error,
+                source: 'js',
+                code: 1109,
+                message: 'Expression expected.'
+            });
+            const docManager = new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            );
+            const pluginHost = new PluginHost(docManager);
+            pluginHost.initialize({
+                definitionLinkSupport: true,
+                filterIncompleteCompletions: false
+            });
+            pluginHost.register({
+                __name: 'svelte',
+                getDiagnostics: () => [compilerError],
+                getDiagnosticsForPullMode: () => ({
+                    kind: 'full' as const,
+                    resultId: 'svelte-1',
+                    items: [compilerError]
+                })
+            });
+            pluginHost.register({
+                __name: 'ts',
+                getDiagnostics: () => [generatedFallback, generatedFallback],
+                getDiagnosticsForPullMode: () => ({
+                    kind: 'full' as const,
+                    resultId: 'ts-1',
+                    items: [generatedFallback, generatedFallback]
+                })
+            });
+            docManager.openClientDocument(textDocument);
+
+            assert.deepStrictEqual(await pluginHost.getDiagnostics(textDocument), [compilerError]);
+            assert.deepStrictEqual(
+                await pluginHost.getDiagnosticsForPullMode(textDocument, undefined),
+                {
+                    kind: 'full',
+                    resultId: JSON.stringify({ svelte: 'svelte-1', ts: 'ts-1' }),
+                    items: [compilerError]
+                }
+            );
+        });
+
+        it('retains one clean parser fallback when Svelte diagnostics are disabled', async () => {
+            const fallback = markSvelteParserError({
+                range: Range.create(0, 7, 0, 8),
+                severity: DiagnosticSeverity.Error,
+                source: 'js',
+                code: 1109,
+                message: 'Expression expected.'
+            });
+            const { docManager, pluginHost } = setup({
+                getDiagnostics: () => [fallback, fallback],
+                getDiagnosticsForPullMode: () => ({
+                    kind: 'full' as const,
+                    resultId: '1',
+                    items: [fallback, fallback]
+                })
+            });
+            docManager.openClientDocument(textDocument);
+
+            const expected = [{ ...fallback }];
+            Reflect.deleteProperty(expected[0], SVELTE_PARSER_ERROR);
+            assert.deepStrictEqual(await pluginHost.getDiagnostics(textDocument), expected);
+            assert.deepStrictEqual(
+                await pluginHost.getDiagnosticsForPullMode(textDocument, undefined),
+                {
+                    kind: 'full',
+                    resultId: JSON.stringify({ test: '1' }),
+                    items: expected
+                }
+            );
+        });
+
+        it('retains template type diagnostics beside an unrelated CSS compiler error', async () => {
+            const item = {
+                ...textDocument,
+                text: '<style>\n. {}\n</style>\n<p>{value.missing}</p>'
+            };
+            const cssError = {
+                range: Range.create(1, 0, 1, 1),
+                severity: DiagnosticSeverity.Error,
+                source: 'svelte',
+                code: 'css_expected_identifier',
+                codeDescription: {
+                    href: 'https://svelte.dev/docs/svelte/compiler-errors#css_expected_identifier'
+                },
+                message: 'Expected a valid CSS identifier'
+            };
+            const typeError = {
+                range: Range.create(3, 10, 3, 17),
+                severity: DiagnosticSeverity.Error,
+                source: 'ts',
+                code: 2339,
+                message: "Property 'missing' does not exist on type '{ ok: number; }'."
+            };
+            const docManager = new DocumentManager(
+                (document) => new Document(document.uri, document.text, true)
+            );
+            const pluginHost = new PluginHost(docManager);
+            pluginHost.initialize({
+                definitionLinkSupport: true,
+                filterIncompleteCompletions: false
+            });
+            pluginHost.register({
+                __name: 'svelte',
+                getDiagnostics: () => [cssError],
+                getDiagnosticsForPullMode: () => ({
+                    kind: 'full' as const,
+                    resultId: 'svelte-1',
+                    items: [cssError]
+                })
+            });
+            pluginHost.register({
+                __name: 'ts',
+                getDiagnostics: () => [typeError],
+                getDiagnosticsForPullMode: () => ({
+                    kind: 'full' as const,
+                    resultId: 'ts-1',
+                    items: [typeError]
+                })
+            });
+            docManager.openClientDocument(item);
+
+            assert.deepStrictEqual(await pluginHost.getDiagnostics(item), [cssError, typeError]);
+            assert.deepStrictEqual(await pluginHost.getDiagnosticsForPullMode(item, undefined), {
+                kind: 'full',
+                resultId: JSON.stringify({ svelte: 'svelte-1', ts: 'ts-1' }),
+                items: [cssError, typeError]
             });
         });
 
@@ -205,6 +419,56 @@ describe('PluginHost', () => {
                 kind: 'full',
                 items: [],
                 resultId: JSON.stringify({ test: '1', test2: '2' })
+            });
+        });
+
+        it('propagates request cancellation instead of replacing it with an empty report', async () => {
+            const cancellationTokenSource = new CancellationTokenSource();
+            cancellationTokenSource.cancel();
+            const expectedDiagnostic = {
+                range: Range.create(0, 0, 0, 1),
+                message: 'recomputed'
+            };
+            const { docManager, pluginHost } = setup({
+                getDiagnostics() {
+                    return [expectedDiagnostic];
+                },
+                getDiagnosticsForPullMode(
+                    _document: Document,
+                    _previousResultId: string | undefined,
+                    cancellationToken: CancellationToken | undefined
+                ): DocumentDiagnosticReport {
+                    if (cancellationToken?.isCancellationRequested) {
+                        throw new ResponseError(
+                            LSPErrorCodes.RequestCancelled,
+                            'Request cancelled'
+                        );
+                    }
+                    return {
+                        kind: 'full',
+                        resultId: textDocument.version.toString(),
+                        items: [expectedDiagnostic]
+                    };
+                }
+            });
+            docManager.openClientDocument(textDocument);
+
+            await assert.rejects(
+                pluginHost.getDiagnosticsForPullMode(
+                    textDocument,
+                    undefined,
+                    cancellationTokenSource.token
+                ),
+                (error: unknown) =>
+                    error instanceof ResponseError && error.code === LSPErrorCodes.RequestCancelled
+            );
+
+            const retry = await pluginHost.getDiagnosticsForPullMode(textDocument, undefined);
+
+            assert.deepStrictEqual(retry, {
+                kind: 'full',
+                resultId: JSON.stringify({ test: textDocument.version.toString() }),
+                items: [expectedDiagnostic]
             });
         });
     });

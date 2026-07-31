@@ -32,6 +32,7 @@ function parseArgs(argv) {
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
+        if (a === '--') continue;
         const next = () => argv[++i];
         if (a === '--project') out.project = path.resolve(next());
         else if (a === '--file') out.file = next();

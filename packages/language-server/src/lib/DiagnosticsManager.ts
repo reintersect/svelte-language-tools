@@ -79,10 +79,19 @@ export class PushDiagnosticsManager implements DiagnosticsManager {
             { uri: document.getURL() },
             tokenSource.token
         );
-        this.sendDiagnostics({
-            uri: document.getURL(),
-            diagnostics
-        });
+        // Providers are not required to stop synchronously when cancellation is requested. A
+        // superseded run can therefore settle after a newer update has taken ownership of this
+        // URI. Publishing it would briefly restore stale diagnostics (and a provider that maps
+        // cancellation to `[]` would clear valid squiggles altogether).
+        if (
+            !tokenSource.token.isCancellationRequested &&
+            this.cancellationTokens.get(uri) === tokenSource
+        ) {
+            this.sendDiagnostics({
+                uri: document.getURL(),
+                diagnostics
+            });
+        }
 
         tokenSource.dispose();
 

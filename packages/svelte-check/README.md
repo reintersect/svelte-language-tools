@@ -6,18 +6,20 @@
 > which upstream does not do at all, and in **`svelte-check`**, replacing the two experimental tsgo
 > modes that were there.
 >
-> Measured against upstream's classic engine as the oracle, on a ~800-component SvelteKit app in a
-> pnpm monorepo:
+> One recorded comparison against upstream's classic engine, on the Reintersect ~800-component
+> SvelteKit app in its pnpm monorepo:
 >
-> | | upstream | this fork |
-> |---|---|---|
-> | `svelte-check` on a component library | 4.3s | **2.3s** |
-> | `svelte-check` on a SvelteKit app | 15.5s | **3.9s** |
-> | editor: cold project load | 7.7s | **3.6s** |
-> | editor: keystroke → diagnostics | 948ms | **420ms** |
+> |                                       | upstream | this fork |
+> | ------------------------------------- | -------- | --------- |
+> | `svelte-check` on a component library | 4.3s     | **2.3s**  |
+> | `svelte-check` on a SvelteKit app     | 15.5s    | **3.9s**  |
+> | editor: cold project load             | 7.7s     | **3.6s**  |
+> | editor: keystroke → diagnostics       | 948ms    | **420ms** |
 >
-> Same diagnostics in every case — the check is diffed against the classic engine file by file, and
-> converges on it exactly.
+> Focused fixtures are diffed against the classic engine including code, message, severity and full
+> range. That is a tested invariant rather than a universal promise: TypeScript 6 and the evolving
+> TypeScript 7 native compiler can intentionally differ, so engine updates still require reviewing
+> the full differential oracle.
 >
 > **It is also vibecoded as hell.** Essentially all of it was written by Claude in a handful of
 > sessions, against real measurements rather than a design doc, and it drifts from upstream wherever
@@ -40,7 +42,7 @@ the flag it behaves exactly like upstream.
 same for every package at once):
 
 ```bash
-pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.1 @reintersect/effect-tsgo
+pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.2 @reintersect/effect-tsgo
 ```
 
 **2. Add `--tsgo` to your check script.** It requires an explicit tsconfig:
@@ -54,13 +56,18 @@ pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.1 @reintersect/effec
 ```
 
 Generated `.tsx` twins land in `node_modules/.cache/svelte-lsp/` in each package that has
-components — already ignored by git and search tools, safe to delete, reused across runs so warm
-checks skip the transform entirely.
+components — already ignored by git and search tools and safe to delete. A transform/config
+fingerprint plus source mtimes lets warm checks reuse unchanged twins; stale or unproven entries are
+regenerated.
 
 **Requirements:** a tsconfig/jsconfig, and `@reintersect/effect-tsgo`, `@typescript/native` or
 `@typescript/native-preview` in the workspace. `SVELTE_LS_RSVELTE=1` opts the transform into
 rsvelte's Rust svelte2tsx (fast, but its source-map bug can lose template-level diagnostics —
 off by default).
+
+The native compiler follows TypeScript 7 rather than the JavaScript TypeScript 6 engine. Removed or
+not-yet-supported settings such as `baseUrl`, `moduleResolution: "node"`/`"node10"`, `outFile`, ES5
+targets and AMD/System-style module output need to be migrated before using `--tsgo`.
 
 **In CI**, [`reintersect/svelte-check-action`](https://github.com/reintersect/svelte-check-action)
 runs this fork with `tsgo: true` and comments diagnostics on the pull request.
@@ -73,7 +80,7 @@ Provides CLI diagnostics checks for:
 -   Svelte A11y hints
 -   JavaScript/TypeScript compiler errors
 
-Requires Node 16 or later.
+Requires Node 18 or later.
 
 ### Usage:
 
@@ -146,7 +153,7 @@ npm install --save-dev typescript@~6 @typescript/native@npm:typescript@7
 | `--diagnostic-sources <js,svelte,css>`                          | A list of diagnostic sources which should run diagnostics on your code. Possible values are `js` (includes TS), `svelte`, `css`. Comma-separated, inside quotes. By default all are active. Example: `--diagnostic-sources "js,svelte"`                                                                                                                                                                  |
 | `--threshold <error\|warning>`                                  | Filters the diagnostics to display. `error` will output only errors while `warning` will output warnings and errors.                                                                                                                                                                                                                                                                                     |
 | `--incremental`                                                 | Opts into TypeScript's incremental build cache, which speeds up subsequent runs. Saved within `.svelte-kit` or if not available within `.svelte-check`. This might result in slightly different type check outcomes, and certain patterns are not supported. Specifically, anything that is not in the root dir of your tsconfig.json and is a Svelte file will not be properly loaded and type-checked. |
-| `--tsgo`                                                        | Use TypeScript's Go implementation. Needs to have `@typescript/native-preview` installed. Subject to the same limitations as `--incremental`                                                                                                                                                                                                                                                             |
+| `--tsgo`                                                        | Use TypeScript's native Go implementation through the shared Svelte overlay. Requires `@reintersect/effect-tsgo`, `@typescript/native`, or `@typescript/native-preview`, plus an explicit tsconfig/jsconfig.                                                                                                                                                                                             |
 
 ### FAQ
 

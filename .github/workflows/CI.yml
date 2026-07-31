@@ -21,10 +21,25 @@ jobs:
       - run: pnpm bootstrap
       - run: pnpm build
 
+      - name: Assert the pinned native engine under test
+        env:
+          SVELTE_LS_TSGO_PACKAGE: "@typescript/native-preview"
+        run: |
+          node -e "
+            const expected = require('./package.json').devDependencies['@typescript/native-preview'].replace(/^[^0-9]*/, '');
+            const { resolveTsGoEngine } = require('./packages/language-server/dist/src/plugins/typescript-go/lsp/TsGoEngine.js');
+            const engine = resolveTsGoEngine(process.cwd());
+            if (!engine) throw new Error('the pinned native engine did not resolve');
+            if (engine.packageName !== process.env.SVELTE_LS_TSGO_PACKAGE) throw new Error('resolved ' + engine.packageName);
+            if (engine.version !== expected) throw new Error('expected ' + expected + ', resolved ' + engine.version);
+            console.log(engine.packageName + '@' + engine.version + ' -> ' + engine.binPath);
+          "
+
       # Run any tests
       - run: pnpm test
         env:
           CI: true
+      - run: pnpm test:tsgo-oracle
 
   test-svelte5:
     permissions: {}
@@ -51,6 +66,7 @@ jobs:
       - run: pnpm test
         env:
           CI: true
+      - run: pnpm test:tsgo-oracle
 
   lint:
     permissions: {}

@@ -1,4 +1,6 @@
 import { ChildProcess, spawn } from 'child_process';
+import globrex from 'globrex';
+import { relative as relativePath } from 'path';
 import {
     CancellationToken,
     createProtocolConnection,
@@ -8,18 +10,24 @@ import {
 } from 'vscode-languageserver/node';
 import {
     ConfigurationRequest,
+    DidChangeConfigurationNotification,
+    DidChangeWatchedFilesNotification,
     DidChangeTextDocumentNotification,
     DidCloseTextDocumentNotification,
     DidOpenTextDocumentNotification,
+    FileEvent,
+    FileSystemWatcher,
     InitializeRequest,
     InitializedNotification,
+    RegistrationParams,
     RegistrationRequest,
     TextDocumentContentChangeEvent,
     WorkDoneProgressCreateRequest
 } from 'vscode-languageserver-protocol';
 import { getSemanticTokenLegends } from '../../../lib/semanticToken/semanticTokenLegend';
-import { pathToUrl } from '../../../utils';
+import { normalizePath, pathToUrl, urlToPath } from '../../../utils';
 import { Logger } from '../../../logger';
+import { ResolvedTsGoEngine } from './TsGoEngine';
 
 /**
  * Preferences handed to tsgo. These arrive through a `workspace/configuration` *response*,
@@ -27,26 +35,41 @@ import { Logger } from '../../../logger';
  * names are ignored. Answering with an empty object wipes the settings entirely, so this must
  * never be `{}`.
  */
-function tsGoConfiguration() {
+function tsGoConfiguration(config: any = {}, scopeUri?: string) {
+    const scopePath = scopeUri ? urlToPath(scopeUri) : undefined;
+    const generatedSvelteScope =
+        !!scopePath &&
+        /[/\\]node_modules[/\\]\.cache[/\\]svelte-lsp[/\\]svelte[/\\].*\.svelte\.tsx$/i.test(
+            scopePath
+        );
     // Only keys with a `config:` path in tsgo's settings unmarshalling are listed — verified
     // against the binary; `allowIncompleteCompletions`, `includePackageJsonAutoImports` and
     // `suggest.completeFunctionCalls` have none and were silently ignored.
     return {
         preferences: {
-            // 'js' would leak the shadow's own extension into inserted imports
-            // (`./Button.svelte.tsx`); 'index' keeps them as `./Button.svelte`.
-            importModuleSpecifierEnding: 'index'
+            ...(config.preferences ?? {}),
+            // 'js' would leak a shadow's own extension into inserted imports
+            // (`./Button.svelte.tsx`). Override only generated Svelte requests; real TS/JS
+            // buffers must retain the user's configured preference.
+            ...(generatedSvelteScope ? { importModuleSpecifierEnding: 'index' } : {})
         },
         suggest: {
-            autoImports: true
+            autoImports: true,
+            ...(config.suggest ?? {})
         },
-        inlayHints: {}
+        inlayHints: config.inlayHints ?? {},
+        ...(config.referencesCodeLens
+            ? { referencesCodeLens: config.referencesCodeLens }
+            : undefined),
+        ...(config.implementationsCodeLens
+            ? { implementationsCodeLens: config.implementationsCodeLens }
+            : undefined)
     };
 }
 
 export interface TsGoServerOptions {
-    /** Absolute path to the tsgo executable. */
-    tsgoPath: string;
+    /** The resolved launcher and matching API package for this exact tsgo build. */
+    engine: ResolvedTsGoEngine;
     /** Directory the server is rooted at — normally the workspace source root. */
     workspacePath: string;
     /**
@@ -55,8 +78,22 @@ export interface TsGoServerOptions {
      * no checking.
      */
     workspacePaths?: string[];
+    /** Resolve the VS Code-shaped settings requested by the child. */
+    getConfiguration?: (section?: string, scopeUri?: string) => unknown;
+    /** Dynamic child watcher registrations which the outer LSP client should install. */
+    onDidRegisterWatchers?: (watchers: FileSystemWatcher[]) => void;
     /** Called when the child dies unexpectedly, so documents can be replayed into a new one. */
     onRestart?: () => void;
+    /** @internal Process factory used by focused lifecycle tests. */
+    spawnProcess?: typeof spawn;
+    /** @internal Protocol factory used by focused lifecycle tests. */
+    createConnection?: (process: ChildProcess) => ProtocolConnection;
+}
+
+interface OpenDocumentState {
+    languageId: string;
+    text: string;
+    revision: number;
 }
 
 /**
@@ -77,22 +114,58 @@ export class TsGoServer {
      * translated through this before being handed to the editor or every colour is wrong.
      */
     private tokenLegend: { tokenTypes: string[]; tokenModifiers: string[] } | undefined;
-    /** Documents we've opened, so they can be replayed if the child crashes. */
-    private readonly openDocuments = new Map<string, { languageId: string; text: string }>();
+    /** Documents the current child has actually seen. */
+    private readonly openDocuments = new Map<string, OpenDocumentState>();
     private versions = new Map<string, number>();
-    /** Documents the previous child had open, waiting to be replayed into the next one. */
-    private pendingReplay: Map<string, { languageId: string; text: string }> | undefined;
+    /** Latest caller intent, retained across startup and child crashes. */
+    private readonly desiredDocuments = new Map<string, OpenDocumentState>();
+    /** Also records closes, so continuations from older open/update calls become harmless. */
+    private readonly documentRevisions = new Map<string, number>();
     /**
      * Monotonic counter of everything that can change what tsgo knows: opens, real content
      * changes, closes, watched-file rewrites, restarts. Consumers cache against it — the
      * checker API session skips its `updateSnapshot` round trip while this hasn't moved.
      */
     private generationCounter = 0;
+    /** Ignore duplicate/late termination signals (`error` is commonly followed by `exit`). */
+    private readonly failedProcesses = new WeakSet<ChildProcess>();
+    /** LSConfigManager updates several setting groups synchronously; send one child refresh. */
+    private configurationUpdateQueued = false;
+    /** Child restarts repeat the same dynamic registrations; install each outer watcher once. */
+    private readonly registeredWatcherKeys = new Set<string>();
+    private readonly registeredWatchers: Array<{
+        watcher: FileSystemWatcher;
+        regex: RegExp;
+        basePath?: string;
+    }> = [];
 
     constructor(private readonly options: TsGoServerOptions) {}
 
     get generation(): number {
         return this.generationCounter;
+    }
+
+    /** Exact native engine selected for this session; exposed to benchmark telemetry. */
+    get engineInfo(): { packageName: string; version: string } {
+        return {
+            packageName: this.options.engine.packageName,
+            version: this.options.engine.version
+        };
+    }
+
+    /** Current native child PID, if materialisation has started it. */
+    get processId(): number | undefined {
+        return this.proc?.pid;
+    }
+
+    /** Open overlays retained for replay; exposed for lifecycle/RSS acceptance tests. */
+    get openDocumentCount(): number {
+        return this.desiredDocuments.size;
+    }
+
+    /** Documents confirmed open in the current child, excluding replay intent still in flight. */
+    get childOpenDocumentCount(): number {
+        return this.openDocuments.size;
     }
 
     /** Record a change tsgo observed outside the didOpen/didChange flow (watched files). */
@@ -105,9 +178,9 @@ export class TsGoServer {
         return this.versions.get(pathToUrl(filePath));
     }
 
-    /** The text last sent for a document, if it is open — the diff base for ranged changes. */
+    /** Latest intended text for an open document — the diff base for queued ranged changes. */
     getOpenText(filePath: string): string | undefined {
-        return this.openDocuments.get(pathToUrl(filePath))?.text;
+        return this.desiredDocuments.get(pathToUrl(filePath))?.text;
     }
 
     async start(): Promise<void> {
@@ -127,13 +200,61 @@ export class TsGoServer {
         return this.starting;
     }
 
+    /**
+     * Deliberately replace the child after a structural project/configuration change.
+     * `desiredDocuments` is left intact and is replayed by {@link start}; callers should close
+     * obsolete shadow URIs before invoking this so only the atomically rebuilt overlays return.
+     */
+    async restart(): Promise<void> {
+        if (this.disposed) {
+            throw new Error('TsGoServer has been disposed');
+        }
+        const proc = this.proc;
+        const connection = this.connection;
+        if (proc) {
+            // The ensuing exit is intentional and must not race handleProcessFailure into
+            // clearing a newer child or logging a false crash.
+            this.failedProcesses.add(proc);
+        }
+        this.connection = undefined;
+        this.proc = undefined;
+        this.starting = undefined;
+        this.openDocuments.clear();
+        this.versions.clear();
+        this.tokenLegend = undefined;
+        this.generationCounter++;
+        try {
+            connection?.dispose();
+        } catch {}
+        try {
+            proc?.kill();
+        } catch {}
+        this.options.onRestart?.();
+        await this.start();
+    }
+
     private async doStart(): Promise<void> {
         // `--lsp -stdio` is deliberate: `--stdio` and `lsp -stdio` both exit 1.
-        const proc = spawn(this.options.tsgoPath, ['--lsp', '-stdio'], {
-            cwd: this.options.workspacePath,
-            stdio: ['pipe', 'pipe', 'pipe']
-        });
+        const proc = (this.options.spawnProcess ?? spawn)(
+            this.options.engine.command,
+            [...this.options.engine.argsPrefix, '--lsp', '-stdio'],
+            {
+                cwd: this.options.workspacePath,
+                stdio: ['pipe', 'pipe', 'pipe']
+            }
+        );
         this.proc = proc;
+
+        // `spawn()` reports ENOENT/EACCES asynchronously. Without an error listener Node treats
+        // it as an unhandled EventEmitter error and takes down the whole language server.
+        let rejectSpawn: (error: Error) => void;
+        const spawnFailure = new Promise<never>((_, reject) => {
+            rejectSpawn = reject;
+        });
+        proc.once('error', (error) => {
+            this.handleProcessFailure(proc, `failed to start: ${error.message}`);
+            rejectSpawn(error);
+        });
 
         // Errors, not debug. A Go panic or a fatal startup error arrives here and nowhere else,
         // and routing it to a suppressed-by-default channel turns "tsgo died" into "the request
@@ -145,138 +266,241 @@ export class TsGoServer {
             }
             Logger.error(`[tsgo] ${text}`);
         });
-        proc.on('exit', (code, signal) => {
-            if (this.disposed) {
-                return;
-            }
-            Logger.error(`[tsgo] exited unexpectedly (code=${code} signal=${signal})`);
-            // The new child starts with no documents: queue the old overlay set for replay and
-            // clear the bookkeeping, or `updateDocument` keeps "updating" documents the child
-            // has never seen — the early-return on identical text then replays nothing at all.
-            // Merged, not replaced: a second crash before the replay ran must not wipe the
-            // queue with the (empty) live map.
-            this.pendingReplay = new Map([...(this.pendingReplay ?? []), ...this.openDocuments]);
-            this.openDocuments.clear();
-            this.versions.clear();
-            this.generationCounter++;
-            const dead = this.connection;
-            this.connection = undefined;
-            this.proc = undefined;
-            this.starting = undefined;
-            try {
-                // vscode-jsonrpc only rejects pending response promises in dispose() — a
-                // stream that merely closes leaves every in-flight request hanging forever,
-                // which surfaces as a permanently stuck editor request.
-                dead?.dispose();
-            } catch {}
-            this.options.onRestart?.();
-        });
-
-        const connection = createProtocolConnection(
-            new StreamMessageReader(proc.stdout!),
-            new StreamMessageWriter(proc.stdin!)
+        proc.on('exit', (code, signal) =>
+            this.handleProcessFailure(proc, `exited unexpectedly (code=${code} signal=${signal})`)
         );
+
+        const connection =
+            this.options.createConnection?.(proc) ??
+            createProtocolConnection(
+                new StreamMessageReader(proc.stdout!),
+                new StreamMessageWriter(proc.stdin!)
+            );
         this.connection = connection;
+        try {
+            // tsgo asks the client for settings; see tsGoConfiguration().
+            connection.onRequest(ConfigurationRequest.type, (params) =>
+                (params.items ?? []).map((item) =>
+                    tsGoConfiguration(
+                        this.options.getConfiguration?.(item.section, item.scopeUri ?? undefined),
+                        item.scopeUri ?? undefined
+                    )
+                )
+            );
+            // Accept dynamic registrations and relay file-watch requests to the outer LSP client.
+            connection.onRequest(RegistrationRequest.type, (params: RegistrationParams) => {
+                const watchers = params.registrations
+                    .filter(
+                        (registration) =>
+                            registration.method === DidChangeWatchedFilesNotification.method
+                    )
+                    .flatMap(
+                        (registration) =>
+                            ((registration.registerOptions as any)?.watchers ??
+                                []) as FileSystemWatcher[]
+                    );
+                const newWatchers = watchers.filter((watcher) => {
+                    const key = JSON.stringify(watcher);
+                    if (this.registeredWatcherKeys.has(key)) {
+                        return false;
+                    }
+                    this.registeredWatcherKeys.add(key);
+                    const globPattern = watcher.globPattern;
+                    const pattern =
+                        typeof globPattern === 'string' ? globPattern : globPattern.pattern;
+                    const baseUri =
+                        typeof globPattern === 'string' ? undefined : globPattern.baseUri;
+                    const basePath = baseUri
+                        ? urlToPath(typeof baseUri === 'string' ? baseUri : baseUri.uri)
+                        : undefined;
+                    this.registeredWatchers.push({
+                        watcher,
+                        regex: globrex(normalizePath(pattern), {
+                            globstar: true,
+                            extended: true
+                        }).regex,
+                        ...(basePath ? { basePath: normalizePath(basePath) } : {})
+                    });
+                    return true;
+                });
+                if (newWatchers.length) {
+                    this.options.onDidRegisterWatchers?.(newWatchers);
+                }
+                return null;
+            });
+            connection.onRequest(WorkDoneProgressCreateRequest.type, () => null);
+            connection.listen();
 
-        // tsgo asks the client for settings; see tsGoConfiguration().
-        connection.onRequest(ConfigurationRequest.type, (params) =>
-            (params.items ?? []).map(() => tsGoConfiguration())
-        );
-        // Accept dynamic registrations and progress creation rather than erroring on them.
-        connection.onRequest(RegistrationRequest.type, () => null);
-        connection.onRequest(WorkDoneProgressCreateRequest.type, () => null);
-        connection.listen();
+            // Every folder of a multi-root workspace: tsgo assigns configured projects only to
+            // files under its declared folders.
+            const workspaceFolders = [
+                this.options.workspacePath,
+                ...(this.options.workspacePaths ?? [])
+            ].filter((folder, index, all) => all.indexOf(folder) === index);
 
-        // Every folder of a multi-root workspace: tsgo assigns configured projects only to
-        // files under its declared folders.
-        const workspaceFolders = [
-            this.options.workspacePath,
-            ...(this.options.workspacePaths ?? [])
-        ].filter((folder, index, all) => all.indexOf(folder) === index);
-
-        const initResult = await connection.sendRequest(InitializeRequest.type, {
-            processId: process.pid,
-            rootUri: pathToUrl(this.options.workspacePath),
-            workspaceFolders: workspaceFolders.map((folder, index) => ({
-                uri: pathToUrl(folder),
-                name: index === 0 ? 'svelte-language-server' : `workspace-${index}`
-            })),
-            capabilities: {
-                // utf-8 makes tsgo's offsets line up with ours; we convert only at the
-                // editor boundary.
-                general: { positionEncodings: ['utf-8', 'utf-16'] },
-                workspace: {
-                    configuration: true,
-                    didChangeWatchedFiles: { dynamicRegistration: true }
-                },
-                textDocument: {
-                    synchronization: { dynamicRegistration: true },
-                    diagnostic: { dynamicRegistration: true },
-                    hover: { contentFormat: ['markdown', 'plaintext'] },
-                    completion: {
-                        completionItem: {
-                            snippetSupport: true,
-                            documentationFormat: ['markdown', 'plaintext'],
-                            labelDetailsSupport: true,
-                            resolveSupport: {
-                                properties: ['documentation', 'detail', 'additionalTextEdits']
+            const initResult: unknown = await Promise.race([
+                connection.sendRequest(InitializeRequest.type, {
+                    processId: process.pid,
+                    rootUri: pathToUrl(this.options.workspacePath),
+                    workspaceFolders: workspaceFolders.map((folder, index) => ({
+                        uri: pathToUrl(folder),
+                        name: index === 0 ? 'svelte-language-server' : `workspace-${index}`
+                    })),
+                    capabilities: {
+                        // LSP/Document offsets are JavaScript UTF-16 code units throughout this server.
+                        // Advertising UTF-8 lets tsgo select it and shifts every position after a
+                        // non-ASCII character, including the ranged edits used for didChange.
+                        general: { positionEncodings: ['utf-16'] },
+                        workspace: {
+                            configuration: true,
+                            didChangeWatchedFiles: { dynamicRegistration: true }
+                        },
+                        textDocument: {
+                            synchronization: { dynamicRegistration: true },
+                            diagnostic: { dynamicRegistration: true },
+                            // Native diagnostics conditionally include their secondary source
+                            // locations. Without this capability, the checker CLI retains notes
+                            // such as "declared here" while editor pull diagnostics silently
+                            // drop them, even though the outer VS Code client supports them.
+                            publishDiagnostics: {
+                                relatedInformation: true
+                            },
+                            hover: { contentFormat: ['markdown', 'plaintext'] },
+                            completion: {
+                                completionItem: {
+                                    snippetSupport: true,
+                                    documentationFormat: ['markdown', 'plaintext'],
+                                    labelDetailsSupport: true,
+                                    resolveSupport: {
+                                        properties: [
+                                            'documentation',
+                                            'detail',
+                                            'additionalTextEdits'
+                                        ]
+                                    }
+                                }
+                            },
+                            definition: { linkSupport: true },
+                            typeDefinition: { linkSupport: true },
+                            implementation: { linkSupport: true },
+                            signatureHelp: {},
+                            references: {},
+                            documentHighlight: {},
+                            rename: { prepareSupport: true },
+                            codeAction: {
+                                codeActionLiteralSupport: {
+                                    codeActionKind: {
+                                        valueSet: [
+                                            'quickfix',
+                                            'source.organizeImports',
+                                            'source.fixAll'
+                                        ]
+                                    }
+                                },
+                                resolveSupport: { properties: ['edit'] }
+                            },
+                            inlayHint: { resolveSupport: { properties: ['tooltip'] } },
+                            semanticTokens: {
+                                requests: { full: true, range: true },
+                                // tsgo encodes tokens against the *client's* legend, so this must be
+                                // the same legend we advertise to the editor. Sending an empty list
+                                // makes every token untypeable and the whole response is discarded.
+                                tokenTypes: getSemanticTokenLegends().tokenTypes,
+                                tokenModifiers: getSemanticTokenLegends().tokenModifiers,
+                                formats: ['relative']
                             }
                         }
                     },
-                    definition: { linkSupport: true },
-                    typeDefinition: { linkSupport: true },
-                    implementation: { linkSupport: true },
-                    signatureHelp: {},
-                    references: {},
-                    documentHighlight: {},
-                    rename: { prepareSupport: true },
-                    codeAction: {
-                        codeActionLiteralSupport: {
-                            codeActionKind: {
-                                valueSet: ['quickfix', 'source.organizeImports', 'source.fixAll']
-                            }
-                        },
-                        resolveSupport: { properties: ['edit'] }
-                    },
-                    inlayHint: { resolveSupport: { properties: ['tooltip'] } },
-                    semanticTokens: {
-                        requests: { full: true, range: true },
-                        // tsgo encodes tokens against the *client's* legend, so this must be
-                        // the same legend we advertise to the editor. Sending an empty list
-                        // makes every token untypeable and the whole response is discarded.
-                        tokenTypes: getSemanticTokenLegends().tokenTypes,
-                        tokenModifiers: getSemanticTokenLegends().tokenModifiers,
-                        formats: ['relative']
-                    }
-                }
-            },
-            initializationOptions: {}
-        } as any);
+                    initializationOptions: {}
+                } as any),
+                spawnFailure
+            ]);
 
-        const legend = (initResult as any)?.capabilities?.semanticTokensProvider?.legend;
-        if (legend) {
-            this.tokenLegend = {
-                tokenTypes: legend.tokenTypes ?? [],
-                tokenModifiers: legend.tokenModifiers ?? []
-            };
-        }
-
-        connection.sendNotification(InitializedNotification.type, {});
-
-        // Re-open what the previous child had, so a crash costs a restart and not the session.
-        const replay = this.pendingReplay;
-        this.pendingReplay = undefined;
-        if (replay?.size) {
-            Logger.log(`[tsgo] replaying ${replay.size} open document(s) after restart`);
-            for (const [uri, { languageId, text }] of replay) {
-                this.openDocuments.set(uri, { languageId, text });
-                this.versions.set(uri, 1);
-                connection.sendNotification(DidOpenTextDocumentNotification.type, {
-                    textDocument: { uri, languageId, version: 1, text }
-                });
+            if (
+                !initResult ||
+                typeof initResult !== 'object' ||
+                Array.isArray(initResult) ||
+                !(initResult as any).capabilities ||
+                typeof (initResult as any).capabilities !== 'object' ||
+                Array.isArray((initResult as any).capabilities)
+            ) {
+                throw new Error('tsgo returned a malformed initialize result');
             }
-            this.generationCounter++;
+            const capabilities = (initResult as any).capabilities;
+            const positionEncoding = capabilities.positionEncoding;
+            if (positionEncoding !== undefined && typeof positionEncoding !== 'string') {
+                throw new Error('tsgo returned a non-string position encoding');
+            }
+            if (positionEncoding !== undefined && positionEncoding.toLowerCase() !== 'utf-16') {
+                throw new Error(
+                    `tsgo selected unsupported position encoding ${positionEncoding}; expected utf-16`
+                );
+            }
+
+            const legend = capabilities.semanticTokensProvider?.legend;
+            if (legend) {
+                this.tokenLegend = {
+                    tokenTypes: legend.tokenTypes ?? [],
+                    tokenModifiers: legend.tokenModifiers ?? []
+                };
+            }
+
+            connection.sendNotification(InitializedNotification.type, {});
+
+            // Re-open what the previous child had, so a crash costs a restart and not the session.
+            const replay = this.desiredDocuments;
+            if (replay.size) {
+                Logger.log(`[tsgo] replaying ${replay.size} open document(s) after restart`);
+                for (const [uri, state] of replay) {
+                    const { languageId, text } = state;
+                    this.openDocuments.set(uri, state);
+                    this.versions.set(uri, 1);
+                    connection.sendNotification(DidOpenTextDocumentNotification.type, {
+                        textDocument: { uri, languageId, version: 1, text }
+                    });
+                }
+                this.generationCounter++;
+            }
+        } catch (error) {
+            const startupError =
+                error instanceof Error ? error : new Error(`tsgo initialization failed: ${error}`);
+            this.handleProcessFailure(proc, `initialization failed: ${startupError.message}`);
+            // handleProcessFailure owns the current references, but clean these exact resources
+            // as well so a superseded attempt can never tear down or leak a newer connection.
+            try {
+                connection.dispose();
+            } catch {}
+            try {
+                proc.kill();
+            } catch {}
+            throw startupError;
         }
+    }
+
+    private handleProcessFailure(proc: ChildProcess, message: string) {
+        if (this.disposed || this.failedProcesses.has(proc)) {
+            return;
+        }
+        this.failedProcesses.add(proc);
+        // A late exit from a superseded attempt must not dispose the current child's connection.
+        if (this.proc !== proc) {
+            return;
+        }
+        Logger.error(`[tsgo] ${message}`);
+        // The new child starts with no actual overlays. desiredDocuments remains canonical and
+        // will be replayed by the next start, including updates which arrived during startup.
+        this.openDocuments.clear();
+        this.versions.clear();
+        this.generationCounter++;
+        const dead = this.connection;
+        this.connection = undefined;
+        this.proc = undefined;
+        this.starting = undefined;
+        try {
+            // vscode-jsonrpc only rejects pending response promises in dispose().
+            dead?.dispose();
+        } catch {}
+        this.options.onRestart?.();
     }
 
     /** tsgo's semantic-token legend, available once the server has initialized. */
@@ -298,51 +522,96 @@ export class TsGoServer {
      * `any` with no diagnostic at all.
      */
     async openDocument(filePath: string, text: string, languageId = 'typescriptreact') {
-        await this.start();
         const uri = pathToUrl(filePath);
-        // A fresh open supersedes anything queued for replay from before a crash.
-        this.pendingReplay?.delete(uri);
-        this.openDocuments.set(uri, { languageId, text });
-        this.versions.set(uri, 1);
-        this.generationCounter++;
-        this.conn.sendNotification(DidOpenTextDocumentNotification.type, {
-            textDocument: { uri, languageId, version: 1, text }
-        });
+        const revision = this.recordDesiredDocument(uri, languageId, text);
+        await this.start();
+        if (this.documentRevisions.get(uri) !== revision) {
+            return;
+        }
+        const current = this.openDocuments.get(uri);
+        if (current) {
+            if (current.text === text && current.languageId === languageId) {
+                this.openDocuments.set(uri, { languageId, text, revision });
+                return;
+            }
+            if (current.languageId !== languageId) {
+                this.reopenDocument(uri, { languageId, text, revision });
+                return;
+            }
+            this.changeDocument(uri, { languageId, text, revision }, [{ text }]);
+            return;
+        }
+        this.sendOpenDocument(uri, { languageId, text, revision });
     }
 
     async updateDocument(
         filePath: string,
         changes: TextDocumentContentChangeEvent[],
-        text: string
+        text: string,
+        languageId?: string
     ) {
-        await this.start();
         const uri = pathToUrl(filePath);
-        const current = this.openDocuments.get(uri);
-        if (!current) {
-            return this.openDocument(filePath, text);
-        }
-        if (current.text === text) {
-            // Nothing changed. A didChange here would still make tsgo re-parse and re-check the
-            // file, which is most of the cost of a request — and one editor interaction fans out
-            // into many requests against identical content.
+        const resolvedLanguageId =
+            languageId ??
+            this.desiredDocuments.get(uri)?.languageId ??
+            this.openDocuments.get(uri)?.languageId ??
+            'typescriptreact';
+        const revision = this.recordDesiredDocument(uri, resolvedLanguageId, text);
+        await this.start();
+        if (this.documentRevisions.get(uri) !== revision) {
             return;
         }
-        this.openDocuments.set(uri, { languageId: 'typescriptreact', text });
-        const version = (this.versions.get(uri) ?? 1) + 1;
-        this.versions.set(uri, version);
-        this.generationCounter++;
-        this.conn.sendNotification(DidChangeTextDocumentNotification.type, {
-            textDocument: { uri, version },
-            contentChanges: changes
-        });
+        const current = this.openDocuments.get(uri);
+        if (!current) {
+            this.sendOpenDocument(uri, {
+                languageId: resolvedLanguageId,
+                text,
+                revision
+            });
+            return;
+        }
+        if (current.text === text) {
+            // Retain the newest revision and real language id even when content is unchanged.
+            // A language-id change requires close/open because didChange cannot carry one.
+            if (current.languageId !== resolvedLanguageId) {
+                this.reopenDocument(uri, {
+                    languageId: resolvedLanguageId,
+                    text,
+                    revision
+                });
+            } else {
+                this.openDocuments.set(uri, {
+                    languageId: resolvedLanguageId,
+                    text,
+                    revision
+                });
+            }
+            return;
+        }
+        if (current.languageId !== resolvedLanguageId) {
+            this.reopenDocument(uri, { languageId: resolvedLanguageId, text, revision });
+            return;
+        }
+        // If an older update was superseded while start() was pending, this incremental range is
+        // based on text the child never saw. A full replacement is the only safe coalesced edit.
+        const contentChanges =
+            current.revision + 1 === revision && changes.length ? changes : [{ text }];
+        this.changeDocument(
+            uri,
+            { languageId: resolvedLanguageId, text, revision },
+            contentChanges
+        );
     }
 
     async closeDocument(filePath: string) {
         const uri = pathToUrl(filePath);
-        // Also drop it from a queued replay: a document closed (or deleted) between a crash
-        // and the next start must not be resurrected as an overlay in the new child.
-        this.pendingReplay?.delete(uri);
+        const revision = (this.documentRevisions.get(uri) ?? 0) + 1;
+        this.documentRevisions.set(uri, revision);
+        const wasDesired = this.desiredDocuments.delete(uri);
         if (!this.openDocuments.delete(uri)) {
+            if (wasDesired) {
+                this.generationCounter++;
+            }
             return;
         }
         this.versions.delete(uri);
@@ -353,7 +622,110 @@ export class TsGoServer {
     }
 
     isOpen(filePath: string) {
-        return this.openDocuments.has(pathToUrl(filePath));
+        return this.desiredDocuments.has(pathToUrl(filePath));
+    }
+
+    private recordDesiredDocument(uri: string, languageId: string, text: string): number {
+        const revision = (this.documentRevisions.get(uri) ?? 0) + 1;
+        const state = { languageId, text, revision };
+        this.documentRevisions.set(uri, revision);
+        this.desiredDocuments.set(uri, state);
+        return revision;
+    }
+
+    private sendOpenDocument(uri: string, state: OpenDocumentState) {
+        this.openDocuments.set(uri, state);
+        this.versions.set(uri, 1);
+        this.generationCounter++;
+        this.conn.sendNotification(DidOpenTextDocumentNotification.type, {
+            textDocument: {
+                uri,
+                languageId: state.languageId,
+                version: 1,
+                text: state.text
+            }
+        });
+    }
+
+    private reopenDocument(uri: string, state: OpenDocumentState) {
+        this.conn.sendNotification(DidCloseTextDocumentNotification.type, {
+            textDocument: { uri }
+        });
+        this.sendOpenDocument(uri, state);
+    }
+
+    private changeDocument(
+        uri: string,
+        next: OpenDocumentState,
+        changes: TextDocumentContentChangeEvent[]
+    ) {
+        this.openDocuments.set(uri, next);
+        const version = (this.versions.get(uri) ?? 1) + 1;
+        this.versions.set(uri, version);
+        this.generationCounter++;
+        this.conn.sendNotification(DidChangeTextDocumentNotification.type, {
+            textDocument: { uri, version },
+            contentChanges: changes
+        });
+    }
+
+    /** Forward outer workspace file events into tsgo's dynamically registered watcher. */
+    async notifyWatchedFiles(changes: FileEvent[]) {
+        const matching = changes.filter((change) => this.matchesRegisteredWatcher(change));
+        if (!matching.length) {
+            return;
+        }
+        await this.start();
+        this.generationCounter++;
+        this.conn.sendNotification(DidChangeWatchedFilesNotification.type, {
+            changes: matching
+        });
+    }
+
+    private matchesRegisteredWatcher(change: FileEvent): boolean {
+        const filePath = urlToPath(change.uri);
+        if (!filePath) {
+            return false;
+        }
+        const normalized = normalizePath(filePath);
+        const kind = change.type === 1 ? 1 : change.type === 2 ? 2 : 4;
+        return this.registeredWatchers.some(({ watcher, regex, basePath }) => {
+            if (((watcher.kind ?? 7) & kind) === 0) {
+                return false;
+            }
+            if (basePath) {
+                const relative = normalizePath(relativePath(basePath, normalized));
+                return !relative.startsWith('../') && regex.test(relative);
+            }
+            const candidates = [normalized];
+            for (const workspacePath of [
+                this.options.workspacePath,
+                ...(this.options.workspacePaths ?? [])
+            ]) {
+                const relative = normalizePath(relativePath(workspacePath, normalized));
+                if (!relative.startsWith('../')) {
+                    candidates.push(relative);
+                }
+            }
+            return candidates.some((candidate) => regex.test(candidate));
+        });
+    }
+
+    /** Tell tsgo to request the latest VS Code-shaped configuration from us. */
+    async updateConfiguration() {
+        const connection = this.connection;
+        if (!connection || this.configurationUpdateQueued) {
+            return;
+        }
+        this.configurationUpdateQueued = true;
+        queueMicrotask(() => {
+            this.configurationUpdateQueued = false;
+            if (this.connection === connection) {
+                connection.sendNotification(DidChangeConfigurationNotification.type, {
+                    settings: {}
+                });
+            }
+        });
     }
 
     /**
@@ -384,6 +756,7 @@ export class TsGoServer {
         this.proc = undefined;
         this.openDocuments.clear();
         this.versions.clear();
-        this.pendingReplay = undefined;
+        this.desiredDocuments.clear();
+        this.documentRevisions.clear();
     }
 }

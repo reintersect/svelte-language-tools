@@ -38,7 +38,13 @@ export function mapLocationBack(
     return Location.create(pathToUrl(originalPath), mapped);
 }
 
-/** Map a whole WorkspaceEdit's `changes` back to original files, dropping unmappable edits. */
+/**
+ * Map a whole workspace edit back to original files without changing its representation.
+ *
+ * In particular, `documentChanges` cannot be flattened into `changes`: the VS Code extension
+ * consumes `documentChanges` for file-rename edits, and flattening also discards document
+ * versions, change annotations and resource operations.
+ */
 export function mapWorkspaceEditBack(
     shadows: ShadowLookup,
     edit: WorkspaceEdit | null | undefined
@@ -47,24 +53,24 @@ export function mapWorkspaceEditBack(
         return null;
     }
 
-    const changes: Record<string, TextEdit[]> = {};
-    const add = (uri: string, edits: TextEdit[]) => {
-        if (!edits.length) {
-            return;
-        }
-        changes[uri] = (changes[uri] ?? []).concat(edits);
+    const mapUri = (uri: string): string => {
+        const filePath = urlToPath(uri);
+        const originalPath = filePath ? shadows.getOriginalPath(filePath) : undefined;
+        return originalPath ? pathToUrl(originalPath) : uri;
     };
 
-    const mapEdits = (uri: string, edits: TextEdit[]) => {
+    const mapEdits = (
+        uri: string,
+        edits: TextEdit[]
+    ): { uri: string; edits: TextEdit[] } | undefined => {
         const filePath = urlToPath(uri);
         const originalPath = filePath ? shadows.getOriginalPath(filePath) : undefined;
         if (!originalPath) {
-            add(uri, edits);
-            return;
+            return { uri, edits };
         }
         const snapshot = shadows.ensureSnapshot(originalPath);
         if (!snapshot) {
-            return;
+            return undefined;
         }
         const mapped = edits
             .map((textEdit) => {
@@ -72,21 +78,54 @@ export function mapWorkspaceEditBack(
                 return isMapped(range) ? { ...textEdit, range } : undefined;
             })
             .filter((e): e is TextEdit => !!e);
-        add(pathToUrl(originalPath), mapped);
+        return { uri: pathToUrl(originalPath), edits: mapped };
     };
 
+    const changes: Record<string, TextEdit[]> = {};
     for (const [uri, edits] of Object.entries(edit.changes ?? {})) {
-        mapEdits(uri, edits);
-    }
-    for (const change of edit.documentChanges ?? []) {
-        // Only plain text edits are translated; create/rename/delete file operations refer to
-        // shadows and have no meaningful counterpart in the user's tree.
-        if ('textDocument' in change && Array.isArray(change.edits)) {
-            mapEdits(change.textDocument.uri, change.edits as TextEdit[]);
+        const mapped = mapEdits(uri, edits);
+        if (mapped?.edits.length) {
+            changes[mapped.uri] = (changes[mapped.uri] ?? []).concat(mapped.edits);
         }
     }
 
-    return Object.keys(changes).length ? { changes } : null;
+    const documentChanges: NonNullable<WorkspaceEdit['documentChanges']> = [];
+    for (const change of edit.documentChanges ?? []) {
+        if ('textDocument' in change && Array.isArray(change.edits)) {
+            const mapped = mapEdits(change.textDocument.uri, change.edits as TextEdit[]);
+            if (mapped?.edits.length) {
+                documentChanges.push({
+                    ...change,
+                    textDocument: { ...change.textDocument, uri: mapped.uri },
+                    edits: mapped.edits
+                });
+            }
+            continue;
+        }
+
+        // Resource operations can target either a real TypeScript file or a generated Svelte
+        // shadow. Preserve them in both cases, translating only the shadow URI(s).
+        if ('kind' in change) {
+            if (change.kind === 'rename') {
+                documentChanges.push({
+                    ...change,
+                    oldUri: mapUri(change.oldUri),
+                    newUri: mapUri(change.newUri)
+                });
+            } else if (change.kind === 'create' || change.kind === 'delete') {
+                documentChanges.push({ ...change, uri: mapUri(change.uri) });
+            }
+        }
+    }
+
+    if (!Object.keys(changes).length && !documentChanges.length) {
+        return null;
+    }
+    return {
+        ...(Object.keys(changes).length ? { changes } : {}),
+        ...(documentChanges.length ? { documentChanges } : {}),
+        ...(edit.changeAnnotations ? { changeAnnotations: edit.changeAnnotations } : {})
+    };
 }
 
 /**
@@ -113,6 +152,21 @@ export function decodeSemanticTokens(
 export function buildLegendMap(from: string[], to: string[]): number[] {
     const target = new Map(to.map((name, index) => [name, index]));
     return from.map((name) => target.get(name) ?? -1);
+}
+
+/** Translate a semantic-token modifier bitset between two differently ordered legends. */
+export function mapLegendModifierBits(bits: number, legendMap: number[]): number {
+    let mapped = 0;
+    for (let source = 0; source < legendMap.length && source < 31; source++) {
+        if ((bits & (1 << source)) === 0) {
+            continue;
+        }
+        const target = legendMap[source];
+        if (target >= 0 && target < 31) {
+            mapped |= 1 << target;
+        }
+    }
+    return mapped;
 }
 
 export function mapTokenRangeBack(

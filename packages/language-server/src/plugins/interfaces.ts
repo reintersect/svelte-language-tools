@@ -43,6 +43,19 @@ import { Document } from '../lib/documents';
 
 export type Resolvable<T> = T | Promise<T>;
 
+/**
+ * Marks a generated TypeScript fallback for a Svelte transform/parser failure. PluginHost uses
+ * the non-serializable symbol to prefer the compiler's richer named diagnostic when available.
+ */
+export const SVELTE_PARSER_ERROR = Symbol('svelte-parser-error');
+
+export function markSvelteParserError<T extends object>(diagnostic: T): T {
+    // Keep this out of snapshots, object enumeration and JSON-RPC. Mapping code explicitly
+    // propagates the marker across the TypeScript-to-LSP diagnostic boundary.
+    Object.defineProperty(diagnostic, SVELTE_PARSER_ERROR, { value: true });
+    return diagnostic;
+}
+
 export interface AppCompletionItem<T extends TextDocumentIdentifier = any> extends CompletionItem {
     data?: T;
 }
@@ -61,7 +74,11 @@ export interface DiagnosticsProvider {
 }
 
 export interface HoverProvider {
-    doHover(document: Document, position: Position): Resolvable<Hover | null>;
+    doHover(
+        document: Document,
+        position: Position,
+        cancellationToken?: CancellationToken
+    ): Resolvable<Hover | null>;
 }
 
 export interface CompletionsProvider<T extends TextDocumentIdentifier = any> {
@@ -107,13 +124,18 @@ export interface DocumentSymbolsProvider {
 }
 
 export interface DefinitionsProvider {
-    getDefinitions(document: Document, position: Position): Resolvable<DefinitionLink[]>;
+    getDefinitions(
+        document: Document,
+        position: Position,
+        cancellationToken?: CancellationToken
+    ): Resolvable<DefinitionLink[]>;
 }
 
 export interface BackwardsCompatibleDefinitionsProvider {
     getDefinitions(
         document: Document,
-        position: Position
+        position: Position,
+        cancellationToken?: CancellationToken
     ): Resolvable<DefinitionLink[] | Location[]>;
 }
 
@@ -150,9 +172,14 @@ export interface RenameProvider {
     rename(
         document: Document,
         position: Position,
-        newName: string
+        newName: string,
+        cancellationToken?: CancellationToken
     ): Resolvable<WorkspaceEdit | null>;
-    prepareRename(document: Document, position: Position): Resolvable<Range | null>;
+    prepareRename(
+        document: Document,
+        position: Position,
+        cancellationToken?: CancellationToken
+    ): Resolvable<Range | null>;
 }
 
 export interface FindReferencesProvider {
@@ -165,11 +192,14 @@ export interface FindReferencesProvider {
 }
 
 export interface FileReferencesProvider {
-    fileReferences(uri: string): Promise<Location[] | null>;
+    fileReferences(uri: string, cancellationToken?: CancellationToken): Promise<Location[] | null>;
 }
 
 export interface FindComponentReferencesProvider {
-    findComponentReferences(uri: string): Promise<Location[] | null>;
+    findComponentReferences(
+        uri: string,
+        cancellationToken?: CancellationToken
+    ): Promise<Location[] | null>;
 }
 
 export interface SignatureHelpProvider {
@@ -182,17 +212,26 @@ export interface SignatureHelpProvider {
 }
 
 export interface SelectionRangeProvider {
-    getSelectionRange(document: Document, position: Position): Resolvable<SelectionRange | null>;
+    getSelectionRange(
+        document: Document,
+        position: Position,
+        cancellationToken?: CancellationToken
+    ): Resolvable<SelectionRange | null>;
 }
 
 export interface SemanticTokensProvider {
-    getSemanticTokens(textDocument: Document, range?: Range): Resolvable<SemanticTokens | null>;
+    getSemanticTokens(
+        textDocument: Document,
+        range?: Range,
+        cancellationToken?: CancellationToken
+    ): Resolvable<SemanticTokens | null>;
 }
 
 export interface LinkedEditingRangesProvider {
     getLinkedEditingRanges(
         document: Document,
-        position: Position
+        position: Position,
+        cancellationToken?: CancellationToken
     ): Resolvable<LinkedEditingRanges | null>;
 }
 
@@ -205,13 +244,18 @@ export interface ImplementationProvider {
 }
 
 export interface TypeDefinitionProvider {
-    getTypeDefinition(document: Document, position: Position): Resolvable<Location[] | null>;
+    getTypeDefinition(
+        document: Document,
+        position: Position,
+        cancellationToken?: CancellationToken
+    ): Resolvable<Location[] | null>;
 }
 
 export interface CallHierarchyProvider {
     prepareCallHierarchy(
         document: Document,
-        position: Position
+        position: Position,
+        cancellationToken?: CancellationToken
     ): Resolvable<CallHierarchyItem[] | null>;
 
     getIncomingCalls(
@@ -226,7 +270,10 @@ export interface CallHierarchyProvider {
 }
 
 export interface CodeLensProvider {
-    getCodeLens(document: Document): Resolvable<CodeLens[] | null>;
+    getCodeLens(
+        document: Document,
+        cancellationToken?: CancellationToken
+    ): Resolvable<CodeLens[] | null>;
     resolveCodeLens(
         document: Document,
         codeLensToResolve: CodeLens,
@@ -248,13 +295,17 @@ export interface InlayHintProvider {
 }
 
 export interface FoldingRangeProvider {
-    getFoldingRanges(document: Document): Resolvable<FoldingRange[]>;
+    getFoldingRanges(
+        document: Document,
+        cancellationToken?: CancellationToken
+    ): Resolvable<FoldingRange[]>;
 }
 
 export interface DocumentHighlightProvider {
     findDocumentHighlight(
         document: Document,
-        position: Position
+        position: Position,
+        cancellationToken?: CancellationToken
     ): Resolvable<DocumentHighlight[] | null>;
 }
 
@@ -270,7 +321,25 @@ export interface OnWatchFileChanges {
 }
 
 export interface UpdateTsOrJsFile {
-    updateTsOrJsFile(fileName: string, changes: TextDocumentContentChangeEvent[]): void;
+    updateTsOrJsFile(
+        fileName: string,
+        changes: TextDocumentContentChangeEvent[],
+        text?: string,
+        version?: number,
+        languageId?: string
+    ): void;
+}
+
+export interface OpenTsOrJsFile {
+    openTsOrJsFile(fileName: string, text: string, languageId: string, version?: number): void;
+}
+
+export interface CloseTsOrJsFile {
+    closeTsOrJsFile(fileName: string): void;
+}
+
+export interface DisposablePlugin {
+    dispose(): void;
 }
 
 type ProviderBase = DiagnosticsProvider &
@@ -318,5 +387,8 @@ export type Plugin = Partial<
         DefinitionsProvider &
         OnWatchFileChanges &
         SelectionRangeProvider &
-        UpdateTsOrJsFile
+        UpdateTsOrJsFile &
+        OpenTsOrJsFile &
+        CloseTsOrJsFile &
+        DisposablePlugin
 > & { __name: string };

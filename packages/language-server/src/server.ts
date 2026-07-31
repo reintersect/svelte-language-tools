@@ -27,7 +27,14 @@ import {
     DocumentDiagnosticRequest,
     DocumentDiagnosticParams,
     DocumentDiagnosticReport,
-    DiagnosticRefreshRequest
+    DiagnosticRefreshRequest,
+    FileSystemWatcher,
+    TextDocumentContentChangeEvent,
+    DidOpenTextDocumentNotification,
+    DidChangeTextDocumentNotification,
+    DidCloseTextDocumentNotification,
+    BulkRegistration,
+    DocumentSelector
 } from 'vscode-languageserver';
 import { IPCMessageReader, IPCMessageWriter, createConnection } from 'vscode-languageserver/node';
 import {
@@ -58,6 +65,7 @@ import {
 import { debounceThrottle, isNotNullOrUndefined, normalizeUri, urlToPath } from './utils';
 import { FallbackWatcher } from './lib/FallbackWatcher';
 import { configLoader } from './lib/documents/configLoader';
+import { getLineOffsets, offsetAt } from './lib/documents/utils';
 import { setIsTrusted } from './importPackage';
 import {
     SORT_IMPORT_CODE_ACTION_KIND,
@@ -70,6 +78,52 @@ import { FileSystemProvider } from './lib/FileSystemProvider';
 namespace TagCloseRequest {
     export const type: RequestType<TextDocumentPositionParams, string | null, any> =
         new RequestType('html/tag');
+}
+
+const tsOrJsLanguageIds = new Set([
+    'typescript',
+    'typescriptreact',
+    'javascript',
+    'javascriptreact'
+]);
+
+function isTsOrJsLanguageId(languageId: string): boolean {
+    return tsOrJsLanguageIds.has(languageId);
+}
+
+function applyTextDocumentChanges(text: string, changes: TextDocumentContentChangeEvent[]): string {
+    for (const change of changes) {
+        if (!('range' in change)) {
+            text = change.text;
+            continue;
+        }
+        const lineOffsets = getLineOffsets(text);
+        const start = offsetAt(change.range.start, text, lineOffsets);
+        const end = offsetAt(change.range.end, text, lineOffsets);
+        text = text.slice(0, start) + change.text + text.slice(end);
+    }
+    return text;
+}
+
+const tsOrJsDocumentSelector: DocumentSelector = Array.from(tsOrJsLanguageIds, (language) => ({
+    scheme: 'file',
+    language
+}));
+
+/** Dynamically extend text synchronization without claiming TS/JS language features. */
+export function registerTsOrJsTextSynchronization(connection: Connection): Promise<unknown> {
+    const registrations = BulkRegistration.create();
+    registrations.add(DidOpenTextDocumentNotification.type, {
+        documentSelector: tsOrJsDocumentSelector
+    });
+    registrations.add(DidChangeTextDocumentNotification.type, {
+        documentSelector: tsOrJsDocumentSelector,
+        syncKind: TextDocumentSyncKind.Incremental
+    });
+    registrations.add(DidCloseTextDocumentNotification.type, {
+        documentSelector: tsOrJsDocumentSelector
+    });
+    return connection.client.register(registrations);
 }
 
 export interface LSOptions {
@@ -117,24 +171,150 @@ export function startServer(options?: LSOptions) {
     const pluginHost = new PluginHost(docManager);
     let sveltePlugin: SveltePlugin = undefined as any;
     let watcher: FallbackWatcher | undefined;
+    let dynamicTsOrJsTextSync = false;
+    let tsGoActive = false;
+    let tsGoPlugin: ReturnType<typeof createTsGoPlugin>;
     let pendingWatchPatterns: RelativePattern[] = [];
+    const openTsOrJsDocuments = new Map<
+        string,
+        {
+            fileName: string;
+            languageId: string;
+            version?: number;
+            text?: string;
+            open: boolean;
+        }
+    >();
     let watchDirectory: (patterns: RelativePattern[]) => void = (patterns) => {
         pendingWatchPatterns = patterns;
     };
 
     // Include Svelte files to better deal with scenarios such as switching git branches
     // where files that are not opened in the client could change
-    const watchExtensions = ['.ts', '.js', '.mts', '.mjs', '.cjs', '.cts', '.json', '.svelte'];
+    const watchExtensions = [
+        '.ts',
+        '.tsx',
+        '.js',
+        '.jsx',
+        '.mts',
+        '.mjs',
+        '.cjs',
+        '.cts',
+        '.json',
+        '.svelte'
+    ];
     const nonRecursiveWatchPattern =
         '*.{' + watchExtensions.map((ext) => ext.slice(1)).join(',') + '}';
     const recursiveWatchPattern = '**/' + nonRecursiveWatchPattern;
 
+    function openTsOrJsFile(
+        uri: string,
+        fileName: string,
+        text: string,
+        languageId: string,
+        version?: number
+    ) {
+        const key = normalizeUri(uri);
+        const current = openTsOrJsDocuments.get(key);
+        if (
+            current?.open &&
+            ((version !== undefined &&
+                current.version !== undefined &&
+                version <= current.version) ||
+                (current.text === text && current.languageId === languageId))
+        ) {
+            return;
+        }
+        openTsOrJsDocuments.set(key, {
+            fileName,
+            languageId,
+            version,
+            text,
+            open: true
+        });
+        pluginHost.openTsOrJsFile(fileName, text, languageId, version);
+    }
+
+    function updateTsOrJsFile(
+        uri: string,
+        fileName: string,
+        changes: TextDocumentContentChangeEvent[],
+        text?: string,
+        version?: number,
+        languageId?: string
+    ) {
+        const key = normalizeUri(uri);
+        const current = openTsOrJsDocuments.get(key);
+        // Mixed/custom clients may send standard and compatibility notifications for the same
+        // version. Only the first may mutate tsgo; lower versions are stale messages in flight.
+        if (version !== undefined && current?.version !== undefined && version <= current.version) {
+            return;
+        }
+        const nextText =
+            text ??
+            (current?.text !== undefined
+                ? applyTextDocumentChanges(current.text, changes)
+                : undefined);
+        if (nextText !== undefined) {
+            openTsOrJsDocuments.set(key, {
+                fileName,
+                languageId: languageId ?? current?.languageId ?? 'typescript',
+                version,
+                text: nextText,
+                open: true
+            });
+        }
+        pluginHost.updateTsOrJsFile(
+            fileName,
+            changes,
+            nextText,
+            version,
+            languageId ?? current?.languageId
+        );
+    }
+
+    function closeTsOrJsFile(uri: string, fileName?: string) {
+        const key = normalizeUri(uri);
+        const current = openTsOrJsDocuments.get(key);
+        if (current && !current.open) {
+            return;
+        }
+        const resolvedFileName = current?.fileName ?? fileName;
+        if (!resolvedFileName) {
+            return;
+        }
+        openTsOrJsDocuments.set(key, {
+            fileName: resolvedFileName,
+            languageId: current?.languageId ?? 'typescript',
+            version: current?.version,
+            // Tombstones exist only to deduplicate standard + compatibility closes. Retaining
+            // whole source buffers here would keep hundreds of closed TS/JS files alive.
+            text: undefined,
+            open: false
+        });
+        pluginHost.closeTsOrJsFile(resolvedFileName);
+        // Bound closed-document metadata while retaining enough recent entries to deduplicate
+        // the standard + compatibility close pair.
+        if (openTsOrJsDocuments.size > 1_000) {
+            for (const [closedUri, state] of openTsOrJsDocuments) {
+                if (!state.open && closedUri !== key) {
+                    openTsOrJsDocuments.delete(closedUri);
+                    if (openTsOrJsDocuments.size <= 750) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     connection.onInitialize(async (evt) => {
+        const tsGoEnabled = isTsGoEnabled(evt.initializationOptions);
+        const isTrusted: boolean = evt.initializationOptions?.isTrusted ?? true;
         // The Rust transform is ESM-only and can only be loaded asynchronously, while the
         // transform call sites are synchronous — so it has to be resolved before the plugin
         // exists. Deciding the engine once per session also keeps the shadow fingerprint
         // stable; a mid-session switch would split it between engines.
-        if (isTsGoEnabled(evt.initializationOptions)) {
+        if (tsGoEnabled && isTrusted) {
             // Opt-in: `svelte.language-server.rsvelte` setting or SVELTE_LS_RSVELTE=1.
             await preloadRsvelte(isRsvelteEnabled(evt.initializationOptions));
         }
@@ -150,13 +330,17 @@ export function startServer(options?: LSOptions) {
             const workspacePaths = workspaceUris.map(urlToPath).filter(isNotNullOrUndefined);
             watcher = new FallbackWatcher(watchExtensions, workspacePaths);
             watcher.onDidChangeWatchedFiles(onDidChangeWatchedFiles);
+            watcher.onErrorOccurred((error) =>
+                Logger.error(
+                    `[watch] external file changes will not be observed until restart: ${error.message}`
+                )
+            );
 
             watchDirectory = (patterns) => {
                 watcher?.watchDirectory(patterns);
             };
         }
 
-        const isTrusted: boolean = evt.initializationOptions?.isTrusted ?? true;
         configLoader.setDisabled(!isTrusted);
         setIsTrusted(isTrusted);
         configManager.updateIsTrusted(isTrusted);
@@ -224,10 +408,22 @@ export function startServer(options?: LSOptions) {
         );
         const normalizedWorkspaceUris = workspaceUris.map(normalizeUri);
 
+        // Document transforms synchronously consult configLoader. Preload every trusted root
+        // before tsgo materialises its first shadow, otherwise the config-less transform is
+        // cached and settings such as defaultScriptLanguage stay wrong for the whole session.
+        if (isTrusted && tsGoEnabled) {
+            await Promise.all(
+                normalizedWorkspaceUris
+                    .map((uri) => urlToPath(uri))
+                    .filter((path): path is string => !!path)
+                    .map((path) => configLoader.loadConfigs(path))
+            );
+        }
+
         // Full tsgo: when enabled, the JS TypeScript engine is not constructed at all. Building
         // it registers document listeners and its own snapshot pipeline, so merely having it
         // around means paying for a second engine even when nothing queries it.
-        const tsGoPlugin = isTsGoEnabled(evt.initializationOptions)
+        tsGoPlugin = tsGoEnabled
             ? createTsGoPlugin({
                   workspacePath: urlToPath(normalizedWorkspaceUris[0] ?? '') ?? process.cwd(),
                   // Every folder, not just the first: project resolution is bounded by these,
@@ -235,7 +431,18 @@ export function startServer(options?: LSOptions) {
                   workspacePaths: normalizedWorkspaceUris
                       .map((uri) => urlToPath(uri))
                       .filter((path): path is string => !!path),
-                  docManager
+                  docManager,
+                  configManager,
+                  isTrusted,
+                  onDidRegisterWatchers: (watchers: FileSystemWatcher[]) => {
+                      // The fallback watcher already observes the full supported extension
+                      // superset. Dynamic clients can install tsgo's more precise registrations.
+                      if (!watcher) {
+                          void connection?.client.register(DidChangeWatchedFilesNotification.type, {
+                              watchers
+                          });
+                      }
+                  }
               })
             : undefined;
 
@@ -244,6 +451,9 @@ export function startServer(options?: LSOptions) {
         } else {
             pluginHost.register(createTypeScriptPlugin());
         }
+        tsGoActive = !!tsGoPlugin;
+        dynamicTsOrJsTextSync =
+            !!tsGoPlugin && !!evt.capabilities.textDocument?.synchronization?.dynamicRegistration;
 
         function createTypeScriptPlugin() {
             return new TypeScriptPlugin(
@@ -410,6 +620,11 @@ export function startServer(options?: LSOptions) {
                     evt.initializationOptions?.configuration?.svelte?.plugin?.svelte
                         ?.documentHighlight?.enable ?? true,
                 workspaceSymbolProvider: true,
+                experimental: {
+                    // The VS Code extension may synchronize TS-family buffers over standard
+                    // textDocument notifications without adding them to its feature selector.
+                    tsOrJsTextSync: dynamicTsOrJsTextSync
+                },
                 diagnosticProvider: {
                     interFileDependencies: true,
                     workspaceDiagnostics: false
@@ -419,6 +634,12 @@ export function startServer(options?: LSOptions) {
     });
 
     connection.onInitialized(() => {
+        if (dynamicTsOrJsTextSync) {
+            void registerTsOrJsTextSynchronization(connection!).catch((error) =>
+                Logger.error('[tsgo] could not register TS/JS text synchronization', error)
+            );
+        }
+
         if (watcher) {
             return;
         }
@@ -430,15 +651,23 @@ export function startServer(options?: LSOptions) {
             return;
         }
 
-        // still watch the roots since some files might be referenced but not included in the project
+        // tsgo dynamically registers its own TS/project watchers. Add only the Svelte/config
+        // supplement it cannot know about; registering the old broad watcher as well caused VS
+        // Code to deliver every TS/config event twice and structural changes restarted two
+        // children back-to-back.
         connection?.client.register(DidChangeWatchedFilesNotification.type, {
-            watchers: [
-                {
-                    // Editors have exclude configs, such as VSCode with `files.watcherExclude`,
-                    // which means it's safe to watch recursively here
-                    globPattern: recursiveWatchPattern
-                }
-            ]
+            watchers: tsGoActive
+                ? [
+                      { globPattern: '**/*.svelte' },
+                      { globPattern: '**/{svelte,vite}.config.{js,cjs,mjs,ts,cts,mts}' }
+                  ]
+                : [
+                      {
+                          // Editors have exclude configs, such as VSCode with
+                          // `files.watcherExclude`, which makes recursive watching acceptable.
+                          globPattern: recursiveWatchPattern
+                      }
+                  ]
         });
 
         if (didChangeWatchedFiles.relativePatternSupport) {
@@ -466,14 +695,18 @@ export function startServer(options?: LSOptions) {
         });
     }
 
+    connection.onShutdown(() => pluginHost.dispose());
     connection.onExit(() => {
         watcher?.dispose();
+        pluginHost.dispose();
     });
 
-    connection.onRenameRequest((req) =>
-        pluginHost.rename(req.textDocument, req.position, req.newName)
+    connection.onRenameRequest((req, token) =>
+        pluginHost.rename(req.textDocument, req.position, req.newName, token)
     );
-    connection.onPrepareRename((req) => pluginHost.prepareRename(req.textDocument, req.position));
+    connection.onPrepareRename((req, token) =>
+        pluginHost.prepareRename(req.textDocument, req.position, token)
+    );
 
     connection.onDidChangeConfiguration(({ settings }) => {
         configManager.update(settings.svelte?.plugin);
@@ -489,17 +722,58 @@ export function startServer(options?: LSOptions) {
     });
 
     connection.onDidOpenTextDocument((evt) => {
+        const fileName = urlToPath(evt.textDocument.uri);
+        if (fileName && isTsOrJsLanguageId(evt.textDocument.languageId)) {
+            openTsOrJsFile(
+                evt.textDocument.uri,
+                fileName,
+                evt.textDocument.text,
+                evt.textDocument.languageId,
+                evt.textDocument.version
+            );
+            return;
+        }
+        const externalKey = normalizeUri(evt.textDocument.uri);
+        const external = openTsOrJsDocuments.get(externalKey);
+        if (external?.open) {
+            pluginHost.closeTsOrJsFile(external.fileName);
+        }
+        // A URI can be reopened with a different language id. Do not let the closed TS/JS
+        // tombstone hijack the new Svelte document's subsequent didChange/didClose events.
+        openTsOrJsDocuments.delete(externalKey);
         const document = docManager.openClientDocument(evt.textDocument);
         diagnosticsManager.scheduleUpdate(document);
     });
 
-    connection.onDidCloseTextDocument((evt) => docManager.closeDocument(evt.textDocument.uri));
+    connection.onDidCloseTextDocument((evt) => {
+        const external = openTsOrJsDocuments.get(normalizeUri(evt.textDocument.uri));
+        if (external?.open) {
+            closeTsOrJsFile(evt.textDocument.uri);
+            refreshCrossFilesSemanticFeatures();
+            return;
+        }
+        docManager.closeDocument(evt.textDocument.uri);
+    });
     connection.onDidChangeTextDocument((evt) => {
+        const external = openTsOrJsDocuments.get(normalizeUri(evt.textDocument.uri));
+        if (external?.open) {
+            updateTsOrJsFile(
+                evt.textDocument.uri,
+                external.fileName,
+                evt.contentChanges,
+                undefined,
+                evt.textDocument.version,
+                external.languageId
+            );
+            pluginHost.didUpdateDocument();
+            refreshCrossFilesSemanticFeatures();
+            return;
+        }
         diagnosticsManager.cancelStarted(evt.textDocument.uri);
         docManager.updateDocument(evt.textDocument, evt.contentChanges);
         pluginHost.didUpdateDocument();
     });
-    connection.onHover((evt) => pluginHost.doHover(evt.textDocument, evt.position));
+    connection.onHover((evt, token) => pluginHost.doHover(evt.textDocument, evt.position, token));
     connection.onCompletion((evt, cancellationToken) =>
         pluginHost.getCompletions(evt.textDocument, evt.position, evt.context, cancellationToken)
     );
@@ -523,7 +797,9 @@ export function startServer(options?: LSOptions) {
             return pluginHost.getDocumentSymbols(evt.textDocument, cancellationToken);
         }
     });
-    connection.onDefinition((evt) => pluginHost.getDefinitions(evt.textDocument, evt.position));
+    connection.onDefinition((evt, token) =>
+        pluginHost.getDefinitions(evt.textDocument, evt.position, token)
+    );
     connection.onReferences((evt, cancellationToken) =>
         pluginHost.findReferences(evt.textDocument, evt.position, evt.context, cancellationToken)
     );
@@ -566,21 +842,23 @@ export function startServer(options?: LSOptions) {
         pluginHost.getSignatureHelp(evt.textDocument, evt.position, evt.context, cancellationToken)
     );
 
-    connection.onSelectionRanges((evt) =>
-        pluginHost.getSelectionRanges(evt.textDocument, evt.positions)
+    connection.onSelectionRanges((evt, token) =>
+        pluginHost.getSelectionRanges(evt.textDocument, evt.positions, token)
     );
 
     connection.onImplementation((evt, cancellationToken) =>
         pluginHost.getImplementation(evt.textDocument, evt.position, cancellationToken)
     );
 
-    connection.onTypeDefinition((evt) =>
-        pluginHost.getTypeDefinition(evt.textDocument, evt.position)
+    connection.onTypeDefinition((evt, token) =>
+        pluginHost.getTypeDefinition(evt.textDocument, evt.position, token)
     );
 
-    connection.onFoldingRanges((evt) => pluginHost.getFoldingRanges(evt.textDocument));
+    connection.onFoldingRanges((evt, token) =>
+        pluginHost.getFoldingRanges(evt.textDocument, token)
+    );
 
-    connection.onCodeLens((evt) => pluginHost.getCodeLens(evt.textDocument));
+    connection.onCodeLens((evt, token) => pluginHost.getCodeLens(evt.textDocument, token));
     connection.onCodeLensResolve((codeLens, token) => {
         const data = codeLens.data as TextDocumentIdentifier;
 
@@ -590,8 +868,8 @@ export function startServer(options?: LSOptions) {
 
         return pluginHost.resolveCodeLens(data, codeLens, token);
     });
-    connection.onDocumentHighlight((evt) =>
-        pluginHost.findDocumentHighlight(evt.textDocument, evt.position)
+    connection.onDocumentHighlight((evt, token) =>
+        pluginHost.findDocumentHighlight(evt.textDocument, evt.position, token)
     );
 
     connection.onWorkspaceSymbol((evt, token) => pluginHost.getWorkspaceSymbols(evt.query, token));
@@ -634,12 +912,30 @@ export function startServer(options?: LSOptions) {
         refreshCrossFilesSemanticFeatures();
     }
 
-    connection.onNotification('$/onDidChangeTsOrJsFile', async (e: any) => {
+    connection.onNotification('$/onDidOpenTsOrJsFile', (e: any) => {
+        const path = urlToPath(e.uri);
+        if (path && typeof e.text === 'string') {
+            openTsOrJsFile(e.uri, path, e.text, e.languageId ?? 'typescript', e.version);
+        }
+    });
+
+    connection.onNotification('$/onDidChangeTsOrJsFile', (e: any) => {
         const path = urlToPath(e.uri);
         if (path) {
-            pluginHost.updateTsOrJsFile(path, e.changes);
+            // `text`, version and languageId are supplied by current clients. Keeping them
+            // optional preserves the legacy diff-only notification; plugins can reconstruct
+            // that first diff from the on-disk base when needed.
+            updateTsOrJsFile(e.uri, path, e.changes ?? [], e.text, e.version, e.languageId);
         }
 
+        refreshCrossFilesSemanticFeatures();
+    });
+
+    connection.onNotification('$/onDidCloseTsOrJsFile', (e: any) => {
+        const path = urlToPath(e.uri);
+        if (path) {
+            closeTsOrJsFile(e.uri, path);
+        }
         refreshCrossFilesSemanticFeatures();
     });
 
@@ -650,9 +946,8 @@ export function startServer(options?: LSOptions) {
         pluginHost.getSemanticTokens(evt.textDocument, evt.range, cancellationToken)
     );
 
-    connection.onRequest(
-        LinkedEditingRangeRequest.type,
-        async (evt) => await pluginHost.getLinkedEditingRanges(evt.textDocument, evt.position)
+    connection.onRequest(LinkedEditingRangeRequest.type, async (evt, token) =>
+        pluginHost.getLinkedEditingRanges(evt.textDocument, evt.position, token)
     );
 
     connection.onRequest(InlayHintRequest.type, (evt, cancellationToken) =>
@@ -686,13 +981,18 @@ export function startServer(options?: LSOptions) {
         pluginHost.updateImports(fileRename)
     );
 
-    connection.onRequest('$/getFileReferences', async (uri: string) => {
-        return pluginHost.fileReferences(uri);
+    connection.onRequest('$/getFileReferences', async (uri: string, token) => {
+        return pluginHost.fileReferences(uri, token);
     });
 
-    connection.onRequest('$/getComponentReferences', async (uri: string) => {
-        return pluginHost.findComponentReferences(uri);
+    connection.onRequest('$/getComponentReferences', async (uri: string, token) => {
+        return pluginHost.findComponentReferences(uri, token);
     });
+
+    // Internal, read-only telemetry used by the acceptance harness. Keeping this on an explicit
+    // request means production sessions pay no sampling/logging cost and JSON-RPC serialisation
+    // cannot silently erase the Map-backed counters.
+    connection.onRequest('$/getTsGoStats', () => tsGoPlugin?.getStatsSnapshot() ?? null);
 
     connection.onRequest('$/getCompiledCode', async (uri: DocumentUri) => {
         const doc = docManager.get(uri);

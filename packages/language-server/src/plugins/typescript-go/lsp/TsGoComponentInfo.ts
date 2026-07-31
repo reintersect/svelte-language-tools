@@ -52,6 +52,34 @@ export class TsGoComponentInfo {
         this.definitionCache.clear();
     }
 
+    async dispose() {
+        this.clearCache();
+        await this.session.dispose();
+    }
+
+    /**
+     * Invalidate answers affected by one changed overlay.
+     *
+     * The usage-side definition cache is especially important here: an unsaved import edit can
+     * make the same `<Button>` tag resolve to a different declaration without producing a watched
+     * file event. Declaration-side entries are removed as well so open TS/Svelte edits cannot
+     * leave stale prop types behind.
+     */
+    invalidateFile(filePath: string) {
+        const usagePrefix = `${filePath}::`;
+        for (const [key, definition] of this.definitionCache) {
+            if (key.startsWith(usagePrefix) || definition?.filePath === filePath) {
+                this.definitionCache.delete(key);
+            }
+        }
+        const declarationPrefix = `${filePath}:`;
+        for (const key of this.cache.keys()) {
+            if (key.startsWith(declarationPrefix)) {
+                this.cache.delete(key);
+            }
+        }
+    }
+
     async getProps(
         shadowPath: string,
         generatedOffset: number,
@@ -87,7 +115,14 @@ export class TsGoComponentInfo {
             // Resolve the declaration first: it is both the anchor for the type walk and the
             // cache key. Memoised per (usage file, tag name) so a keystroke inside the tag
             // costs no LSP round trip at all once the component is known.
-            const definitionKey = tagName ? `${shadowPath}::${tagName}` : undefined;
+            // A component-valued identifier can be shadowed in separate template scopes. The
+            // visible tag name is therefore not enough to identify its declaration: two
+            // `<Button>` occurrences in one file may legitimately resolve to different symbols.
+            // Include the generated usage position so each lexical occurrence retains its own
+            // definition while repeated requests at that occurrence still share the lookup.
+            const definitionKey = tagName
+                ? `${shadowPath}::${tagName}::${generatedOffset}`
+                : undefined;
             let definition = definitionKey ? this.definitionCache.get(definitionKey) : undefined;
             if (
                 definition === undefined &&
@@ -95,6 +130,9 @@ export class TsGoComponentInfo {
             ) {
                 definition = await this.definitionAt(shadowPath, generatedOffset);
                 if (definitionKey) {
+                    if (this.definitionCache.size >= 200) {
+                        this.definitionCache.delete(this.definitionCache.keys().next().value!);
+                    }
                     this.definitionCache.set(definitionKey, definition);
                 }
             }

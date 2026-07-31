@@ -1,4 +1,4 @@
-import { dirname, basename } from 'path';
+import { dirname, basename, join } from 'path';
 import ts from 'typescript';
 import {
     DiagnosticSeverity,
@@ -371,6 +371,34 @@ async function createLanguageService(
         svelteTsPath = __dirname;
     }
     const sveltePackageInfo = getPackageInfo('svelte', tsconfigPath || workspacePath);
+    const projectOwnsSveltePackage = (() => {
+        let current = normalizePath(tsconfigPath ? dirname(tsconfigPath) : workspacePath);
+        let resolvedPackagePath: string;
+        try {
+            resolvedPackagePath = normalizePath(
+                tsSystem.realpath?.(sveltePackageInfo.path) ?? sveltePackageInfo.path
+            );
+        } catch {
+            return false;
+        }
+        for (;;) {
+            const candidate = join(current, 'node_modules', 'svelte');
+            try {
+                if (
+                    tsSystem.directoryExists(candidate) &&
+                    normalizePath(tsSystem.realpath?.(candidate) ?? candidate) ===
+                        resolvedPackagePath
+                ) {
+                    return true;
+                }
+            } catch {
+                // Keep walking through the normal node_modules ancestry.
+            }
+            const parent = dirname(current);
+            if (parent === current) return false;
+            current = parent;
+        }
+    })();
     // Svelte 4 has some fixes with regards to parsing the generics attribute.
     // Svelte 5 has new features, but we don't want to add the new compiler into language-tools. In the future it's probably
     // best to shift more and more of this into user's node_modules for better handling of multiple Svelte versions.
@@ -1253,7 +1281,13 @@ async function createLanguageService(
             sveltePackageInfo.version.major === 3,
             sveltePackageInfo.path,
             svelteTsPath,
-            docContext.isSvelteCheck ? undefined : tsconfigPath || workspacePath
+            // The shims import `svelte`, so a checker project which owns that package needs the
+            // same relocation as the editor. A project using the language server's fallback
+            // compiler has no local `svelte` for a relocated shim to resolve, so retain the
+            // fallback location in that case.
+            !docContext.isSvelteCheck || projectOwnsSveltePackage
+                ? tsconfigPath || workspacePath
+                : undefined
         );
         const pathToOriginalCasing = new Map<string, string>();
         for (const file of svelteTsxFiles) {

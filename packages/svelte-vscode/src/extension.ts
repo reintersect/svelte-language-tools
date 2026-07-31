@@ -9,6 +9,7 @@ import {
     ProgressLocation,
     Range,
     TextDocument,
+    TextDocumentContentChangeEvent,
     Uri,
     ViewColumn,
     window,
@@ -216,7 +217,14 @@ export function activateSvelteLanguageServer(context: ExtensionContext) {
     };
 
     const ls = createLanguageServer(serverOptions, clientOptions);
+    let syncOpenTsOrJsDocuments = () => {};
     ls.start().then(() => {
+        // Current servers dynamically register standard LSP synchronization for these language
+        // ids. The custom path remains only for older/custom language-server builds.
+        if (!(ls.initializeResult?.capabilities.experimental as any)?.tsOrJsTextSync) {
+            syncOpenTsOrJsDocuments = addLegacyTsOrJsTextDocumentListeners(getLS, context);
+            syncOpenTsOrJsDocuments();
+        }
         const tagRequestor = (document: TextDocument, position: Position) => {
             const param = ls.code2ProtocolConverter.asTextDocumentPositionParams(
                 document,
@@ -261,6 +269,7 @@ export function activateSvelteLanguageServer(context: ExtensionContext) {
         restartingLs = true;
         outputChannel.clear();
         await ls.restart();
+        syncOpenTsOrJsDocuments();
         if (showNotification) {
             window.showInformationMessage('Svelte language server restarted.');
         }
@@ -270,8 +279,6 @@ export function activateSvelteLanguageServer(context: ExtensionContext) {
     function getLS() {
         return ls;
     }
-
-    addDidChangeTextDocumentListener(getLS);
 
     addFindFileReferencesListener(getLS, context);
     addFindComponentReferencesListener(getLS, context);
@@ -353,24 +360,71 @@ export function activateSvelteLanguageServer(context: ExtensionContext) {
     };
 }
 
-function addDidChangeTextDocumentListener(getLS: () => LanguageClient) {
-    // Only Svelte file changes are automatically notified through the inbuilt LSP
-    // because the extension says it's only responsible for Svelte files.
-    // Therefore we need to set this up for TS/JS files manually.
-    workspace.onDidChangeTextDocument((evt) => {
-        if (evt.document.languageId === 'typescript' || evt.document.languageId === 'javascript') {
-            getLS().sendNotification('$/onDidChangeTsOrJsFile', {
-                uri: evt.document.uri.toString(true),
-                changes: evt.contentChanges.map((c) => ({
-                    range: {
-                        start: { line: c.range.start.line, character: c.range.start.character },
-                        end: { line: c.range.end.line, character: c.range.end.character }
-                    },
-                    text: c.text
-                }))
-            });
+function addLegacyTsOrJsTextDocumentListeners(
+    getLS: () => LanguageClient,
+    context: ExtensionContext
+): () => void {
+    const languageIds = new Set(['typescript', 'typescriptreact', 'javascript', 'javascriptreact']);
+    const isTsOrJsDocument = (document: TextDocument) =>
+        document.uri.scheme === 'file' && languageIds.has(document.languageId);
+    const sendOpen = (document: TextDocument) => {
+        if (!isTsOrJsDocument(document)) {
+            return;
         }
-    });
+        const textDocument = {
+            uri: document.uri.toString(true),
+            languageId: document.languageId,
+            version: document.version,
+            text: document.getText()
+        };
+        void getLS().sendNotification('$/onDidOpenTsOrJsFile', textDocument);
+    };
+
+    const sendChange = (
+        document: TextDocument,
+        contentChanges: readonly TextDocumentContentChangeEvent[]
+    ) => {
+        if (!isTsOrJsDocument(document)) {
+            return;
+        }
+        const uri = document.uri.toString(true);
+        const changes = contentChanges.map((change) => ({
+            range: {
+                start: {
+                    line: change.range.start.line,
+                    character: change.range.start.character
+                },
+                end: { line: change.range.end.line, character: change.range.end.character }
+            },
+            rangeLength: change.rangeLength,
+            text: change.text
+        }));
+        void getLS().sendNotification('$/onDidChangeTsOrJsFile', {
+            uri,
+            languageId: document.languageId,
+            version: document.version,
+            text: document.getText(),
+            changes
+        });
+    };
+
+    const sendClose = (document: TextDocument) => {
+        if (!isTsOrJsDocument(document)) {
+            return;
+        }
+        const uri = document.uri.toString(true);
+        void getLS().sendNotification('$/onDidCloseTsOrJsFile', { uri });
+    };
+
+    context.subscriptions.push(
+        workspace.onDidOpenTextDocument(sendOpen),
+        workspace.onDidChangeTextDocument((event) =>
+            sendChange(event.document, event.contentChanges)
+        ),
+        workspace.onDidCloseTextDocument(sendClose)
+    );
+
+    return () => workspace.textDocuments.forEach(sendOpen);
 }
 
 function addRenameFileListener(getLS: () => LanguageClient) {

@@ -161,8 +161,15 @@ export class MachineFriendlyWriter implements Writer {
     }
 
     file(diagnostics: Diagnostic[], workspaceDir: string, filename: string, _text: string) {
+        // A verbose machine consumer needs to know which source files participated in the
+        // program, including clean files. Diagnostics alone cannot distinguish an empty program
+        // from a successful check with no errors.
+        if (this.isVerbose) {
+            this.log(JSON.stringify({ type: 'FILE', filename }));
+        }
         diagnostics.filter(this.diagnosticFilter).forEach((d) => {
-            const { message, severity, range, code, codeDescription, source } = d;
+            const { message, severity, range, code, codeDescription, source, relatedInformation } =
+                d;
             const type =
                 severity === DiagnosticSeverity.Error
                     ? 'ERROR'
@@ -180,9 +187,11 @@ export class MachineFriendlyWriter implements Writer {
                             start,
                             end,
                             message,
+                            severity,
                             code,
                             codeDescription,
-                            source
+                            source,
+                            relatedInformation
                         })
                     );
                 } else {

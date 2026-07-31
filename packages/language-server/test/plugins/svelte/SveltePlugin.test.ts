@@ -5,7 +5,9 @@ import {
     Diagnostic,
     Range,
     DiagnosticSeverity,
-    CancellationTokenSource
+    CancellationTokenSource,
+    LSPErrorCodes,
+    ResponseError
 } from 'vscode-languageserver';
 import { LSConfigManager } from '../../../src/ls-config';
 import * as importPackage from '../../../src/importPackage';
@@ -82,6 +84,24 @@ describe('Svelte Plugin', () => {
         const diagnostics = await plugin.getDiagnostics(document);
 
         assert.deepStrictEqual(diagnostics, []);
+    });
+
+    it('recomputes a same-version pull after the first request is cancelled', async () => {
+        const { plugin, document } = setup('<div bind:whatever></div>');
+        const cancellationTokenSource = new CancellationTokenSource();
+        cancellationTokenSource.cancel();
+
+        await assert.rejects(
+            plugin.getDiagnosticsForPullMode(document, undefined, cancellationTokenSource.token),
+            (error: unknown) =>
+                error instanceof ResponseError && error.code === LSPErrorCodes.RequestCancelled
+        );
+
+        const retry = await plugin.getDiagnosticsForPullMode(document, undefined);
+
+        assert.strictEqual(retry.kind, 'full');
+        assert.strictEqual(retry.resultId, document.version.toString());
+        assert.strictEqual(retry.kind === 'full' && retry.items.length, 1);
     });
 
     describe('#formatDocument', () => {

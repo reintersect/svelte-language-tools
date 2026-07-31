@@ -1,0 +1,465 @@
+{
+    "schemaVersion": 1,
+    "svelteVersion": "5.55.5",
+    "diagnosticSources": "js",
+    "cases": [
+        {
+            "file": "src/00-undeclared-component.svelte",
+            "diagnostics": [
+                {
+                    "code": 2304,
+                    "range": [5, 1, 5, 7],
+                    "message": "Cannot find name 'Button'."
+                },
+                {
+                    "code": 2304,
+                    "range": [5, 10, 5, 16],
+                    "message": "Cannot find name 'Button'."
+                }
+            ]
+        },
+        {
+            "file": "src/01-unknown-expression.svelte",
+            "diagnostics": [
+                {
+                    "code": 2304,
+                    "range": [4, 22, 4, 34],
+                    "message": "Cannot find name 'missingValue'."
+                }
+            ]
+        },
+        {
+            "file": "src/02-bad-member-call.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [4, 28, 4, 39],
+                    "message": "Property 'toUpperCase' does not exist on type '1'."
+                }
+            ]
+        },
+        {
+            "file": "src/03-component-wrong-prop.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [5, 8, 5, 13],
+                    "message": "Type 'number' is not assignable to type 'string'."
+                }
+            ]
+        },
+        {
+            "file": "src/04-component-missing-prop.svelte",
+            "diagnostics": [
+                {
+                    "code": 2741,
+                    "range": [5, 1, 5, 7],
+                    "message": "Property 'label' is missing in type '{ count: number; }' but required in type '$$ComponentProps'.",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "workspace:src/_Button.svelte",
+                                "range": [1, 32, 1, 37],
+                                "message": "'label' is declared here."
+                            },
+                            {
+                                "uri": "dependency:svelte/types/index.d.ts",
+                                "range": [14, 2, 14, 7],
+                                "message": "The expected type comes from property 'props' which is declared here on type 'ComponentConstructorOptions<$$ComponentProps>'"
+                            }
+                        ]
+                    },
+                    "nativeLsp": {
+                        "relatedInformation": []
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/05-each-object-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [4, 40, 4, 47],
+                    "message": "Property 'missing' does not exist on type '{ id: number; profile: { name: string; }; }'."
+                }
+            ]
+        },
+        {
+            "file": "src/06-each-tuple-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2493,
+                    "range": [4, 38, 4, 43],
+                    "message": "Tuple type '[number, string]' of length '2' has no element at index '2'."
+                }
+            ]
+        },
+        {
+            "file": "src/07-each-nested-default-rest.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [8, 61, 8, 72],
+                    "message": "Property 'toUpperCase' does not exist on type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/08-keyed-each.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [4, 32, 4, 39],
+                    "message": "Property 'missing' does not exist on type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/09-await-object-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [4, 44, 4, 51],
+                    "message": "Property 'missing' does not exist on type '{ payload: { title: string; }; }'."
+                }
+            ]
+        },
+        {
+            "file": "src/10-await-tuple-rest.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [5, 35, 5, 46],
+                    "message": "Property 'toUpperCase' does not exist on type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/11-const-nested-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [5, 37, 5, 44],
+                    "message": "Property 'missing' does not exist on type '{ user: { name: string; }; score: number; }'."
+                }
+            ]
+        },
+        {
+            "file": "src/12-snippet-argument.svelte",
+            "diagnostics": [
+                {
+                    "code": 2345,
+                    "range": [7, 13, 7, 20],
+                    "message": "Argument of type 'string' is not assignable to parameter of type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/13-snippet-default-argument.svelte",
+            "diagnostics": [
+                {
+                    "code": 2345,
+                    "range": [7, 26, 7, 33],
+                    "message": "Argument of type 'string' is not assignable to parameter of type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/14-snippet-body.svelte",
+            "diagnostics": [
+                {
+                    "code": 2551,
+                    "range": [3, 36, 3, 43],
+                    "message": "Property 'toFixed' does not exist on type 'string'. Did you mean 'fixed'?",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "typescript-lib:lib.es2015.core.d.ts",
+                                "range": [484, 4, 484, 20],
+                                "message": "'fixed' is declared here."
+                            }
+                        ]
+                    },
+                    "nativeLsp": {
+                        "relatedInformation": []
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/15-snippet-scope.svelte",
+            "diagnostics": [
+                {
+                    "code": 2304,
+                    "range": [7, 9, 7, 15],
+                    "message": "Cannot find name 'nested'."
+                }
+            ]
+        },
+        {
+            "file": "src/16-native-bind.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [6, 21, 6, 35],
+                    "message": "Type 'string' is not assignable to type 'boolean | null | undefined'.",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "dependency:svelte/elements.d.ts",
+                                "range": [1127, 1, 1127, 15],
+                                "message": "The expected type comes from property 'bind:checked' which is declared here on type 'HTMLProps<\"input\", HTMLAttributes<any>>'"
+                            }
+                        ]
+                    },
+                    "nativeLsp": {
+                        "relatedInformation": []
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/17-component-bind.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [8, 10, 8, 23],
+                    "message": "Cannot use 'bind:' with this property. It is declared as non-bindable inside the component.\nTo mark a property as bindable: 'let { readonly = $bindable() } = $props()'"
+                }
+            ]
+        },
+        {
+            "file": "src/18-action-node.svelte",
+            "diagnostics": [
+                {
+                    "code": 2345,
+                    "range": [7, 20, 7, 20],
+                    "message": "Argument of type 'HTMLButtonElement' is not assignable to parameter of type 'HTMLInputElement'.\n  Type 'HTMLButtonElement' is missing the following properties from type 'HTMLInputElement': accept, align, alt, autocomplete, and 36 more.",
+                    "native": {
+                        "code": 2740,
+                        "message": "Type 'HTMLButtonElement' is missing the following properties from type 'HTMLInputElement': accept, align, alt, autocomplete, and 36 more."
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/19-action-parameter.svelte",
+            "diagnostics": [
+                {
+                    "code": 2345,
+                    "range": [7, 23, 7, 30],
+                    "message": "Argument of type 'string' is not assignable to parameter of type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/20-transition-parameter.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [5, 24, 5, 32],
+                    "message": "Type 'string' is not assignable to type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/21-dynamic-component.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [7, 25, 7, 30],
+                    "message": "Type 'string' is not assignable to type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/22-dotted-component.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [7, 17, 7, 22],
+                    "message": "Type 'number' is not assignable to type 'string'."
+                }
+            ]
+        },
+        {
+            "file": "src/23-invalid-dynamic-component.svelte",
+            "diagnostics": [
+                {
+                    "code": 2345,
+                    "range": [7, 1, 7, 14],
+                    "message": "Argument of type '42' is not assignable to parameter of type 'ConstructorOfATypedSvelteComponent | Component<any, any, any> | null | undefined'.\n\nPossible causes:\n- You use the instance type of a component where you should use the constructor type\n- Type definitions are missing for this Svelte Component. ",
+                    "native": {
+                        "message": "Argument of type '42' is not assignable to parameter of type 'Component<any, any, any> | ConstructorOfATypedSvelteComponent | null | undefined'.\n\nPossible causes:\n- You use the instance type of a component where you should use the constructor type\n- Type definitions are missing for this Svelte Component. "
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/24-event-handler.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [6, 8, 6, 15],
+                    "message": "Type '(event: KeyboardEvent) => string' is not assignable to type 'MouseEventHandler<HTMLButtonElement>'.\n  Types of parameters 'event' and 'event' are incompatible.\n    Type 'MouseEvent & { currentTarget: EventTarget & HTMLButtonElement; }' is missing the following properties from type 'KeyboardEvent': charCode, code, isComposing, key, and 8 more.",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "dependency:svelte/elements.d.ts",
+                                "range": [266, 1, 266, 8],
+                                "message": "The expected type comes from property 'onclick' which is declared here on type 'HTMLProps<\"button\", HTMLAttributes<any>>'"
+                            }
+                        ]
+                    },
+                    "nativeLsp": {
+                        "relatedInformation": []
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/25-snippet-component-prop.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [8, 18, 8, 21],
+                    "message": "Type '(item: string) => ReturnType<import(\"svelte\").Snippet>' is not assignable to type 'Snippet<[number]>'.\n  Types of parameters 'item' and 'args_0' are incompatible.\n    Type 'number' is not assignable to type 'string'.",
+                    "native": {
+                        "message": "Type '(item: string) => ReturnType<import('svelte').Snippet>' is not assignable to type 'Snippet<[number]>'.\n  Types of parameters 'item' and 'args_0' are incompatible.\n    Type 'number' is not assignable to type 'string'."
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/26-unicode-mapping.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [4, 44, 4, 51],
+                    "message": "Property 'missing' does not exist on type '{ ok: number; }'."
+                }
+            ]
+        },
+        {
+            "file": "src/27-snippet-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [7, 15, 7, 17],
+                    "message": "Type 'string' is not assignable to type 'number'.",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "workspace:src/27-snippet-destructure.svelte",
+                                "range": [2, 31, 2, 33],
+                                "message": "The expected type comes from property 'id' which is declared here on type '{ id: number; label: string; }'"
+                            }
+                        ]
+                    },
+                    "nativeLsp": {
+                        "relatedInformation": []
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/28-snippet-generic.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [7, 20, 7, 22],
+                    "message": "Type 'number' is not assignable to type 'string'.",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "workspace:src/28-snippet-generic.svelte",
+                                "range": [2, 18, 2, 18],
+                                "message": "The expected type comes from property 'id' which is declared here on type '{ id: string; }'"
+                            }
+                        ]
+                    },
+                    "nativeLsp": {
+                        "relatedInformation": []
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/29-if-narrowing-else.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [10, 14, 10, 19],
+                    "message": "Property 'count' does not exist on type '{ kind: \"text\"; text: string; }'."
+                },
+                {
+                    "code": 2339,
+                    "range": [12, 14, 12, 18],
+                    "message": "Property 'text' does not exist on type '{ kind: \"count\"; count: number; }'."
+                }
+            ]
+        },
+        {
+            "file": "src/30-await-catch-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2304,
+                    "range": [9, 23, 9, 40],
+                    "message": "Cannot find name 'missingCatchValue'."
+                }
+            ]
+        },
+        {
+            "file": "src/31-generic-component-inference.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [10, 24, 10, 36],
+                    "message": "Type 'number' is not assignable to type 'string'."
+                }
+            ]
+        },
+        {
+            "file": "src/32-typed-attachment.svelte",
+            "diagnostics": [
+                {
+                    "code": 2345,
+                    "range": [9, 3, 9, 23],
+                    "message": "Argument of type '{ [x: symbol]: Attachment<HTMLInputElement>; }' is not assignable to parameter of type 'HTMLProps<\"div\", HTMLAttributes<any>>'.\n  Type '{ [x: symbol]: Attachment<HTMLInputElement>; }' is not assignable to type 'Omit<HTMLAttributes<HTMLDivElement>, never>'.\n    'symbol' index signatures are incompatible.\n      Type 'Attachment<HTMLInputElement>' is not assignable to type 'false | Attachment<HTMLDivElement> | null | undefined'.\n        Type 'Attachment<HTMLInputElement>' is not assignable to type 'Attachment<HTMLDivElement>'.\n          Type 'HTMLDivElement' is missing the following properties from type 'HTMLInputElement': accept, alt, autocomplete, capture, and 54 more."
+                }
+            ]
+        },
+        {
+            "file": "src/33-if-nullability.svelte",
+            "diagnostics": [
+                {
+                    "code": 2551,
+                    "range": [6, 19, 6, 26],
+                    "message": "Property 'toFixed' does not exist on type 'string'. Did you mean 'fixed'?",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "typescript-lib:lib.es2015.core.d.ts",
+                                "range": [484, 4, 484, 20],
+                                "message": "'fixed' is declared here."
+                            }
+                        ]
+                    },
+                    "nativeLsp": {
+                        "relatedInformation": []
+                    }
+                },
+                {
+                    "code": 18047,
+                    "range": [8, 8, 8, 13],
+                    "message": "'maybe' is possibly 'null'."
+                }
+            ]
+        },
+        { "file": "src/_Bindable.svelte", "diagnostics": [] },
+        { "file": "src/_Button.svelte", "diagnostics": [] },
+        { "file": "src/_List.svelte", "diagnostics": [] },
+        { "file": "src/_ValueComponent.svelte", "diagnostics": [] }
+    ]
+}

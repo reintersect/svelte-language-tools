@@ -70,6 +70,10 @@ export class ConfigLoader {
     private configFiles = new FileMap<SvelteConfig>();
     private configFilesAsync = new FileMap<Promise<SvelteConfig>>();
     private filePathToConfigPath = new FileMap<string>();
+    /** Also clear @sveltejs/load-config's process-wide cache on the next real load. */
+    private clearUpstreamCache = false;
+    /** Prevent a config load started before invalidation from repopulating the cleared maps. */
+    private configRevision = 0;
     private disabled = false;
     private loadSvelteConfigTs: boolean;
     private explicitConfigScope?: ExplicitConfigScope;
@@ -100,6 +104,21 @@ export class ConfigLoader {
      */
     setExplicitConfigScope(scope: ExplicitConfigScope | undefined): void {
         this.explicitConfigScope = scope;
+    }
+
+    /**
+     * Forget every resolved config association after a config file is created, removed or
+     * changed. Config lookup is hierarchical, so a nearer config can change the answer for an
+     * arbitrary subtree; a targeted cache deletion cannot safely prove which fallback entries
+     * are still valid. Structural config edits are rare, making a complete invalidation both
+     * simpler and cheaper than serving a stale preprocessor/compiler configuration.
+     */
+    invalidateConfigs(): void {
+        this.configRevision++;
+        this.configFiles.clear();
+        this.configFilesAsync.clear();
+        this.filePathToConfigPath.clear();
+        this.clearUpstreamCache = true;
     }
 
     private isInExplicitConfigScope(fileOrDirPath: string): boolean {
@@ -141,7 +160,24 @@ export class ConfigLoader {
                 })
                 .withRelativePaths()
                 .crawl(directory)
-                .sync();
+                .sync()
+                .filter((pathResult) => {
+                    const configPath = this.path.join(directory, pathResult);
+                    if (!isViteConfigPath(configPath)) {
+                        return true;
+                    }
+
+                    // Loading both entries would resolve one package twice and mutate the same
+                    // vitePreprocess callbacks twice. Keep the authored Svelte entry; loadConfig
+                    // resolves it once through this package's directory when Vite is colocated,
+                    // while Vite remains the entry for projects configured only through Vite.
+                    return !findSvelteConfigInDirectory(
+                        this.fs,
+                        this.path,
+                        this.path.dirname(configPath),
+                        this.loadSvelteConfigTs
+                    );
+                });
 
             const someConfigIsImmediateFileInDirectory =
                 pathResults.length > 0 &&
@@ -167,7 +203,9 @@ export class ConfigLoader {
                     return !config || config.loadConfigError;
                 })
                 .map(async (pathResult) => {
-                    await this.loadAndCacheConfig(pathResult, directory);
+                    await this.loadAndCacheConfig(pathResult, directory, {
+                        broadDiscovery: true
+                    });
                 });
             await Promise.all(promises);
         } catch (e) {
@@ -176,9 +214,13 @@ export class ConfigLoader {
     }
 
     private async addFallbackConfig(directory: string) {
+        const revision = this.configRevision;
         const configPath = this.searchConfigPathUpwards(directory);
         if (configPath) {
             const loadedConfigPath = await this.loadAndCacheConfig(configPath, directory);
+            if (revision !== this.configRevision) {
+                return;
+            }
             const config = loadedConfigPath && this.configFiles.get(loadedConfigPath);
             if (config && !config.loadConfigError && !config.isFallbackConfig) {
                 return;
@@ -190,6 +232,9 @@ export class ConfigLoader {
             false,
             configPath && isViteConfigPath(configPath) ? 'vite-error' : 'none'
         );
+        if (revision !== this.configRevision) {
+            return;
+        }
         const path = this.path.join(directory, 'svelte.config.js');
         this.configFilesAsync.set(path, Promise.resolve(fallback));
         this.configFiles.set(path, fallback);
@@ -204,13 +249,12 @@ export class ConfigLoader {
         let nextDir = this.path.dirname(path);
         while (currentDir !== nextDir) {
             const configPath =
-                findViteConfigInDirectory(this.fs, this.path, currentDir) ??
                 findSvelteConfigInDirectory(
                     this.fs,
                     this.path,
                     currentDir,
                     this.loadSvelteConfigTs
-                );
+                ) ?? findViteConfigInDirectory(this.fs, this.path, currentDir);
             if (configPath) {
                 return configPath;
             }
@@ -220,18 +264,26 @@ export class ConfigLoader {
         }
     }
 
-    private async loadAndCacheConfig(configPath: string, directory: string) {
+    private async loadAndCacheConfig(
+        configPath: string,
+        directory: string,
+        options: { broadDiscovery?: boolean } = {}
+    ) {
+        const revision = this.configRevision;
         const loadingConfig = this.configFilesAsync.get(configPath);
         if (loadingConfig) {
             await loadingConfig;
             return configPath;
         } else {
-            const newConfig = this.loadConfig(configPath, directory);
+            const newConfig = this.loadConfig(configPath, directory, options);
             this.configFilesAsync.set(
                 configPath,
                 newConfig.then(({ config }) => config)
             );
             const { config, configFilePath } = await newConfig;
+            if (revision !== this.configRevision) {
+                return configFilePath;
+            }
             this.configFiles.set(configFilePath, config);
             if (configFilePath !== configPath) {
                 this.configFiles.set(configPath, config);
@@ -240,7 +292,11 @@ export class ConfigLoader {
         }
     }
 
-    private async loadConfig(configPath: string, directory: string) {
+    private async loadConfig(
+        configPath: string,
+        directory: string,
+        options: { broadDiscovery?: boolean }
+    ) {
         const configDirectory = this.path.dirname(configPath);
 
         if (this.disabled) {
@@ -258,23 +314,33 @@ export class ConfigLoader {
             };
         }
 
-        const result = await this.loadFromDirectory(
+        const clearCache = this.clearUpstreamCache;
+        this.clearUpstreamCache = false;
+        // A colocated Vite config is what binds vitePreprocess to this package's resolved root.
+        // The workspace scan has already discarded the duplicate Vite entry, so resolving the
+        // surviving Svelte entry through its directory performs that binding exactly once.
+        const hasColocatedViteConfig =
+            isSvelteConfigPath(configPath) &&
+            !!findViteConfigInDirectory(this.fs, this.path, configDirectory);
+        const loadTarget =
             this.explicitConfigScope &&
-                configPath === this.explicitConfigScope.configPath &&
-                this.isInExplicitConfigScope(directory)
+            configPath === this.explicitConfigScope.configPath &&
+            this.isInExplicitConfigScope(directory)
                 ? configPath
-                : configDirectory,
-            { traverse: false }
-        );
+                : isSvelteConfigPath(configPath) && !hasColocatedViteConfig
+                  ? configPath
+                  : configDirectory;
+        const result = await this.loadFromDirectory(loadTarget, { traverse: false, clearCache });
 
         if (result && 'config' in result) {
             const configSource = result.configSource;
+            const loadedConfig = result.config as SvelteConfig;
             const config: SvelteConfig = {
-                ...(result.config as SvelteConfig),
+                ...loadedConfig,
                 configSource,
                 compilerOptions: {
                     ...DEFAULT_OPTIONS,
-                    ...(result.config.compilerOptions as CompileOptions | undefined),
+                    ...(loadedConfig.compilerOptions as CompileOptions | undefined),
                     ...NO_GENERATE
                 }
             };
@@ -294,8 +360,16 @@ export class ConfigLoader {
                     : 'No Svelte configuration found'
             );
         const errorConfigPath = result?.configFilePath ?? configPath;
-        Logger.error('Error while loading config at ', errorConfigPath);
-        Logger.error(error);
+        // A workspace-wide scan also encounters ordinary Vite packages which do not own any
+        // Svelte files. Keep the fallback (and its loadConfigError) cached so an actual Svelte
+        // document still receives a config diagnostic, but do not make successful workspace
+        // checks look broken merely because such a candidate does not configure the Svelte
+        // plugin. Real loader/config errors and document-driven loads remain visible.
+        const isSynthesizedMissingVitePlugin = configSource === 'vite' && !result?.error;
+        if (!options.broadDiscovery || !isSynthesizedMissingVitePlugin) {
+            Logger.error('Error while loading config at ', errorConfigPath);
+            Logger.error(error);
+        }
 
         return {
             config: {
@@ -366,16 +440,16 @@ export class ConfigLoader {
             }
         }
 
-        for (const ending of VITE_CONFIG_EXTENSIONS) {
-            const configPath = this.path.join(fromDirectory, `vite.config.${ending}`);
+        for (const ending of getSvelteConfigExtensions(this.loadSvelteConfigTs)) {
+            const configPath = this.path.join(fromDirectory, `svelte.config.${ending}`);
             const config = this.configFiles.get(configPath);
             if (config) {
                 this.filePathToConfigPath.set(file, configPath);
                 return config;
             }
         }
-        for (const ending of getSvelteConfigExtensions(this.loadSvelteConfigTs)) {
-            const configPath = this.path.join(fromDirectory, `svelte.config.${ending}`);
+        for (const ending of VITE_CONFIG_EXTENSIONS) {
+            const configPath = this.path.join(fromDirectory, `vite.config.${ending}`);
             const config = this.configFiles.get(configPath);
             if (config) {
                 this.filePathToConfigPath.set(file, configPath);
@@ -468,6 +542,10 @@ function findViteConfigInDirectory(
 
 function isViteConfigPath(configPath: string): boolean {
     return /[/\\]vite\.config\.(js|mjs|ts|cjs|mts|cts)$/.test(configPath);
+}
+
+function isSvelteConfigPath(configPath: string): boolean {
+    return /[/\\]svelte\.config\.(js|mjs|ts|cjs|mts)$/.test(configPath);
 }
 
 function getConfigSource(configPath: string): 'svelte' | 'vite' {

@@ -13,7 +13,7 @@ import {
     isRangeInTag,
     mapRangeToOriginal
 } from '../../../lib/documents';
-import { DiagnosticsProvider } from '../../interfaces';
+import { DiagnosticsProvider, markSvelteParserError, SVELTE_PARSER_ERROR } from '../../interfaces';
 import { LSAndTSDocResolver } from '../LSAndTSDocResolver';
 import { convertRange, getDiagnosticTag, hasNonZeroRange, mapSeverity } from '../utils';
 import { SvelteDocumentSnapshot } from '../DocumentSnapshot';
@@ -79,7 +79,7 @@ export class DiagnosticsProviderImpl implements DiagnosticsProvider {
         // Document preprocessing failed, show parser error instead
         if (tsDoc.parserError) {
             return [
-                {
+                markSvelteParserError({
                     range: tsDoc.parserError.range,
                     severity: DiagnosticSeverity.Error,
                     source:
@@ -89,11 +89,16 @@ export class DiagnosticsProviderImpl implements DiagnosticsProvider {
                             : 'js',
                     message: tsDoc.parserError.message,
                     code: tsDoc.parserError.code
-                }
+                })
             ];
         }
 
-        let diagnostics: ts.Diagnostic[] = lang.getSyntacticDiagnostics(tsDoc.filePath);
+        // Keep syntactic provenance through source mapping. If the Svelte compiler also reports
+        // a parser failure in the same region, PluginHost can discard only these generated
+        // fallbacks without hiding unrelated semantic template diagnostics.
+        let diagnostics: ts.Diagnostic[] = lang
+            .getSyntacticDiagnostics(tsDoc.filePath)
+            .map((diagnostic) => markSvelteParserError({ ...diagnostic }));
         const checkers = [lang.getSuggestionDiagnostics, lang.getSemanticDiagnostics];
 
         for (const checker of checkers) {
@@ -222,6 +227,9 @@ export function mapAndFilterDiagnostics(
 
         diagnostic = adjustIfNecessary(diagnostic, tsDoc.isSvelte5Plus);
         diagnostic = swapDiagRangeStartEndIfNecessary(diagnostic);
+        if ((tsDiag as ts.Diagnostic & { [SVELTE_PARSER_ERROR]?: boolean })[SVELTE_PARSER_ERROR]) {
+            diagnostic = markSvelteParserError(diagnostic);
+        }
         converted.push(diagnostic);
     }
 

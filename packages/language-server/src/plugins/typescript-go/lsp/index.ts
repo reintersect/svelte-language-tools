@@ -2,13 +2,19 @@ import { dirname } from 'path';
 import ts from 'typescript';
 import { internalHelpers } from 'svelte2tsx';
 import { DocumentManager } from '../../../lib/documents';
-import { getPackageInfo, importSvelte } from '../../../importPackage';
+import {
+    getPackageInfo,
+    importSvelte,
+    invalidateImportedSveltePackages
+} from '../../../importPackage';
 import { Logger } from '../../../logger';
+import { LSConfigManager } from '../../../ls-config';
 import { pathToUrl, urlToPath } from '../../../utils';
 import { Plugin } from '../../interfaces';
 import { SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
 import { getRsvelte } from '../rsvelte';
-import { findWorkspaceRoot, resolveTsGoPath, ShadowManager } from './ShadowManager';
+import { findWorkspaceRoot, ShadowManager } from './ShadowManager';
+import { resolveTsGoEngine } from './TsGoEngine';
 
 export { isRsvelteEnabled, preloadRsvelte } from '../rsvelte';
 import { ProjectRegistry } from './ProjectRegistry';
@@ -16,15 +22,17 @@ import { TsGoPlugin } from './TsGoPlugin';
 import { TsGoApiSession } from './TsGoApiSession';
 import { TsGoComponentInfo } from './TsGoComponentInfo';
 import { TsGoServer } from './TsGoServer';
+import { FileSystemWatcher } from 'vscode-languageserver-protocol';
 
 export { TsGoPlugin } from './TsGoPlugin';
 export { TsGoServer } from './TsGoServer';
 export {
-    ShadowManager,
-    resolveTsGoPath,
-    findProjectTsconfig,
-    findWorkspaceRoot
-} from './ShadowManager';
+    ResolvedTsGoEngine,
+    ResolveTsGoEngineOptions,
+    resolveTsGoEngine,
+    resolveTsGoPath
+} from './TsGoEngine';
+export { ShadowManager, findProjectTsconfig, findWorkspaceRoot } from './ShadowManager';
 export {
     TsGoBatchOverlay,
     FileDiagnostics,
@@ -85,6 +93,9 @@ export interface TsGoSetupOptions {
     /** Every workspace folder the editor has open; project resolution never leaves them. */
     workspacePaths?: string[];
     docManager: DocumentManager;
+    configManager?: LSConfigManager;
+    isTrusted?: boolean;
+    onDidRegisterWatchers?: (watchers: FileSystemWatcher[]) => void;
 }
 
 /**
@@ -92,8 +103,12 @@ export interface TsGoSetupOptions {
  * which case the caller simply keeps using the JS engine.
  */
 export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefined {
-    const tsgoPath = resolveTsGoPath(options.workspacePath);
-    if (!tsgoPath) {
+    if (options.isTrusted === false || options.configManager?.getIsTrusted() === false) {
+        Logger.error('[tsgo] disabled in an untrusted workspace; using the classic engine');
+        return undefined;
+    }
+    const engine = resolveTsGoEngine(options.workspacePath);
+    if (!engine) {
         Logger.error(
             '[tsgo] SVELTE_LS_TSGO is set but no tsgo binary was found. ' +
                 'Install @reintersect/effect-tsgo or @typescript/native-preview.'
@@ -255,7 +270,7 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
     });
 
     const server = new TsGoServer({
-        tsgoPath,
+        engine,
         // Root tsgo at the source root, which is the one directory guaranteed to contain every
         // mirror. Project selection is per-file — tsgo walks up from the opened file until it
         // finds a tsconfig that contains it, landing on that package's overlay — but a file
@@ -264,6 +279,18 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
         workspacePath: sourceRoot,
         // The other folders of a multi-root workspace, each widened to its own source root.
         workspacePaths: (options.workspacePaths ?? []).map((folder) => findWorkspaceRoot(folder)),
+        getConfiguration: (section, scopeUri) => {
+            const scopePath = scopeUri ? urlToPath(scopeUri) : undefined;
+            const javascript =
+                section?.toLowerCase().includes('javascript') ||
+                !!scopePath?.match(/\.(?:js|jsx|mjs|cjs)$/i);
+            return (
+                options.configManager?.getClientTsUserConfig(
+                    javascript ? 'javascript' : 'typescript'
+                ) ?? {}
+            );
+        },
+        onDidRegisterWatchers: options.onDidRegisterWatchers,
         onRestart: () => {
             Logger.error('[tsgo] server exited; a new one will replay the open documents');
             // Everything attached to the dead process has to let go of it: the checker pipe,
@@ -277,7 +304,7 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
     // Component props/events/slots are read off the *type*, which no LSP request exposes.
     // The session attaches a checker to the same programs tsgo is already serving; the project
     // is picked per file, exactly like the LSP side does.
-    const apiSession = new TsGoApiSession(server, options.workspacePath);
+    const apiSession = new TsGoApiSession(server, engine);
     const componentInfo = new TsGoComponentInfo(
         apiSession,
         async (shadowPath, offset) => {
@@ -315,12 +342,19 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
         (filePath) => server.documentVersion(filePath)
     );
 
-    Logger.log(`[tsgo] enabled, using ${tsgoPath}`);
+    Logger.log(`[tsgo] enabled, using ${engine.packageName}@${engine.version} (${engine.binPath})`);
     const plugin = new TsGoPlugin({
         server,
         projects,
         docManager: options.docManager,
-        componentInfo
+        componentInfo,
+        invalidateEngineCaches: () => {
+            invalidateImportedSveltePackages();
+            svelteHomeCache.clear();
+            shimCache.clear();
+            optionsCache.clear();
+        },
+        ...(options.configManager ? { configManager: options.configManager } : {})
     });
     return plugin;
 }

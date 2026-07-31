@@ -53,6 +53,15 @@ export type ParsedDiagnostic = {
     severity: DiagnosticSeverity;
     code: number;
     message: string;
+    relatedInformation?: ParsedDiagnosticRelatedInformation[];
+};
+
+export type ParsedDiagnosticRelatedInformation = {
+    filePath: string;
+    line: number;
+    character: number;
+    length: number;
+    message: string;
 };
 
 const MANIFEST_VERSION = 3;
@@ -115,9 +124,10 @@ function kitFilesSettingsFromConfig(config: any): InternalHelpers.KitFilesSettin
  */
 async function loadKitFilesSettings(
     workspacePath: string,
-    config?: string
+    config?: string,
+    clearCache = false
 ): Promise<InternalHelpers.KitFilesSettings> {
-    const result = await loadConfig(config ?? workspacePath, { traverse: false });
+    const result = await loadConfig(config ?? workspacePath, { traverse: false, clearCache });
     if (!result || !('config' in result)) {
         return defaultKitFilesSettings;
     }
@@ -138,7 +148,8 @@ export async function emitSvelteFiles(
     workspacePath: string,
     filePathsToIgnore: string[],
     incremental: boolean,
-    config?: string
+    config?: string,
+    clearConfigCache = false
 ): Promise<EmitResult> {
     const cacheDir = getCacheDir(workspacePath);
     const emitDir = path.join(cacheDir, EMIT_SUBDIR);
@@ -148,7 +159,7 @@ export async function emitSvelteFiles(
     const manifest = incremental
         ? loadManifest(manifestPath, workspacePath)
         : { version: MANIFEST_VERSION, entries: {} as Record<string, ManifestEntry> };
-    const kitFilesSettings = await loadKitFilesSettings(workspacePath, config);
+    const kitFilesSettings = await loadKitFilesSettings(workspacePath, config, clearConfigCache);
     const isJsOrTsFile = (filePath: string) => filePath.endsWith('.ts') || filePath.endsWith('.js');
     const allRelevantFiles = await findFiles(
         workspacePath,
@@ -683,42 +694,103 @@ export function parseDiagnostics(output: string, baseDir: string): ParsedDiagnos
     const diagnostics: ParsedDiagnostic[] = [];
     const lines = clean.split(/\r?\n/);
     // Pretty format: file.ts:5:10 - error TS2322: message
-    const headerRegex = /^((.+):(\d+):(\d+) - )?(error|warning) TS(\d+): (.*)$/;
+    const headerRegex = /^((.+):(\d+):(\d+) - )?(error|warning|suggestion|message) TS(\d+): (.*)$/;
     // Tilde underline: optional leading whitespace followed by one or more tildes
     const tildeRegex = /^(\s*)(~+)\s*$/;
+    // Pretty source context begins with a line number (and, in newer compilers, an optional
+    // gutter). Diagnostic-chain continuations are indented prose and must not be confused with
+    // that context.
+    const sourceLineRegex = /^\s*\d+\s*(?:\||\s)\s?.*$/;
+    const summaryRegex = /^(?:Found \d+ errors?|Errors\s+Files?)\b/i;
+    // TypeScript prints related locations below the primary code frame with exactly one
+    // half-indent. They intentionally have no category/code suffix:
+    //
+    //   other.ts:1:5
+    //     1 declaration
+    //         ~~~~~~~~~~~
+    //     The expected type comes from this declaration.
+    const relatedLocationRegex = /^ {2}(\S.*):(\d+):(\d+)(?: - (.*))?\s*$/;
 
     for (let i = 0; i < lines.length; i++) {
         const match = headerRegex.exec(lines[i].trim());
         if (!match) {
             continue;
         }
-        const [, , filePath, lineStr = '0', colStr = '0', severity, codeStr, message] = match;
-        const resolvedPath = filePath
-            ? path.isAbsolute(filePath)
-                ? filePath
-                : path.resolve(baseDir, filePath)
-            : null;
+        const [, , filePath, lineStr = '0', colStr = '0', severity, codeStr, firstMessage] = match;
+        const resolvedPath = filePath ? resolveCompilerPath(filePath, baseDir) : null;
         const lineNum = Math.max(0, Number(lineStr) - 1);
         const colNum = Math.max(0, Number(colStr) - 1);
 
-        // Look ahead (up to 4 lines) for a ~~ underline to determine span length.
-        // The underline appears after the source context line in pretty output.
-        let length = 1;
-        // No file path, so no source context line.
-        if (filePath) {
-            for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
-                const tildeMatch = tildeRegex.exec(lines[j]);
-                if (tildeMatch) {
-                    length = tildeMatch[2].length;
-                    break;
-                }
-
-                // Stop looking if we hit another diagnostic header
-                if (headerRegex.test(lines[j].trim())) {
-                    break;
-                }
+        // Find the complete primary block before interpreting it. Related code frames contain
+        // their own tildes, which must not overwrite the primary range, and overload chains can
+        // be much longer than the four-line lookahead the old parser used.
+        let blockEnd = lines.length;
+        for (let j = i + 1; j < lines.length; j++) {
+            const raw = lines[j];
+            const trimmed = raw.trim();
+            if (
+                headerRegex.test(trimmed) ||
+                isAbsoluteCompilerPath(raw) ||
+                summaryRegex.test(trimmed)
+            ) {
+                blockEnd = j;
+                break;
             }
         }
+        const relatedStarts: number[] = [];
+        for (let j = i + 1; j < blockEnd; j++) {
+            if (relatedLocationRegex.test(lines[j])) {
+                relatedStarts.push(j);
+            }
+        }
+        const primaryEnd = relatedStarts[0] ?? blockEnd;
+
+        // Keep the chain's newlines/indentation: flattening it to the first header line loses
+        // the actual reason each overload failed.
+        const messageLines = [firstMessage];
+        let length = 1;
+        let collectingMessage = true;
+        for (let j = i + 1; j < primaryEnd; j++) {
+            const raw = lines[j];
+            const trimmed = raw.trim();
+
+            const tildeMatch = tildeRegex.exec(raw);
+            if (tildeMatch) {
+                length = tildeMatch[2].length;
+                collectingMessage = false;
+                continue;
+            }
+
+            if (!collectingMessage) {
+                continue;
+            }
+            if (!trimmed || sourceLineRegex.test(raw)) {
+                collectingMessage = false;
+                continue;
+            }
+
+            // TypeScript indents every continuation of a DiagnosticMessageChain. An
+            // unindented line is compiler output of another kind, not part of this message.
+            if (/^\s+\S/.test(raw)) {
+                messageLines.push(raw.trimEnd());
+            } else {
+                collectingMessage = false;
+            }
+        }
+
+        const relatedInformation = relatedStarts
+            .map((start, index) =>
+                parseRelatedInformation(
+                    lines,
+                    start,
+                    relatedStarts[index + 1] ?? blockEnd,
+                    baseDir,
+                    relatedLocationRegex,
+                    sourceLineRegex,
+                    tildeRegex
+                )
+            )
+            .filter((related): related is ParsedDiagnosticRelatedInformation => !!related);
 
         diagnostics.push({
             filePath: resolvedPath,
@@ -726,13 +798,99 @@ export function parseDiagnostics(output: string, baseDir: string): ParsedDiagnos
             character: colNum,
             length,
             severity:
-                severity === 'warning' ? DiagnosticSeverity.Warning : DiagnosticSeverity.Error,
+                severity === 'warning'
+                    ? DiagnosticSeverity.Warning
+                    : severity === 'suggestion'
+                      ? DiagnosticSeverity.Hint
+                      : severity === 'message'
+                        ? DiagnosticSeverity.Information
+                        : DiagnosticSeverity.Error,
             code: Number(codeStr),
-            message
+            message: messageLines.join('\n'),
+            ...(relatedInformation.length ? { relatedInformation } : {})
         });
+
+        // The next outer iteration should begin at the next diagnostic/listed file instead of
+        // rescanning every source-context and related-information line in this block.
+        i = blockEnd - 1;
     }
 
     return diagnostics;
+}
+
+function parseRelatedInformation(
+    lines: string[],
+    start: number,
+    end: number,
+    baseDir: string,
+    relatedLocationRegex: RegExp,
+    sourceLineRegex: RegExp,
+    tildeRegex: RegExp
+): ParsedDiagnosticRelatedInformation | undefined {
+    const location = relatedLocationRegex.exec(lines[start]);
+    if (!location) {
+        return undefined;
+    }
+    const [, filePath, lineStr, characterStr, inlineMessage] = location;
+    let length = 1;
+    let sawCodeFrame = false;
+    let messageStarted = false;
+    const messageLines: string[] = inlineMessage ? [inlineMessage] : [];
+    for (let i = start + 1; i < end; i++) {
+        const raw = lines[i];
+        const trimmed = raw.trim();
+        if (!trimmed) {
+            if (messageStarted) {
+                messageLines.push('');
+            }
+            continue;
+        }
+        if (messageStarted) {
+            // `formatDiagnosticsWithColorAndContext` prefixes only the first related-message
+            // line with its fixed four spaces. Newlines already present in the message and
+            // nested DiagnosticMessageChain lines retain their own indentation verbatim.
+            messageLines.push(raw.trimEnd());
+            continue;
+        }
+        if (sourceLineRegex.test(raw)) {
+            sawCodeFrame = true;
+            continue;
+        }
+        const tilde = tildeRegex.exec(raw);
+        if (tilde) {
+            length = tilde[2].length;
+            sawCodeFrame = true;
+            continue;
+        }
+        if (sawCodeFrame && raw.startsWith('    ')) {
+            // Remove the formatter's fixed related-info indent but retain any indentation from
+            // a nested DiagnosticMessageChain.
+            messageLines.push(raw.slice(4).trimEnd());
+            messageStarted = true;
+        }
+    }
+    while (messageLines.at(-1) === '') {
+        messageLines.pop();
+    }
+    if (!messageLines.length) {
+        return undefined;
+    }
+    return {
+        filePath: resolveCompilerPath(filePath, baseDir),
+        line: Math.max(0, Number(lineStr) - 1),
+        character: Math.max(0, Number(characterStr) - 1),
+        length,
+        message: messageLines.join('\n')
+    };
+}
+
+function resolveCompilerPath(filePath: string, baseDir: string): string {
+    return isAbsoluteCompilerPath(filePath) ? filePath : path.resolve(baseDir, filePath);
+}
+
+/** True for native paths printed by the compiler running on either POSIX or Windows. */
+function isAbsoluteCompilerPath(value: string): boolean {
+    return path.isAbsolute(value) || path.win32.isAbsolute(value);
 }
 
 /**

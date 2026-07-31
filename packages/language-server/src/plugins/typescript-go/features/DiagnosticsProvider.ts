@@ -33,7 +33,7 @@ import {
     swapRangeStartEndIfNecessary,
     urlToPath
 } from '../../../utils';
-import { DiagnosticsProvider } from '../../interfaces';
+import { DiagnosticsProvider, markSvelteParserError } from '../../interfaces';
 import {
     DocumentSnapshot,
     JSOrTSDocumentSnapshot,
@@ -593,7 +593,7 @@ function getParserErrorDiagnostic(tsDoc: SvelteDocumentSnapshot): Diagnostic | u
         return;
     }
 
-    return {
+    return markSvelteParserError({
         range: tsDoc.parserError.range,
         severity: DiagnosticSeverity.Error,
         source:
@@ -602,7 +602,7 @@ function getParserErrorDiagnostic(tsDoc: SvelteDocumentSnapshot): Diagnostic | u
                 : 'js',
         message: tsDoc.parserError.message,
         code: tsDoc.parserError.code
-    };
+    });
 }
 
 function toVirtualPath(snapshot: DocumentSnapshot) {

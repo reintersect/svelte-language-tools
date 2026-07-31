@@ -9,6 +9,7 @@ import {
 import { debounce, pathToUrl } from '../utils';
 import { fileURLToPath } from 'url';
 import { Stats } from 'fs';
+import { Logger } from '../logger';
 
 type DidChangeHandler = (para: DidChangeWatchedFilesParams) => void;
 
@@ -17,6 +18,8 @@ const DELAY = 50;
 export class FallbackWatcher {
     private readonly watcher: FSWatcher;
     private readonly callbacks: DidChangeHandler[] = [];
+    private readonly errorCallbacks: Array<(error: Error) => void> = [];
+    private failed = false;
 
     private undeliveredFileEvents: FileEvent[] = [];
 
@@ -38,7 +41,24 @@ export class FallbackWatcher {
         this.watcher
             .on('add', (path) => this.onFSEvent(path, FileChangeType.Created))
             .on('unlink', (path) => this.onFSEvent(path, FileChangeType.Deleted))
-            .on('change', (path) => this.onFSEvent(path, FileChangeType.Changed));
+            .on('change', (path) => this.onFSEvent(path, FileChangeType.Changed))
+            .on('error', (error) => this.onError(error));
+    }
+
+    private onError(error: unknown) {
+        if (this.failed) {
+            return;
+        }
+        this.failed = true;
+        const resolved = error instanceof Error ? error : new Error(String(error));
+        Logger.error(`[watch] fallback watcher disabled after an error: ${resolved.message}`);
+        this.errorCallbacks.forEach((callback) => callback(resolved));
+        // Chokidar errors such as EMFILE otherwise remain live and can repeatedly emit. Closing
+        // degrades external-file refresh deterministically without taking down the LSP process.
+        void this.watcher.close();
+        // chokidar removes its listeners while closing; retain a sink for any already-queued
+        // follow-up `error` event so EventEmitter cannot turn it into an uncaught exception.
+        this.watcher.on('error', () => undefined);
     }
 
     private convert(path: string, type: FileChangeType): FileEvent {
@@ -68,7 +88,14 @@ export class FallbackWatcher {
         this.callbacks.push(callback);
     }
 
+    onErrorOccurred(callback: (error: Error) => void) {
+        this.errorCallbacks.push(callback);
+    }
+
     watchDirectory(patterns: RelativePattern[]) {
+        if (this.failed) {
+            return;
+        }
         for (const pattern of patterns) {
             const basePath = fileURLToPath(
                 typeof pattern.baseUri === 'string' ? pattern.baseUri : pattern.baseUri.uri

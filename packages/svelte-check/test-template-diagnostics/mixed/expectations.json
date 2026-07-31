@@ -1,0 +1,26 @@
+{
+    "schemaVersion": 1,
+    "svelteVersion": "5.55.5",
+    "diagnosticSources": "js,svelte",
+    "cases": [
+        {
+            "file": "src/00-css-parser-and-template-type.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "css_expected_identifier",
+                    "range": [6, 5, 6, 5],
+                    "message": "Expected a valid CSS identifier\nhttps://svelte.dev/e/css_expected_identifier\n\nIf you expect this syntax to work, here are some suggestions: \nIf you use less/SCSS with `svelte-preprocess`, did you add `lang=\"scss\"`/`lang=\"less\"` to your `style` tag? If you use SCSS, it may be necessary to add the path to your NODE runtime to the setting `svelte.language-server.runtime`, or use `sass` instead of `node-sass`. \nDid you setup a `svelte.config.js` or `vite.config.js`? \nSee https://github.com/sveltejs/language-tools/tree/master/docs#using-with-preprocessors for more info.",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#css_expected_identifier"
+                    }
+                },
+                {
+                    "code": 2339,
+                    "range": [9, 20, 9, 27],
+                    "message": "Property 'missing' does not exist on type '{ ok: number; }'."
+                }
+            ]
+        }
+    ]
+}

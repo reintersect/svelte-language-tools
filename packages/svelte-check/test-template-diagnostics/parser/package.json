@@ -1,0 +1,8 @@
+{
+    "name": "svelte-check-template-diagnostics-parser",
+    "private": true,
+    "type": "module",
+    "dependencies": {
+        "svelte": "5.55.5"
+    }
+}

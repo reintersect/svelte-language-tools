@@ -1,4 +1,5 @@
-import { dirname, resolve } from 'path';
+import fs from 'fs';
+import { dirname, resolve, sep } from 'path';
 import * as prettier from 'prettier';
 import * as svelte from 'svelte/compiler';
 import { Logger } from './logger';
@@ -9,6 +10,7 @@ import { Logger } from './logger';
  * and inject that class into all places where it's needed (Document etc.)
  */
 let isTrusted = true;
+const importedSveltePackageRoots = new Set<string>();
 
 export function setIsTrusted(_isTrusted: boolean) {
     isTrusted = _isTrusted;
@@ -36,7 +38,9 @@ export function getPackageInfo(packageName: string, fromPath: string, use_fallba
     const packageJSONPath = require.resolve(`${packageName}/package.json`, {
         paths
     });
-    const { version } = dynamicRequire(packageJSONPath);
+    // Manifests are data, not modules. Reading them directly avoids Node's require cache serving
+    // the previous version after a watched package-manager update.
+    const { version } = JSON.parse(fs.readFileSync(packageJSONPath, 'utf8'));
     const [major, minor, patch] = version.split('.');
 
     return {
@@ -59,6 +63,7 @@ export function importPrettier(fromPath: string): typeof prettier {
 
 export function importSvelte(fromPath: string, use_fallback = true): typeof svelte {
     const pkg = getPackageInfo('svelte', fromPath, use_fallback);
+    importedSveltePackageRoots.add(pkg.path);
     const main = resolve(pkg.path, 'compiler');
     Logger.debug('Using Svelte v' + pkg.version.full, 'from', main);
     if (pkg.version.major === 4) {
@@ -66,6 +71,20 @@ export function importSvelte(fromPath: string, use_fallback = true): typeof svel
     } else {
         return dynamicRequire(main);
     }
+}
+
+/** Forget workspace Svelte compiler modules after a package graph change. */
+export function invalidateImportedSveltePackages(): void {
+    for (const modulePath of Object.keys(require.cache)) {
+        if (
+            [...importedSveltePackageRoots].some(
+                (root) => modulePath === root || modulePath.startsWith(root + sep)
+            )
+        ) {
+            delete require.cache[modulePath];
+        }
+    }
+    importedSveltePackageRoots.clear();
 }
 
 /** Can throw because no fallback guaranteed */

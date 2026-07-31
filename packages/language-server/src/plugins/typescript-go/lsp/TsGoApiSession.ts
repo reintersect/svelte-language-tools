@@ -1,7 +1,6 @@
-import fs from 'fs';
-import { dirname } from 'path';
 import { pathToFileURL } from 'url';
 import { Logger } from '../../../logger';
+import { ResolvedTsGoEngine } from './TsGoEngine';
 import { TsGoServer } from './TsGoServer';
 
 /**
@@ -47,10 +46,12 @@ export class TsGoApiSession {
     /** In-flight refresh, so concurrent callers share one instead of double-disposing. */
     private refreshing: Promise<void> | undefined;
     private failed = false;
+    /** Invalidates every continuation still awaiting the previous child/API pipe. */
+    private epoch = 0;
 
     constructor(
         private readonly server: TsGoServer,
-        private readonly resolveFrom: string
+        private readonly engine: ResolvedTsGoEngine
     ) {}
 
     get signatureKind() {
@@ -61,39 +62,54 @@ export class TsGoApiSession {
         if (this.failed) {
             return false;
         }
-        this.connecting ??= this.doConnect();
+        const epoch = this.epoch;
+        this.connecting ??= this.doConnect(epoch);
         return this.connecting;
     }
 
-    private async doConnect(): Promise<boolean> {
+    private async doConnect(epoch: number): Promise<boolean> {
+        let attachedApi: any;
         try {
-            // The JS API client, from whichever package actually ships `dist/api/async/api.js`.
-            // effect-tsgo first — when a release starts bundling the client it is the exact
-            // match for the running binary — then stock TypeScript 7. The existence check is
-            // load-bearing: pnpm's virtual store can resolve a *transitive* native-preview
-            // whose published files don't include the async API at all, which is precisely how
-            // component-level features silently vanished from the published package while
-            // working in the checkout.
-            const entry = this.resolveApiEntry();
+            // Use only the API entry resolved with the running engine. Mixing the binary from
+            // one native-preview build with a transitive API client from another produces
+            // nondeterministic protocol failures and also bypasses trusted-workspace gating.
+            const entry = this.engine.apiEntry;
             if (!entry) {
                 throw new Error(
-                    'no package with dist/api/async/api.js found ' +
-                        '(tried @reintersect/effect-tsgo, @typescript/native, @typescript/native-preview)'
+                    `${this.engine.packageName}@${this.engine.version} does not provide the async API client`
                 );
             }
-            this.module = await importESM(pathToFileURL(entry).href);
+            const module: TsGoApiModule = await importESM(pathToFileURL(entry).href);
+            if (epoch !== this.epoch) {
+                return false;
+            }
 
             const session = await this.server.sendRequest<{ pipe?: string }>(
                 'custom/initializeAPISession',
                 {}
             );
+            if (epoch !== this.epoch) {
+                return false;
+            }
             if (!session?.pipe) {
                 throw new Error('tsgo did not return an API pipe');
             }
-            this.api = await this.module!.API.fromLSPConnection({ pipe: session.pipe });
+            attachedApi = await module.API.fromLSPConnection({ pipe: session.pipe });
+            if (epoch !== this.epoch) {
+                await attachedApi?.close?.();
+                return false;
+            }
+            this.module = module;
+            this.api = attachedApi;
             Logger.log('[tsgo] checker API session attached');
             return true;
         } catch (e) {
+            if (epoch !== this.epoch) {
+                try {
+                    await attachedApi?.close?.();
+                } catch {}
+                return false;
+            }
             Logger.error(
                 '[tsgo] could not attach the checker API session; component-level features ' +
                     'will be limited',
@@ -102,28 +118,6 @@ export class TsGoApiSession {
             this.failed = true;
             return false;
         }
-    }
-
-    private resolveApiEntry(): string | undefined {
-        const candidates = [
-            '@reintersect/effect-tsgo',
-            '@typescript/native',
-            '@typescript/native-preview'
-        ];
-        for (const name of candidates) {
-            try {
-                const pkgJson = require.resolve(`${name}/package.json`, {
-                    paths: [this.resolveFrom, __dirname]
-                });
-                const entry = `${dirname(pkgJson)}/dist/api/async/api.js`;
-                if (fs.existsSync(entry)) {
-                    return entry;
-                }
-            } catch {
-                // Try the next candidate.
-            }
-        }
-        return undefined;
     }
 
     /**
@@ -145,23 +139,45 @@ export class TsGoApiSession {
         if (!(await this.connect())) {
             return undefined;
         }
+        const epoch = this.epoch;
+        const api = this.api;
+        if (!api) {
+            return undefined;
+        }
         try {
-            const generation = this.server.generation;
-            if (!this.snapshot || generation !== this.snapshotGeneration) {
+            while (!this.snapshot || this.server.generation !== this.snapshotGeneration) {
                 // Single-flight: two feature requests racing here would each capture the same
                 // `previous` and dispose it twice — the server-side refcount underflows and a
                 // snapshot still in use gets released.
-                this.refreshing ??= (async () => {
-                    const previous = this.snapshot;
-                    this.snapshot = await this.api.updateSnapshot();
-                    this.snapshotGeneration = generation;
-                    if (previous && previous !== this.snapshot) {
-                        await previous.dispose?.();
-                    }
-                })().finally(() => {
-                    this.refreshing = undefined;
-                });
+                if (!this.refreshing) {
+                    const generation = this.server.generation;
+                    const refresh = (async () => {
+                        const previous = this.snapshot;
+                        const next = await api.updateSnapshot();
+                        if (epoch !== this.epoch || api !== this.api) {
+                            await next?.dispose?.();
+                            return;
+                        }
+                        if (!next) {
+                            throw new Error('tsgo checker API returned no snapshot');
+                        }
+                        this.snapshot = next;
+                        this.snapshotGeneration = generation;
+                        if (previous && previous !== next) {
+                            await previous.dispose?.();
+                        }
+                    })();
+                    const tracked = refresh.finally(() => {
+                        if (this.refreshing === tracked) {
+                            this.refreshing = undefined;
+                        }
+                    });
+                    this.refreshing = tracked;
+                }
                 await this.refreshing;
+                if (epoch !== this.epoch || api !== this.api) {
+                    return undefined;
+                }
             }
             return await this.snapshot.getDefaultProjectForFile(shadowPath);
         } catch (e) {
@@ -175,14 +191,26 @@ export class TsGoApiSession {
      * process instead of talking to a dead pipe forever.
      */
     reset() {
-        void this.dispose();
+        this.epoch++;
+        void this.disposeCurrent();
         this.module = undefined;
         this.connecting = undefined;
+        this.refreshing = undefined;
         this.failed = false;
         this.snapshotGeneration = -1;
     }
 
     async dispose() {
+        this.epoch++;
+        this.module = undefined;
+        this.connecting = undefined;
+        this.refreshing = undefined;
+        this.failed = false;
+        this.snapshotGeneration = -1;
+        await this.disposeCurrent();
+    }
+
+    private async disposeCurrent() {
         // Detach the fields *synchronously* before the async closes settle: dispose races the
         // next doConnect after a restart, and a late continuation must not null out a freshly
         // attached api.

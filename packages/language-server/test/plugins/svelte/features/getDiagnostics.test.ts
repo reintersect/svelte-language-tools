@@ -246,6 +246,36 @@ describe('SveltePlugin#getDiagnostics', () => {
         ]);
     });
 
+    it('does not hide a markup parser error because an unrelated script has a language', async () => {
+        (
+            await expectDiagnosticsFor({
+                docText: '<script lang="ts"></script>\n<div>',
+                getTranspiled: () => ({
+                    getOriginalPosition: () => Position.create(1, 1)
+                }),
+                getCompiled: () => {
+                    const error: any = new Error('Compilation');
+                    error.message = 'Unexpected token';
+                    error.code = 123;
+                    error.start = { line: 2, column: 1 };
+                    throw error;
+                },
+                config: {}
+            })
+        ).toEqual([
+            {
+                code: 123,
+                message: 'Unexpected token',
+                range: {
+                    start: { character: 1, line: 1 },
+                    end: { character: 1, line: 1 }
+                },
+                severity: DiagnosticSeverity.Error,
+                source: 'svelte'
+            }
+        ]);
+    });
+
     it('expect valid position for compilation error', async () => {
         const message =
             'Stores must be declared at the top level of the component (this may change in a future version of Svelte)';

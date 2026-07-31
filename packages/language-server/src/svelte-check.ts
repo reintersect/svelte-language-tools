@@ -1,6 +1,6 @@
 import { isAbsolute, dirname } from 'path';
 import ts from 'typescript';
-import { Diagnostic, Position, Range } from 'vscode-languageserver';
+import { Diagnostic, DiagnosticSeverity, Position, Range } from 'vscode-languageserver';
 import { WorkspaceFolder } from 'vscode-languageserver-protocol';
 import { Document, DocumentManager } from './lib/documents';
 import { configLoader } from './lib/documents/configLoader';
@@ -80,6 +80,26 @@ export interface SvelteCheckOptions {
             astModule: unknown;
         };
     };
+}
+
+/**
+ * Prime every Svelte config before classic whole-program diagnostics fan out across files and
+ * providers. Vite config loading temporarily changes process.cwd(), while preprocessors such as
+ * Tailwind resolve their own config lazily from process.cwd(). Letting those operations overlap
+ * can therefore make one package preprocess with another package's configuration.
+ *
+ * @internal Exported for the focused checker lifecycle regression.
+ */
+export async function preloadSvelteConfigsForClassicDiagnostics(
+    files: readonly Pick<ts.SourceFile, 'fileName'>[],
+    loadConfig: (fileName: string) => Promise<unknown> = (fileName) =>
+        configLoader.awaitConfig(fileName)
+): Promise<void> {
+    await Promise.all(
+        files
+            .filter((file) => file.fileName.toLowerCase().endsWith('.svelte'))
+            .map((file) => loadConfig(file.fileName))
+    );
 }
 
 /**
@@ -305,8 +325,30 @@ export class SvelteCheck {
                 message: ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'),
                 code: diagnostic.code,
                 tags: getDiagnosticTag(diagnostic),
+                relatedInformation: diagnostic.relatedInformation
+                    ?.filter(
+                        (related) =>
+                            !!related.file &&
+                            related.start !== undefined &&
+                            related.length !== undefined
+                    )
+                    .map((related) => ({
+                        location: {
+                            uri: pathToUrl(related.file!.fileName),
+                            range: convertRange(
+                                {
+                                    positionAt: related.file!.getLineAndCharacterOfPosition.bind(
+                                        related.file
+                                    )
+                                },
+                                related
+                            )
+                        },
+                        message: ts.flattenDiagnosticMessageText(related.messageText, '\n')
+                    })),
                 data: {
-                    positionUnknown: !diagnostic.start || !diagnostic.length
+                    positionUnknown:
+                        diagnostic.start === undefined || diagnostic.length === undefined
                 }
             };
         };
@@ -334,6 +376,11 @@ export class SvelteCheck {
 
         const files = lang.getProgram()?.getSourceFiles() || [];
         const options = lang.getProgram()?.getCompilerOptions() || {};
+
+        // Config discovery can call into Vite, which temporarily changes the process cwd. Finish
+        // all such work before Svelte style preprocessing starts in the parallel diagnostics
+        // below; otherwise cwd-sensitive PostCSS plugins can observe a sibling package's root.
+        await preloadSvelteConfigsForClassicDiagnostics(files);
 
         const diagnostics = await Promise.all(
             files.map((file) => {
@@ -364,7 +411,11 @@ export class SvelteCheck {
                         ] as const;
                         for (const diagnosticSource of diagnosticSources) {
                             for (let diagnostic of lang[diagnosticSource](file.fileName)) {
-                                if (!diagnostic.start || !diagnostic.length || !isKitFile) {
+                                if (
+                                    diagnostic.start === undefined ||
+                                    diagnostic.length === undefined ||
+                                    !isKitFile
+                                ) {
                                     diagnostics.push(map(diagnostic));
                                     continue;
                                 }
@@ -535,7 +586,9 @@ export class SvelteCheck {
     }
 
     private async getDiagnosticsForFile(uri: string) {
-        const diagnostics = await this.pluginHost.getDiagnostics({ uri });
+        const diagnostics = deduplicateSvelteParserDiagnostics(
+            await this.pluginHost.getDiagnostics({ uri })
+        );
         return {
             filePath: urlToPath(uri) || '',
             text: this.docManager.get(uri)?.getText() || '',
@@ -576,4 +629,39 @@ export class SvelteCheck {
             recursive: !!(flags & ts.WatchDirectoryFlags.Recursive)
         }));
     }
+}
+
+/**
+ * A template parse failure is visible to both the Svelte compiler plugin and the generated
+ * TypeScript snapshot. Prefer the compiler's named/code-linked diagnostic over the synthetic
+ * TypeScript `-1` copy, while preserving multiplicity for ordinary type diagnostics.
+ */
+export function deduplicateSvelteParserDiagnostics(diagnostics: Diagnostic[]): Diagnostic[] {
+    const identity = (diagnostic: Diagnostic) =>
+        JSON.stringify([diagnostic.severity, diagnostic.message]);
+    const isCompilerParserError = (diagnostic: Diagnostic) =>
+        diagnostic.source === 'svelte' &&
+        diagnostic.severity === DiagnosticSeverity.Error &&
+        (diagnostic.codeDescription?.href.includes('/compiler-errors#') ||
+            diagnostic.message.includes('https://svelte.dev/e/'));
+    const authoritativeIdentities = new Set(
+        diagnostics.filter(isCompilerParserError).map(identity)
+    );
+    const emitted = new Set<string>();
+    const result: Diagnostic[] = [];
+
+    for (const diagnostic of diagnostics) {
+        const key = identity(diagnostic);
+        if (!authoritativeIdentities.has(key)) {
+            // Ordinary diagnostics retain their full multiplicity. Only a matching named
+            // compiler failure proves that the TypeScript copy came from a broken shadow.
+            result.push(diagnostic);
+            continue;
+        }
+        if (isCompilerParserError(diagnostic) && !emitted.has(key)) {
+            emitted.add(key);
+            result.push(diagnostic);
+        }
+    }
+    return result;
 }

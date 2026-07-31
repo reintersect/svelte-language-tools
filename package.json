@@ -8,6 +8,10 @@
         "bootstrap": "cd ./packages/svelte2tsx && pnpm build && cd ../load-config && pnpm build && cd ../svelte-vscode && pnpm build:grammar",
         "build": "tsc -b",
         "test": "cross-env CI=true pnpm test -r",
+        "test:tsgo-oracle": "pnpm --filter svelte2tsx build && pnpm --filter @reintersect/svelte-language-server build && node --test bench/lsp-client.test.mjs bench/inferred-project.test.mjs && node --test bench/template-diagnostics.test.mjs && node bench/compare-lsp-features.mjs",
+        "test:tsgo-checker-oracle": "node bench/compare-checker-engines.mjs",
+        "test:tsgo-performance-tools": "node --test bench/perf-utils.test.mjs",
+        "bench:tsgo-performance": "node bench/performance-acceptance.mjs",
         "watch": "tsc -b -watch",
         "format": "prettier --write .",
         "lint": "prettier --check .",
@@ -20,7 +24,7 @@
     "devDependencies": {
         "@changesets/cli": "^2.29.7",
         "@svitejs/changesets-changelog-github-compact": "^1.1.0",
-        "@typescript/native-preview": "~7.0.0-dev.20260703.1",
+        "@typescript/native-preview": "7.0.0-dev.20260703.1",
         "cross-env": "^7.0.2",
         "prettier": "~3.3.3",
         "ts-node": "^10.0.0"

@@ -4,8 +4,10 @@
 
 import { watch, FSWatcher } from 'chokidar';
 import * as fs from 'fs';
+import { createRequire } from 'module';
 import * as path from 'path';
 import { SvelteCheck, SvelteCheckOptions } from 'svelte-language-server';
+import ts from 'typescript';
 import { Diagnostic, DiagnosticSeverity } from 'vscode-languageserver-protocol';
 import { URI } from 'vscode-uri';
 import { parseOptions, SvelteCheckCliOptions } from './options';
@@ -73,7 +75,226 @@ async function getDiagnostics(
 }
 
 const FILE_ENDING_REGEX = /\.(svelte|d\.ts|ts|js|jsx|tsx|mjs|cjs|mts|cts)$/;
+const VIRTUAL_WATCH_FILE_REGEX = /\.(svelte|json|[cm]?[jt]sx?)$/i;
 const VITE_CONFIG_REGEX = /vite\.config\.(js|ts)\.timestamp-/;
+const TS_OR_JS_SOURCE_REGEX = /\.[cm]?[jt]sx?$/i;
+const CONFIG_FILE_NAMES = [
+    'svelte.config.js',
+    'svelte.config.cjs',
+    'svelte.config.mjs',
+    'svelte.config.ts',
+    'svelte.config.cts',
+    'svelte.config.mts',
+    'vite.config.js',
+    'vite.config.cjs',
+    'vite.config.mjs',
+    'vite.config.ts',
+    'vite.config.cts',
+    'vite.config.mts'
+];
+
+/** Only module-graph changes require rebuilding shared dependency indexes. */
+function moduleGraphSignature(filePath: string): string {
+    try {
+        const text = fs.readFileSync(filePath, 'utf8');
+        const info = ts.preProcessFile(text, true, true);
+        const names = (entries: readonly ts.FileReference[]) =>
+            entries.map((entry) => entry.fileName).sort();
+        return JSON.stringify({
+            imports: names(info.importedFiles),
+            references: names(info.referencedFiles),
+            types: names(info.typeReferenceDirectives),
+            libs: names(info.libReferenceDirectives),
+            ambiguous:
+                /\b(?:import|require)\s*\(\s*(?!['"`])\S/.test(text) ||
+                /\b(?:import|require)\s*\(\s*`[^`]*\$\{/.test(text) ||
+                /\bimport\.meta\.glob(?:Eager)?\s*\(/.test(text)
+        });
+    } catch {
+        return '<unreadable>';
+    }
+}
+
+function existingConfigCandidate(candidate: string): string | undefined {
+    for (const filePath of [
+        candidate,
+        candidate.endsWith('.json') ? candidate : `${candidate}.json`,
+        path.join(candidate, 'tsconfig.json')
+    ]) {
+        try {
+            if (fs.statSync(filePath).isFile()) {
+                return path.resolve(filePath);
+            }
+        } catch {
+            // Try the next TypeScript config spelling.
+        }
+    }
+}
+
+function resolveExtendedConfig(specifier: string, containingConfig: string): string | undefined {
+    const configDir = path.dirname(containingConfig);
+    if (path.isAbsolute(specifier) || specifier.startsWith('.')) {
+        const candidate = path.resolve(configDir, specifier);
+        return (
+            existingConfigCandidate(candidate) ??
+            (path.extname(candidate) ? candidate : `${candidate}.json`)
+        );
+    }
+
+    const requireFromConfig = createRequire(path.join(configDir, '__svelte_check_resolve.cjs'));
+    for (const request of [specifier, `${specifier}.json`, `${specifier}/tsconfig.json`]) {
+        try {
+            return path.resolve(requireFromConfig.resolve(request));
+        } catch {
+            // Package configs are not required to expose package.json. Try the next public entry.
+        }
+    }
+}
+
+function collectTsconfigGraph(entryConfig: string | undefined): Set<string> {
+    const configs = new Set<string>();
+    const pending = entryConfig ? [path.resolve(entryConfig)] : [];
+    while (pending.length) {
+        const configPath = pending.pop()!;
+        if (configs.has(configPath)) continue;
+        configs.add(configPath);
+
+        const read = ts.readConfigFile(configPath, ts.sys.readFile);
+        if (read.error || !read.config || typeof read.config !== 'object') continue;
+        const extended = Array.isArray(read.config.extends)
+            ? read.config.extends
+            : typeof read.config.extends === 'string'
+              ? [read.config.extends]
+              : [];
+        for (const specifier of extended) {
+            if (typeof specifier !== 'string') continue;
+            const resolved = resolveExtendedConfig(specifier, configPath);
+            if (resolved && !configs.has(resolved)) pending.push(resolved);
+        }
+        for (const reference of Array.isArray(read.config.references)
+            ? read.config.references
+            : []) {
+            if (typeof reference?.path !== 'string') continue;
+            const candidate = path.resolve(path.dirname(configPath), reference.path);
+            const resolved =
+                existingConfigCandidate(candidate) ??
+                (path.extname(candidate) ? candidate : path.join(candidate, 'tsconfig.json'));
+            if (resolved && !configs.has(resolved)) pending.push(resolved);
+        }
+    }
+    return configs;
+}
+
+function readManifest(manifestPath: string): Record<string, any> | undefined {
+    try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        return manifest && typeof manifest === 'object' ? manifest : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function findWorkspaceManifests(workspacePath: string): string[] {
+    const manifests: string[] = [];
+    const pending = [workspacePath];
+    const ignored = new Set(['node_modules', '.git', '.svelte-kit', '.svelte-check']);
+    while (pending.length) {
+        const directory = pending.pop()!;
+        let entries: fs.Dirent[];
+        try {
+            entries = fs.readdirSync(directory, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        for (const entry of entries) {
+            const entryPath = path.join(directory, entry.name);
+            if (entry.isDirectory() && !ignored.has(entry.name)) pending.push(entryPath);
+            else if (entry.isFile() && entry.name === 'package.json') manifests.push(entryPath);
+        }
+    }
+    return manifests;
+}
+
+function directDependencyManifest(packageRoot: string, packageName: string): string | undefined {
+    const direct = path.join(
+        packageRoot,
+        'node_modules',
+        ...packageName.split('/'),
+        'package.json'
+    );
+    try {
+        return fs.realpathSync(direct);
+    } catch {
+        // pnpm and exports-restricted packages may need entry-point resolution instead.
+    }
+
+    const requireFromPackage = createRequire(path.join(packageRoot, '__svelte_check_resolve.cjs'));
+    let entry: string;
+    try {
+        entry = requireFromPackage.resolve(packageName);
+    } catch {
+        return;
+    }
+    for (let directory = path.dirname(entry); ; directory = path.dirname(directory)) {
+        const manifestPath = path.join(directory, 'package.json');
+        const manifest = readManifest(manifestPath);
+        if (manifest?.name === packageName) return manifestPath;
+        const parent = path.dirname(directory);
+        if (parent === directory) return;
+    }
+}
+
+function collectManifestClosure(workspacePath: string): Set<string> {
+    const workspaceManifests = findWorkspaceManifests(workspacePath).map((manifestPath) =>
+        path.resolve(manifestPath)
+    );
+    const workspaceSet = new Set(workspaceManifests);
+    const manifests = new Set<string>();
+    const pending = [...workspaceManifests];
+    while (pending.length) {
+        const manifestPath = pending.pop()!;
+        if (manifests.has(manifestPath)) continue;
+        manifests.add(manifestPath);
+        const manifest = readManifest(manifestPath);
+        if (!manifest) continue;
+        const packageRoot = path.dirname(manifestPath);
+        const isSveltePackage =
+            workspaceSet.has(manifestPath) ||
+            manifest.name === 'svelte' ||
+            typeof manifest.svelte === 'string' ||
+            Boolean(manifest.dependencies?.svelte || manifest.peerDependencies?.svelte) ||
+            JSON.stringify(manifest.exports ?? '').includes('.svelte') ||
+            CONFIG_FILE_NAMES.some((configName) =>
+                fs.existsSync(path.join(packageRoot, configName))
+            );
+        if (!isSveltePackage) continue;
+        const dependencies = {
+            ...manifest.dependencies,
+            ...manifest.optionalDependencies,
+            ...manifest.peerDependencies,
+            ...(workspaceSet.has(manifestPath) ? manifest.devDependencies : undefined)
+        };
+        for (const packageName of Object.keys(dependencies)) {
+            const resolved = directDependencyManifest(path.dirname(manifestPath), packageName);
+            if (resolved && !manifests.has(resolved)) pending.push(path.resolve(resolved));
+        }
+    }
+    return manifests;
+}
+
+function collectVirtualWatchTargets(opts: SvelteCheckCliOptions): Set<string> {
+    const targets = collectTsconfigGraph(opts.tsconfig);
+    if (opts.config) targets.add(path.resolve(opts.config));
+    for (const manifestPath of collectManifestClosure(opts.workspaceUri.fsPath)) {
+        targets.add(manifestPath);
+        const packageRoot = path.dirname(manifestPath);
+        for (const configName of CONFIG_FILE_NAMES) {
+            const configPath = path.join(packageRoot, configName);
+            if (fs.existsSync(configPath)) targets.add(configPath);
+        }
+    }
+    return targets;
+}
 
 class DiagnosticsWatcher {
     private updateDiagnostics: any;
@@ -81,6 +302,7 @@ class DiagnosticsWatcher {
     private currentWatchedDirs = new Set<string>();
     private userIgnored: Array<(path: string) => boolean>;
     private pendingWatcherUpdate: any;
+    private fatalWatcherError = false;
 
     constructor(
         private workspaceUri: URI,
@@ -120,18 +342,34 @@ class DiagnosticsWatcher {
             },
             ignoreInitial: this.ignoreInitialAdd
         })
-            .on('add', (path) => this.updateDocument(path, true))
-            .on('unlink', (path) => this.removeDocument(path))
-            .on('change', (path) => this.updateDocument(path, false));
+            .on('add', (path) => this.runWatcherTask(this.updateDocument(path, true)))
+            .on('unlink', (path) => this.runWatcherTask(this.removeDocument(path)))
+            .on('change', (path) => this.runWatcherTask(this.updateDocument(path, false)))
+            .on('error', (error) => this.failWatcher(error));
 
-        this.updateWildcardWatcher().then(() => {
-            // ensuring the typescript program is built after wildcard watchers are added
-            // so that individual file watchers added from onFileSnapshotCreated
-            // run after the wildcard ones
-            if (this.ignoreInitialAdd) {
-                getDiagnostics(this.workspaceUri, this.writer, this.svelteCheck);
-            }
-        });
+        this.updateWildcardWatcher()
+            .then(() => {
+                // ensuring the typescript program is built after wildcard watchers are added
+                // so that individual file watchers added from onFileSnapshotCreated
+                // run after the wildcard ones
+                if (this.ignoreInitialAdd) {
+                    return getDiagnostics(this.workspaceUri, this.writer, this.svelteCheck);
+                }
+            })
+            .catch((error) => this.failWatcher(error));
+    }
+
+    private failWatcher(error: unknown) {
+        if (this.fatalWatcherError) return;
+        this.fatalWatcherError = true;
+        clearTimeout(this.updateDiagnostics);
+        clearTimeout(this.pendingWatcherUpdate);
+        this.writer.failure(error instanceof Error ? error : new Error(String(error)));
+        void this.watcher.close().finally(() => exitAfterFlush(1));
+    }
+
+    private runWatcherTask(task: Promise<void>) {
+        void task.catch((error) => this.failWatcher(error));
     }
 
     private isSubDir(candidate: string, parent: string) {
@@ -277,7 +515,7 @@ function writeDiagnostics(
         writer.file(
             diagnostic.diagnostics,
             workspaceUri.fsPath,
-            path.relative(workspaceUri.fsPath, diagnostic.filePath),
+            relativeToWorkspace(workspaceUri.fsPath, diagnostic.filePath),
             diagnostic.text
         );
 
@@ -306,6 +544,29 @@ function writeDiagnostics(
     );
 
     return result;
+}
+
+function relativeToWorkspace(workspacePath: string, filePath: string): string {
+    const direct = path.relative(workspacePath, filePath);
+    if (!isOutsideWorkspace(direct)) return direct;
+
+    // macOS exposes /var through /private/var, and package managers frequently return the real
+    // path behind a workspace symlink. Preserve the user's workspace-relative machine protocol.
+    try {
+        const canonical = path.relative(fs.realpathSync(workspacePath), fs.realpathSync(filePath));
+        if (!isOutsideWorkspace(canonical)) return canonical;
+    } catch {
+        // The diagnostic may describe a config that no longer exists; keep the direct spelling.
+    }
+    return direct;
+}
+
+function isOutsideWorkspace(relativePath: string): boolean {
+    return (
+        relativePath === '..' ||
+        relativePath.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relativePath)
+    );
 }
 
 async function getSvelteDiagnosticsForIncremental(
@@ -460,7 +721,8 @@ async function runWithVirtualFiles(
         opts.workspaceUri.fsPath,
         opts.filePathsToIgnore,
         opts.incremental,
-        opts.config
+        opts.config,
+        opts.clearConfigCache
     );
     const overlayTsconfig = writeOverlayTsconfig(opts.tsconfig, emitResult, opts.incremental);
     const tsDiagnostics = mapCliDiagnosticsToLsp(
@@ -514,19 +776,59 @@ async function watchWithVirtualFiles(
     let pending: NodeJS.Timeout | undefined;
     let running = false;
     let rerun = false;
+    let fatalWatcherError = false;
+    let watchGraphDirty = false;
+    let configCacheDirty = false;
+    let workspaceIndexDirty = false;
+    const moduleGraphSignatures = new Map<string, string>();
     const userIgnored = createIgnored(opts.filePathsToIgnore);
+    const explicitTargets = collectVirtualWatchTargets(opts);
+
+    const isExplicitTarget = (candidate: string) => explicitTargets.has(path.resolve(candidate));
+
+    let watcher: FSWatcher;
+
+    const refreshExplicitTargets = () => {
+        const added: string[] = [];
+        for (const target of collectVirtualWatchTargets(opts)) {
+            if (explicitTargets.has(target)) continue;
+            explicitTargets.add(target);
+            added.push(target);
+        }
+        if (added.length) watcher.add(added);
+    };
 
     const run = async () => {
+        if (fatalWatcherError) return;
         if (running) {
             rerun = true;
             return;
         }
         running = true;
+        const clearConfigCache = configCacheDirty;
+        configCacheDirty = false;
+        const clearTsGoWorkspaceIndex = workspaceIndexDirty && !clearConfigCache;
+        workspaceIndexDirty = false;
         try {
-            await runOnce(opts, writer);
+            await runOnce({ ...opts, clearConfigCache, clearTsGoWorkspaceIndex }, writer);
         } catch (err: any) {
-            writer.failure(err);
+            // A failed check is not a normal watch iteration. Keeping the watcher alive after a
+            // spawn/config/parser failure leaves machine consumers with a FAILURE record from a
+            // process that still reports success when it is eventually terminated. Make the
+            // failure terminal and flush it before exiting, matching one-shot mode.
+            fatalWatcherError = true;
+            clearTimeout(pending);
+            writer.failure(err instanceof Error ? err : new Error(String(err)));
+            void watcher.close().finally(() => exitAfterFlush(1));
         } finally {
+            if (fatalWatcherError) {
+                running = false;
+                return;
+            }
+            if (watchGraphDirty) {
+                watchGraphDirty = false;
+                refreshExplicitTargets();
+            }
             running = false;
             if (rerun) {
                 rerun = false;
@@ -535,19 +837,68 @@ async function watchWithVirtualFiles(
         }
     };
 
-    const schedule = () => {
+    const schedule = (changedPath?: string, event: 'add' | 'change' | 'unlink' = 'change') => {
+        if (fatalWatcherError) return;
+        if (changedPath) {
+            const normalizedChangedPath = path.resolve(changedPath);
+            const isTransformConfig =
+                /(?:^|[/\\])(?:svelte|vite)\.config\.[cm]?[jt]s$/i.test(changedPath) ||
+                (!!opts.config && normalizedChangedPath === path.resolve(opts.config));
+            const isPackageManifest = path.basename(changedPath).toLowerCase() === 'package.json';
+            if (changedPath.toLowerCase().endsWith('.json') || isTransformConfig) {
+                watchGraphDirty = true;
+            }
+            if (isTransformConfig || isPackageManifest) configCacheDirty = true;
+
+            if (changedPath.toLowerCase().endsWith('.svelte')) {
+                if (event === 'unlink') {
+                    moduleGraphSignatures.delete(normalizedChangedPath);
+                    workspaceIndexDirty = true;
+                } else {
+                    const nextSignature = moduleGraphSignature(changedPath);
+                    const previousSignature = moduleGraphSignatures.get(normalizedChangedPath);
+                    moduleGraphSignatures.set(normalizedChangedPath, nextSignature);
+                    // Svelte <script> imports participate in reachability just like a TS barrel.
+                    // Template/style-only edits retain the signature and remain incremental.
+                    if (event === 'add' || previousSignature !== nextSignature) {
+                        workspaceIndexDirty = true;
+                    }
+                }
+            } else if (TS_OR_JS_SOURCE_REGEX.test(changedPath)) {
+                if (event === 'unlink') {
+                    moduleGraphSignatures.delete(normalizedChangedPath);
+                    workspaceIndexDirty = true;
+                } else {
+                    const nextSignature = moduleGraphSignature(changedPath);
+                    const previousSignature = moduleGraphSignatures.get(normalizedChangedPath);
+                    moduleGraphSignatures.set(normalizedChangedPath, nextSignature);
+                    // The first observed edit is conservatively structural; after that, ordinary
+                    // leaf edits whose import/re-export graph is unchanged stay incremental.
+                    if (event === 'add' || previousSignature !== nextSignature) {
+                        workspaceIndexDirty = true;
+                    }
+                }
+            }
+        }
         clearTimeout(pending);
         pending = setTimeout(run, 1000);
     };
 
-    await run();
+    const scheduleUnlink = (changedPath: string) => {
+        schedule(changedPath, 'unlink');
+        // Chokidar drops a polling watch after unlink. Re-adding an authoritative graph target
+        // keeps config/package deletion followed by recreation observable.
+        if (explicitTargets.has(path.resolve(changedPath))) watcher.add(changedPath);
+    };
 
-    watch([], {
+    watcher = watch([], {
         ignored: (path, stats) => {
+            if (isExplicitTarget(path)) return false;
             if (
                 path.includes('node_modules') ||
                 path.includes('.git') ||
-                (stats?.isFile() && (!FILE_ENDING_REGEX.test(path) || VITE_CONFIG_REGEX.test(path)))
+                (stats?.isFile() &&
+                    (!VIRTUAL_WATCH_FILE_REGEX.test(path) || VITE_CONFIG_REGEX.test(path)))
             ) {
                 return true;
             }
@@ -565,12 +916,25 @@ async function watchWithVirtualFiles(
 
             return false;
         },
-        ignoreInitial: true
+        ignoreInitial: true,
+        // Useful on network filesystems and in constrained CI containers where native watcher
+        // handles are unavailable. Native events remain the default.
+        usePolling: process.env.SVELTE_CHECK_WATCH_POLLING === '1',
+        interval: 100
     })
-        .on('add', schedule)
-        .on('unlink', schedule)
-        .on('change', schedule)
-        .add(opts.workspaceUri.fsPath);
+        .on('add', (changedPath) => schedule(changedPath, 'add'))
+        .on('unlink', scheduleUnlink)
+        .on('change', (changedPath) => schedule(changedPath, 'change'))
+        .on('error', (error) => {
+            if (fatalWatcherError) return;
+            fatalWatcherError = true;
+            clearTimeout(pending);
+            writer.failure(error instanceof Error ? error : new Error(String(error)));
+            void watcher.close().finally(() => exitAfterFlush(1));
+        });
+    const watcherReady = new Promise<void>((resolve) => watcher.once('ready', resolve));
+    watcher.add([opts.workspaceUri.fsPath, ...explicitTargets]);
+    await Promise.all([watcherReady, run()]);
 }
 
 // `process.stdout.write` is asynchronous on non-TTY pipes, and `process.exit`
@@ -586,9 +950,8 @@ function exitAfterFlush(code: number): void {
 }
 
 parseOptions(async (opts) => {
+    const writer = instantiateWriter(opts);
     try {
-        const writer = instantiateWriter(opts);
-
         const svelteCheckOptions: SvelteCheckOptions = {
             compilerWarnings: opts.compilerWarnings,
             diagnosticSources: opts.diagnosticSources,
@@ -657,8 +1020,8 @@ parseOptions(async (opts) => {
                     : 1;
             exitAfterFlush(exitCode);
         }
-    } catch (_err) {
-        console.error(_err);
-        console.error('svelte-check failed');
+    } catch (err) {
+        writer.failure(err instanceof Error ? err : new Error(String(err)));
+        exitAfterFlush(1);
     }
 });
