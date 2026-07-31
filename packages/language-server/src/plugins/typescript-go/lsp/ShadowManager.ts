@@ -380,6 +380,9 @@ export class ShadowManager {
         const fingerprint = JSON.stringify({
             layout: SHADOW_LAYOUT_VERSION,
             svelte: this.options.snapshotOptions.version ?? 'unknown',
+            // The engine matters, not just its inputs: the Rust and JS transforms differ in
+            // whitespace, and a shadow written by one is position-garbage to the other's maps.
+            transform: this.options.snapshotOptions.transformFingerprint ?? 'js',
             options: {
                 typingsNamespace: this.options.snapshotOptions.typingsNamespace,
                 transformOnTemplateError: this.options.snapshotOptions.transformOnTemplateError,
