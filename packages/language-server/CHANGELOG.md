@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.19.4
+
+### Patch Changes
+
+-   Harden the tsgo engine across native process failures, UTF-16 document lifecycle,
+    configuration and watcher invalidation, project graphs, diagnostics, and mapped
+    editor features. Template definitions, dirty buffers, crash replay, and dependency
+    components now follow the same tested engine boundary.
+-   Use `@reintersect/load-config@0.2.2` so runtime config invalidation executes the
+    implementation shipped and tested with this server.
+
 ## 0.19.3
 
 ### Patch Changes

@@ -1,5 +1,12 @@
 # @reintersect/load-config
 
+## 0.2.2
+
+### Patch Changes
+
+-   Publish the loader under the Reintersect scope and make cache invalidation reload
+    both ESM and CommonJS Svelte config modules.
+
 ## 0.2.1
 
 ### Patch Changes

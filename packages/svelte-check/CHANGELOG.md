@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.8.3
+
+### Patch Changes
+
+-   Harden the tsgo checker project graph, shadow lifecycle, parser diagnostics, native
+    output parsing, watch invalidation, and fatal machine-output protocol. Add a
+    differential template corpus covering malformed and niche in-template syntax.
+-   Use `@reintersect/load-config@0.2.2` so config changes invalidate the same runtime
+    implementation used by the language server.
+
 ## 4.8.2
 
 ### Patch Changes
