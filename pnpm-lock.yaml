@@ -39,12 +39,12 @@ importers:
       '@jridgewell/trace-mapping':
         specifier: ^0.3.25
         version: 0.3.25
+      '@reintersect/load-config':
+        specifier: workspace:^
+        version: link:../load-config
       '@rsvelte/svelte2tsx':
         specifier: ^0.2.7
         version: 0.2.7
-      '@sveltejs/load-config':
-        specifier: workspace:^
-        version: link:../load-config
       '@vscode/emmet-helper':
         specifier: 2.8.4
         version: 2.8.4
@@ -145,12 +145,12 @@ importers:
       '@jridgewell/trace-mapping':
         specifier: ^0.3.25
         version: 0.3.25
+      '@reintersect/load-config':
+        specifier: workspace:^
+        version: link:../load-config
       '@rsvelte/svelte2tsx':
         specifier: ^0.2.7
         version: 0.2.7
-      '@sveltejs/load-config':
-        specifier: workspace:^
-        version: link:../load-config
       chokidar:
         specifier: ^4.0.1
         version: 4.0.1

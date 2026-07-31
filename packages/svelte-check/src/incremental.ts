@@ -11,7 +11,7 @@ import {
     positionAt,
     getLineOffsets
 } from 'svelte-language-server';
-import { loadConfig } from '@sveltejs/load-config';
+import { loadConfig } from '@reintersect/load-config';
 import { findFiles } from './utils';
 
 type ManifestEntry = {

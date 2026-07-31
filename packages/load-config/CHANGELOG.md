@@ -1,4 +1,4 @@
-# @sveltejs/load-config
+# @reintersect/load-config
 
 ## 0.2.1
 

@@ -1,5 +1,5 @@
 import { Logger } from '../../logger';
-import { loadConfig as loadConfigFromDirectory } from '@sveltejs/load-config';
+import { loadConfig as loadConfigFromDirectory } from '@reintersect/load-config';
 import { normalizePath } from '../../utils';
 // @ts-ignore
 import { CompileOptions } from 'svelte/types/compiler/interfaces';
@@ -70,7 +70,7 @@ export class ConfigLoader {
     private configFiles = new FileMap<SvelteConfig>();
     private configFilesAsync = new FileMap<Promise<SvelteConfig>>();
     private filePathToConfigPath = new FileMap<string>();
-    /** Also clear @sveltejs/load-config's process-wide cache on the next real load. */
+    /** Also clear @reintersect/load-config's process-wide cache on the next real load. */
     private clearUpstreamCache = false;
     /** Prevent a config load started before invalidation from repopulating the cleared maps. */
     private configRevision = 0;

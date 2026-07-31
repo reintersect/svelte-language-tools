@@ -28,7 +28,7 @@
     "dependencies": {
         "@jridgewell/trace-mapping": "^0.3.25",
         "@rsvelte/svelte2tsx": "^0.2.7",
-        "@sveltejs/load-config": "workspace:^",
+        "@reintersect/load-config": "workspace:^",
         "chokidar": "^4.0.1",
         "fdir": "^6.2.0",
         "picocolors": "^1.0.0",
