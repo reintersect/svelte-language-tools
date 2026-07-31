@@ -39,7 +39,7 @@ importers:
       '@jridgewell/trace-mapping':
         specifier: ^0.3.25
         version: 0.3.25
-      '@reintersect/load-config':
+      '@reintersect/svelte-load-config':
         specifier: workspace:^
         version: link:../load-config
       '@rsvelte/svelte2tsx':
@@ -145,7 +145,7 @@ importers:
       '@jridgewell/trace-mapping':
         specifier: ^0.3.25
         version: 0.3.25
-      '@reintersect/load-config':
+      '@reintersect/svelte-load-config':
         specifier: workspace:^
         version: link:../load-config
       '@rsvelte/svelte2tsx':

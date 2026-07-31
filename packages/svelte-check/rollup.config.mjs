@@ -63,7 +63,7 @@ export default [
             // we don't want to bundle and instead require them as dependencies
             'typescript',
             'sade',
-            '@reintersect/load-config',
+            '@reintersect/svelte-load-config',
             'svelte',
             'svelte/compiler',
             '@jridgewell/trace-mapping'

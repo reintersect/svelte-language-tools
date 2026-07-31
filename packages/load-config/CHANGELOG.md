@@ -1,4 +1,4 @@
-# @reintersect/load-config
+# @reintersect/svelte-load-config
 
 ## 0.2.2
 

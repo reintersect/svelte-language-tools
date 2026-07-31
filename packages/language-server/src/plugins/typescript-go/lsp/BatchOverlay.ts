@@ -3,7 +3,7 @@ import { createHash } from 'crypto';
 import { dirname, join } from 'path';
 import ts from 'typescript';
 import { internalHelpers, InternalHelpers } from 'svelte2tsx';
-import { loadConfig } from '@reintersect/load-config';
+import { loadConfig } from '@reintersect/svelte-load-config';
 import { Diagnostic, DiagnosticSeverity, Range } from 'vscode-languageserver';
 import { Document, getLineOffsets, offsetAt, positionAt } from '../../../lib/documents';
 import { configLoader } from '../../../lib/documents/configLoader';
