@@ -12,16 +12,26 @@ import { SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
  * Directory each package gets for its generated twins, plus — in the package being checked —
  * the overlay tsconfig.
  *
- * A dot-directory at the package root, deliberately not somewhere under `node_modules`:
- * TypeScript treats anything inside `node_modules` as an external library source, and shadows
- * placed there fail to resolve ordinary dependencies (`Cannot find module 'runed'`). This
- * mirrors what `.svelte-kit` already does, so it is a familiar thing to see and to gitignore —
- * and it writes its own `.gitignore` regardless.
+ * `node_modules/.cache` is the conventional home for derived artifacts (babel, eslint and
+ * friends all use it): ignored by git and search tools without any `.gitignore` of ours, and
+ * swept away by a clean install. The historical "shadows in `node_modules` cannot resolve
+ * dependencies" failure was an artifact of the old layout, where one overlay under the *app*
+ * held every package's shadows — under pnpm a sibling package's dependencies are not in the
+ * app's `node_modules`, so those shadows resolved nothing. The mirror now sits inside the
+ * package it mirrors, where the upward walk finds that package's own dependencies first.
  */
-const OVERLAY_DIR = '.svelte-ls-overlay';
+const OVERLAY_DIR = 'node_modules/.cache/svelte-lsp';
+/** The previous overlay location; removed when found with our fingerprint inside. */
+const LEGACY_OVERLAY_DIR = '.svelte-ls-overlay';
 const SHADOW_ROOT = 'svelte';
 /** Bump when the shadow tree's layout changes, to invalidate every shadow on disk. */
-const SHADOW_LAYOUT_VERSION = 2;
+const SHADOW_LAYOUT_VERSION = 3;
+/**
+ * Mirror subdirectory for the rare file that sits outside the source root entirely. A distinct
+ * prefix keeps the shadow→original mapping invertible without probing the filesystem: everything
+ * else in a mirror is source-root-relative.
+ */
+const OUTSIDE_ROOT = '__outside';
 
 export interface ShadowManagerOptions {
     /** Directory of the user's tsconfig — the project root for our purposes. */
@@ -68,6 +78,21 @@ export interface ShadowManagerOptions {
      * element mismatches `HTMLProps<...>` and every component's props degrade to `any`.
      */
     resolveShims?: (packageRoot: string) => string[];
+    /**
+     * When false, this manager writes shadows but never a tsconfig — and actively removes one it
+     * finds in its own overlay. For the registry's fallback manager: a file outside every project
+     * still needs a shadow so navigation into it maps, but a config generated from no tsconfig
+     * describes a program of nothing, and at a workspace root it also *wins* tsgo's ancestor walk
+     * for any shadow whose own package has no config — which is how every such file ended up in
+     * an empty three-shim project instead of a real one.
+     */
+    writeConfig?: boolean;
+    /**
+     * Shared workspace `.svelte` scan. Every manager needs the same list — the walk is over
+     * `sourceRoot`, which in a monorepo is the workspace root for all of them — and without
+     * sharing, opening files in N packages costs N full recursive scans of the same tree.
+     */
+    workspaceSvelteFiles?: () => string[];
 }
 
 /** A SvelteKit file's generated twin, with what's needed to map positions back. */
@@ -90,13 +115,6 @@ export class ShadowManager {
         string,
         { sourceText: string; snapshot: SvelteDocumentSnapshot }
     >();
-    private readonly ensuredDirs = new Set<string>();
-    /**
-     * Source roots, longest first. TypeScript re-bases a failed relative resolution using the
-     * *longest* matching `rootDirs` entry, so shadow paths have to be built the same way or the
-     * lookup lands in the wrong place and silently falls back to `declare module '*.svelte'`.
-     */
-    private rootDirsLongestFirst: string[] = [];
     /**
      * The `.svelte` files the user's own tsconfig resolves to, as opposed to every `.svelte`
      * file that needs a shadow. The two differ by a lot: shadows are written for the whole
@@ -125,18 +143,21 @@ export class ShadowManager {
     private readonly mirrorRoots = new Map<string, string>();
     private readonly packageRootByDir = new Map<string, string>();
     private readonly originalByShadowPath = new Map<string, string>();
+    /** Stamp of the last text written per shadow, so identical rewrites can be skipped. */
+    private readonly lastWritten = new Map<string, string>();
     /** False when the transform's output could have changed since the shadows were written. */
     private fingerprintValid = false;
 
     constructor(private readonly options: ShadowManagerOptions) {
         this.overlayPath = join(options.projectPath, OVERLAY_DIR);
         this.overlayTsconfigPath = join(this.overlayPath, 'tsconfig.json');
-        this.rootDirsLongestFirst = [normalizePath(options.sourceRoot)];
         this.packageRoot = findPackageRoot(options.projectPath, options.sourceRoot);
         // The project's own mirror. Named separately because it is the one the overlay tsconfig
         // sits beside, and the one the LSP writes editor-open shadows into.
         this.shadowRoot = normalizePath(join(this.packageRoot, OVERLAY_DIR, SHADOW_ROOT));
         this.mirrorRoots.set(normalizePath(this.packageRoot), this.shadowRoot);
+        removeLegacyOverlay(normalizePath(options.projectPath));
+        removeLegacyOverlay(normalizePath(this.packageRoot));
     }
 
     /** Set the per-package shim resolver after construction (it needs the manager's paths). */
@@ -156,15 +177,31 @@ export class ShadowManager {
         return normalizePath(this.options.sourceRoot);
     }
 
-    /** The rootDir a file resolves against: the longest one that contains it. */
-    private rootDirFor(filePath: string): string {
+    /**
+     * A file's position inside a mirror: its path relative to the source root.
+     *
+     * Deliberately a pure function of the file and the source root, and nothing about *this*
+     * manager. Shadow paths used to be derived from the writing manager's tsconfig `rootDirs`,
+     * which meant two managers computed two different twins for the same component, listed each
+     * other's non-existent paths in their configs, and deleted each other's trees when pruning —
+     * the whole reason a monorepo opened at its root fell apart. Source-root-relative paths are
+     * also globally unique, so a failed relative import can never rootDirs-bridge into a
+     * *different* package that happens to share the same internal layout.
+     */
+    private mirrorRelFor(filePath: string): string {
         const normalized = normalizePath(filePath);
-        for (const root of this.rootDirsLongestFirst) {
-            if (normalized === root || normalized.startsWith(root + '/')) {
-                return root;
-            }
+        const rel = relative(this.sourceRoot, normalized);
+        if (!rel.startsWith('..') && !isAbsolute(rel)) {
+            return rel;
         }
-        return normalizePath(this.options.sourceRoot);
+        // Outside the source root entirely (a globally linked dependency, a stray open file).
+        // Nest the *absolute* path under a marker directory: invertible without guessing, and
+        // — combined with mirrorRootFor sending these to the manager's own mirror — nothing is
+        // ever written into a repository the user did not open.
+        const encoded = normalized.startsWith('/')
+            ? normalized.slice(1)
+            : normalized.replace(':', '');
+        return join(OUTSIDE_ROOT, encoded);
     }
 
     /**
@@ -182,12 +219,20 @@ export class ShadowManager {
      *   foreign mirror is the app's, and it has never heard of `#lib`. Another 356.
      *
      * Putting each package's mirror *inside that package* makes both resolve natively, with no
-     * aliasing at all: the walk up from `<pkg>/.svelte-ls-overlay/svelte/...` reaches `<pkg>`
+     * aliasing at all: the walk up from `<pkg>/node_modules/.cache/svelte-lsp/svelte/...` reaches `<pkg>`
      * before anything else. The alternative — declaring these in the overlay's `paths` — cannot
      * work, because `paths` is one flat table for the whole project while `imports` is
      * per-package, so a global `#*` on one package's behalf retargets every other package's.
      */
     private mirrorRootFor(filePath: string): string {
+        const normalized = normalizePath(filePath);
+        const rel = relative(this.sourceRoot, normalized);
+        if (rel.startsWith('..') || isAbsolute(rel)) {
+            // A file outside the workspace must not get a mirror in its own (foreign) package —
+            // that would write into a repository the user never opened. It shadows into this
+            // manager's own mirror under the __outside marker instead.
+            return this.shadowRoot;
+        }
         return this.mirrorRootIn(this.packageRootOf(filePath));
     }
 
@@ -198,6 +243,7 @@ export class ShadowManager {
         if (!mirror) {
             mirror = normalizePath(join(packageRoot, OVERLAY_DIR, SHADOW_ROOT));
             this.mirrorRoots.set(packageRoot, mirror);
+            removeLegacyOverlay(packageRoot);
         }
         return mirror;
     }
@@ -219,12 +265,13 @@ export class ShadowManager {
      * the path of the opened file, so a shadow sitting in the user's own source tree would be
      * assigned to the user's tsconfig — where `.svelte` imports fall back to the ambient
      * `declare module '*.svelte'` and every component's props degrade to `any`. The path within
-     * the mirror is relative to the file's `rootDirs` entry, which is what lets a failed relative
-     * import bridge back to the real tree.
+     * the mirror is the file's source-root-relative path (see {@link mirrorRelFor}), bridged back
+     * to the real tree by the `sourceRoot` ↔ mirror pairing in the overlay's `rootDirs`.
      */
     getShadowPath(svelteFilePath: string): string {
-        const rel = relative(this.rootDirFor(svelteFilePath), svelteFilePath);
-        const shadowPath = normalizePath(join(this.mirrorRootFor(svelteFilePath), `${rel}.tsx`));
+        const shadowPath = normalizePath(
+            join(this.mirrorRootFor(svelteFilePath), `${this.mirrorRelFor(svelteFilePath)}.tsx`)
+        );
         this.originalByShadowPath.set(shadowPath, normalizePath(svelteFilePath));
         return shadowPath;
     }
@@ -244,20 +291,31 @@ export class ShadowManager {
             return undefined;
         }
         // Not seen this run — a shadow left over from a previous one, or a path arriving from
-        // the client. Work it back out from whichever mirror contains it.
+        // the client. The layout is invertible: rebase the mirror-relative path onto the source
+        // root (or, for the __outside marker, onto the mirror's own package).
         for (const mirror of this.mirrorRoots.values()) {
             if (!normalized.startsWith(mirror + '/')) {
                 continue;
             }
             const rel = normalized.slice(mirror.length + 1, -'.tsx'.length);
-            for (const candidate of this.rootDirsLongestFirst) {
-                const guess = normalizePath(join(candidate, rel));
-                if (this.snapshots.has(guess) || fs.existsSync(guess)) {
-                    return guess;
-                }
+            const guess = this.originalForMirrorRel(mirror, rel);
+            if (guess && (this.snapshots.has(guess) || fs.existsSync(guess))) {
+                return guess;
             }
         }
         return undefined;
+    }
+
+    /** Invert {@link mirrorRelFor}: the original path a mirror-relative entry stands for. */
+    private originalForMirrorRel(_mirror: string, rel: string): string | undefined {
+        if (rel.startsWith(`${OUTSIDE_ROOT}/`)) {
+            // The marker carries the absolute path (drive-letter form on Windows).
+            const encoded = rel.slice(OUTSIDE_ROOT.length + 1);
+            return normalizePath(
+                process.platform === 'win32' ? `${encoded[0]}:${encoded.slice(1)}` : `/${encoded}`
+            );
+        }
+        return normalizePath(join(this.sourceRoot, rel));
     }
 
     getSnapshot(svelteFilePath: string): SvelteDocumentSnapshot | undefined {
@@ -313,6 +371,10 @@ export class ShadowManager {
     /**
      * Compare the current transform fingerprint against the one the shadows were written with,
      * and record the new one. Everything is stale when it differs.
+     *
+     * Stored once per *source root*, not per project overlay: the shadow tree is canonical and
+     * shared, so a per-project fingerprint would make the first manager for each additional
+     * package find nothing, distrust every shadow, and re-transform the entire workspace.
      */
     private checkFingerprint(): boolean {
         const fingerprint = JSON.stringify({
@@ -324,7 +386,7 @@ export class ShadowManager {
                 emitJsDoc: this.options.snapshotOptions.emitJsDoc
             }
         });
-        const target = join(this.overlayPath, '.fingerprint');
+        const target = join(this.sourceRoot, OVERLAY_DIR, '.fingerprint');
         let matched = false;
         try {
             matched = fs.readFileSync(target, 'utf8') === fingerprint;
@@ -333,7 +395,7 @@ export class ShadowManager {
         }
         if (!matched) {
             try {
-                fs.mkdirSync(this.overlayPath, { recursive: true });
+                fs.mkdirSync(dirname(target), { recursive: true });
                 fs.writeFileSync(target, fingerprint);
             } catch {
                 // If it cannot be recorded, treat every shadow as stale rather than trusting one.
@@ -411,17 +473,31 @@ export class ShadowManager {
      * remembered to open it. Only editor-open documents become overlays, where they correctly
      * shadow the on-disk copy.
      */
-    writeShadow(shadowPath: string, text: string) {
+    writeShadow(shadowPath: string, text: string): boolean {
+        const key = normalizePath(shadowPath);
+        // One keystroke fans out into half a dozen feature requests, and each of them syncs the
+        // shadow — without this, that is half a dozen synchronous whole-file writes of identical
+        // bytes per keystroke, each an mtime bump on a file tsgo is watching. The existsSync
+        // keeps the stamp honest: the tree lives under node_modules/.cache, which a clean
+        // install sweeps away mid-session, and a stamp for a file that is gone must not stop
+        // it from being recreated.
+        if (this.lastWritten.get(key) === contentStamp(text) && fs.existsSync(shadowPath)) {
+            return false;
+        }
         this.ensureShadowDirectory(shadowPath);
         try {
             fs.writeFileSync(shadowPath, text);
+            this.lastWritten.set(key, contentStamp(text));
+            return true;
         } catch (e) {
             Logger.error(`[tsgo] could not write shadow ${shadowPath}`, e);
+            return false;
         }
     }
 
     /** Delete a single shadow, e.g. when its `.svelte` source was removed. */
     removeShadow(shadowPath: string) {
+        this.lastWritten.delete(normalizePath(shadowPath));
         try {
             fs.unlinkSync(shadowPath);
         } catch {
@@ -429,9 +505,18 @@ export class ShadowManager {
         }
     }
 
-    /** Remove shadows whose `.svelte` source no longer exists, so stale roots don't error. */
+    /**
+     * Remove shadows whose `.svelte` source no longer exists, so stale roots don't error.
+     *
+     * A shadow outside the live set is only deleted when its reconstructed original is gone
+     * too. Several managers share a package's mirror — the app's manager materialises a library
+     * component's shadow and the library's own manager does the same — and each one's live set
+     * covers only what *it* wrote. Deleting on set-membership alone made every manager destroy
+     * the others' trees. Files from the pre-canonical layout reconstruct to originals that do
+     * not exist, so this also sweeps them out.
+     */
     pruneOrphanedShadows(liveShadowPaths: Set<string>) {
-        const walk = (dir: string) => {
+        const walk = (mirror: string, dir: string) => {
             let entries: fs.Dirent[];
             try {
                 entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -444,18 +529,31 @@ export class ShadowManager {
                     continue;
                 }
                 if (entry.isDirectory()) {
-                    walk(full);
-                } else if (!liveShadowPaths.has(normalizePath(full))) {
-                    try {
-                        fs.unlinkSync(full);
-                    } catch {
-                        // best effort
-                    }
+                    walk(mirror, full);
+                    continue;
+                }
+                const normalized = normalizePath(full);
+                if (liveShadowPaths.has(normalized)) {
+                    continue;
+                }
+                const rel = normalized.slice(mirror.length + 1);
+                const original = this.originalForMirrorRel(
+                    mirror,
+                    rel.endsWith('.tsx') ? rel.slice(0, -'.tsx'.length) : rel
+                );
+                if (original && fs.existsSync(original)) {
+                    continue;
+                }
+                this.lastWritten.delete(normalized);
+                try {
+                    fs.unlinkSync(full);
+                } catch {
+                    // best effort
                 }
             }
         };
         for (const mirror of this.mirrorRoots.values()) {
-            walk(mirror);
+            walk(mirror, mirror);
         }
     }
 
@@ -463,15 +561,15 @@ export class ShadowManager {
      * Create the parent directory of a shadow. tsgo resolves a never-on-disk `.tsx` only when
      * its containing directory physically exists — same-directory and rootDirs-bridged
      * resolution both fail with TS2307 when it doesn't.
+     *
+     * Deliberately not memoised: a recursive mkdir on an existing directory is one cheap
+     * syscall, and the tree sits under node_modules/.cache where an install can sweep it away
+     * behind our back — a "this exists" cache would then block every recovery write.
      */
     ensureShadowDirectory(shadowPath: string) {
         const dir = dirname(shadowPath);
-        if (this.ensuredDirs.has(dir)) {
-            return;
-        }
         try {
             fs.mkdirSync(dir, { recursive: true });
-            this.ensuredDirs.add(dir);
         } catch (e) {
             Logger.error(`[tsgo] could not create shadow directory ${dir}`, e);
         }
@@ -486,8 +584,7 @@ export class ShadowManager {
      * Note there is deliberately no `.d.ts` re-export shim: over LSP, rootDirs plus
      * allowArbitraryExtensions resolve `./Foo.svelte` straight to the `.tsx`.
      */
-    writeOverlayTsconfig(fallbackShims: string[]) {
-        const shimFiles = this.shimsFor(this.packageRoot, fallbackShims);
+    writeOverlayTsconfig(fallbackShims: string[] = []) {
         fs.mkdirSync(this.overlayPath, { recursive: true });
         this.fingerprintValid = this.checkFingerprint();
         // Discovering the mirrors has to happen before the config is written, since every one of
@@ -497,6 +594,15 @@ export class ShadowManager {
         }
         this.ensureMirror(this.shadowRoot);
 
+        if (this.options.writeConfig === false) {
+            // This manager writes shadows only — and deletes nothing. A *real* project can
+            // share this directory (an app whose tsconfig sits at the workspace root gets a
+            // fallback sibling the moment a dependency component is opened), and its overlay
+            // tsconfig must survive.
+            return;
+        }
+
+        const shimFiles = this.shimsFor(this.packageRoot, fallbackShims);
         const base = this.parseBaseConfig();
 
         const config: any = {
@@ -508,18 +614,7 @@ export class ShadowManager {
                 // TS6142 ("resolved to a .tsx file, but --jsx is not set"). `preserve` is what
                 // the JS engine's snapshots are checked under too.
                 jsx: 'preserve',
-                // `rootDirs` must be *merged*, not replaced. SvelteKit's generated config
-                // declares its own (`["..", "./types"]`) and dropping those breaks `$app/types`
-                // and every route's `./$types` import.
-                // Each mirror is paired with the real tree by the same relative path, so a
-                // failed relative import inside a shadow bridges straight back. Base entries
-                // come first: SvelteKit declares its own (`["..", "./types"]`) and a route's
-                // `./$types` has to reach `.svelte-kit/types` before anything else is tried.
-                rootDirs: [
-                    ...base.rootDirs,
-                    this.options.sourceRoot,
-                    ...new Set(this.mirrorRoots.values())
-                ]
+                rootDirs: this.overlayRootDirs(base)
             },
             // `files` carries the base's resolved file list with each .svelte entry replaced
             // by its shadow. Deliberately no `include` glob over the shadow root: in a monorepo
@@ -546,7 +641,7 @@ export class ShadowManager {
         }
 
         this.writeTsSupportConfig(base, shimFiles, paths);
-        this.writeSiblingOverlays(fallbackShims);
+        this.writeExtendsShims();
 
         if (this.options.tsconfigPath) {
             config.extends = this.options.tsconfigPath;
@@ -565,6 +660,43 @@ export class ShadowManager {
         } catch (e) {
             Logger.error(`[tsgo] could not write overlay tsconfig`, e);
         }
+    }
+
+    /**
+     * The overlay's `rootDirs`: the base config's own entries, a mirror twin for each of them,
+     * the source root, and every mirror.
+     *
+     * `rootDirs` must be *merged* with the base's, not replaced. SvelteKit's generated config
+     * declares its own (`["..", "./types"]`) and dropping those breaks `$app/types` and every
+     * route's `./$types` import.
+     *
+     * Shadows are laid out source-root-relative inside each mirror, which the `sourceRoot` ↔
+     * mirror pairing bridges. But TypeScript rebases a failed relative import against the
+     * *longest* rootDir containing the importing file, so every base entry needs a twin inside
+     * the mirror — `<mirror of B's package>/<B's path from the source root>` — or the base
+     * entries' own suffix space is unreachable from a shadow. A route shadow at
+     * `<mirror>/apps/app/src/routes/+page.svelte.tsx` sits in the twin of SvelteKit's `".."`
+     * with suffix `src/routes/…`, which is exactly what its `./$types` import needs to land in
+     * `.svelte-kit/types`. Without the twin the failed import would rebase against the whole
+     * mirror instead and never pair with the base entries at all. Base entries come first: a
+     * route's `./$types` has to reach `.svelte-kit/types` before anything else is tried.
+     */
+    private overlayRootDirs(base: { rootDirs: string[] }): string[] {
+        const baseDirs = base.rootDirs.map((d) => normalizePath(d));
+        const dirs = new Set<string>(baseDirs);
+        for (const dir of baseDirs) {
+            const rel = relative(this.sourceRoot, dir);
+            if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+                continue;
+            }
+            const mirror = this.mirrorRootIn(findPackageRoot(dir, this.sourceRoot));
+            dirs.add(normalizePath(join(mirror, rel)));
+        }
+        dirs.add(this.sourceRoot);
+        for (const mirror of this.mirrorRoots.values()) {
+            dirs.add(mirror);
+        }
+        return [...dirs];
     }
 
     /**
@@ -696,7 +828,7 @@ export class ShadowManager {
      * its generated config):
      *
      * ```jsonc
-     * { "extends": ["./.svelte-kit/tsconfig.json", "./.svelte-ls-overlay/tsconfig.ts-support.json"] }
+     * { "extends": ["./.svelte-kit/tsconfig.json", "./node_modules/.cache/svelte-lsp/tsconfig.ts-support.json"] }
      * ```
      *
      * Freshness is save-granular: shadows are rewritten when a file changes on disk, so a `.ts`
@@ -715,11 +847,7 @@ export class ShadowManager {
                 allowImportingTsExtensions: true,
                 jsx: 'preserve',
                 // Replaces rather than merges, hence carrying the project's own entries through.
-                rootDirs: [
-                    ...base.rootDirs,
-                    this.options.sourceRoot,
-                    ...new Set(this.mirrorRoots.values())
-                ],
+                rootDirs: this.overlayRootDirs(base),
                 ...(Object.keys(paths).length ? { paths } : {})
             },
             // The svelte2tsx shims. `files` and `include` are independent, so a project that
@@ -743,96 +871,73 @@ export class ShadowManager {
         }
     }
 
-    /**
-     * Give every other workspace package that owns components its own overlay project.
-     *
-     * tsgo picks a file's project purely by walking up from its path, so a shadow under
-     * `packages/ui/.svelte-ls-overlay/svelte/` lands in whatever tsconfig sits above it — and
-     * without one of ours, that is `packages/ui/tsconfig.json`, which has never heard of the
-     * svelte2tsx shims. Opening a component from a sibling package then reports
-     * `Cannot find name 'svelteHTML'` on every file: fast, because the project is small, and
-     * wrong, because it is the wrong project.
-     *
-     * Writing an overlay next to each mirror fixes that, and buys the thing that actually makes
-     * editing quick. TypeScript discards its whole type checker on any program change, so the
-     * cost of a keystroke is the cost of rebuilding the types the *program* needs — measured at
-     * ~300ms in a ~10,300-file app against ~18ms in a ~2,900-file library. Editing a component in
-     * a sibling package now re-checks that package's program instead of the app's.
-     *
-     * Skips anything under `node_modules`: a dependency's components are never opened in the
-     * editor, so they need a mirror to resolve into but not a project of their own.
-     */
     private shimsFor(packageRoot: string, fallback: string[]): string[] {
         const resolved = this.options.resolveShims?.(packageRoot);
         return resolved?.length ? resolved : fallback;
     }
 
-    private writeSiblingOverlays(fallbackShims: string[]) {
+    /**
+     * Give a mirror whose package has *no tsconfig of its own* a config tsgo can still find.
+     *
+     * tsgo discovers a file's project by walking up from the opened shadow's path, and that walk
+     * only passes through the shadow's own package — an overlay tsconfig sitting at a project
+     * root higher up is a sibling of the walk, never on it. A package with its own tsconfig gets
+     * a full overlay from its own manager the moment one of its files is opened; a package
+     * without one belongs to an enclosing project, so it gets a pure-`extends` pointer at that
+     * project's overlay. `files`, `rootDirs` and `paths` in the overlay are all absolute, so the
+     * pointer inherits them unchanged and tsgo's containment check passes.
+     *
+     * Notably this replaces the old behaviour of every manager rewriting every *other* package's
+     * overlay with a full config computed in its own layout — the mechanism by which two open
+     * packages used to corrupt each other's projects.
+     */
+    private writeExtendsShims() {
+        const ownTsconfig = this.options.tsconfigPath
+            ? normalizePath(this.options.tsconfigPath)
+            : undefined;
+        if (!ownTsconfig) {
+            return;
+        }
         for (const packageRoot of this.svelteOwningPackages()) {
             if (
-                normalizePath(packageRoot) === normalizePath(this.packageRoot) ||
+                packageRoot === normalizePath(this.packageRoot) ||
                 packageRoot.includes('/node_modules/')
             ) {
                 continue;
             }
-            // Only a config the package actually owns. `findConfigFile` walks upward, so without
-            // this check a package with no tsconfig would adopt the monorepo root's and inherit
-            // an unrelated file list.
-            const tsconfigPath = findProjectTsconfig(packageRoot);
-            if (!tsconfigPath || !normalizePath(tsconfigPath).startsWith(packageRoot + '/')) {
+            // Only packages this project is actually the nearest project *for*. A package with
+            // its own tsconfig is its own project; one whose nearest config belongs to a
+            // different (closer) project is that project's to describe.
+            const nearest = findProjectTsconfig(packageRoot);
+            if (!nearest || normalizePath(nearest) !== ownTsconfig) {
                 continue;
             }
 
             try {
-                const base = this.parseBaseConfig(tsconfigPath, packageRoot);
-                const config: any = {
-                    extends: tsconfigPath,
-                    compilerOptions: {
-                        allowArbitraryExtensions: true,
-                        allowImportingTsExtensions: true,
-                        noEmit: true,
-                        jsx: 'preserve',
-                        rootDirs: [
-                            ...base.rootDirs,
-                            this.options.sourceRoot,
-                            ...new Set(this.mirrorRoots.values())
-                        ]
-                    },
-                    files: [...base.fileNames, ...this.shimsFor(packageRoot, fallbackShims)]
-                };
-                const paths = this.overlayPaths(base);
-                if (Object.keys(paths).length) {
-                    config.compilerOptions.paths = paths;
-                }
-
                 const overlayDir = join(packageRoot, OVERLAY_DIR);
-                fs.mkdirSync(overlayDir, { recursive: true });
                 const target = join(overlayDir, 'tsconfig.json');
-                const contents = JSON.stringify(config, null, 4);
+                const contents = JSON.stringify({ extends: this.overlayTsconfigPath }, null, 4);
+                fs.mkdirSync(overlayDir, { recursive: true });
                 if (!fs.existsSync(target) || fs.readFileSync(target, 'utf8') !== contents) {
                     fs.writeFileSync(target, contents);
                 }
             } catch (e) {
-                Logger.debug(`[tsgo] could not write a sibling overlay for ${packageRoot}`, e);
+                Logger.debug(`[tsgo] could not write an extends shim for ${packageRoot}`, e);
             }
         }
     }
 
     /**
-     * Create a mirror directory and mark it ignored.
+     * Create a mirror directory.
      *
      * Deliberately nothing else: no package.json, no links. The mirror sits inside the package
-     * it mirrors, so the upward walk for `node_modules` and for the nearest package.json passes
-     * straight through it and lands on the real ones.
+     * it mirrors — under `node_modules/.cache`, which git and search tools already ignore — so
+     * the upward walk for `node_modules` and for the nearest package.json passes straight
+     * through it and lands on the real ones.
      */
     private ensureMirror(mirrorRoot: string) {
         try {
             fs.mkdirSync(mirrorRoot, { recursive: true });
-            // Self-ignoring, so no package has to remember to add this to its own .gitignore.
-            const ignore = join(dirname(mirrorRoot), '.gitignore');
-            if (!fs.existsSync(ignore)) {
-                fs.writeFileSync(ignore, '*\n');
-            }
         } catch (e) {
             Logger.debug(`[tsgo] could not create mirror ${mirrorRoot}`, e);
         }
@@ -868,7 +973,10 @@ export class ShadowManager {
             ...this.findDependencySvelteFiles()
         ]) {
             let dir = dirname(filePath);
-            while (dir.length >= sourceRoot.length && !seenDirs.has(dir)) {
+            // Containment, not a length comparison: a path in an unrelated tree that merely
+            // *is as long as* the source root must not mint a package here — that is how a
+            // mirror once ended up inside a different repository.
+            while ((dir === sourceRoot || dir.startsWith(sourceRoot + '/')) && !seenDirs.has(dir)) {
                 seenDirs.add(dir);
                 if (fs.existsSync(join(dir, 'package.json'))) {
                     roots.add(normalizePath(dir));
@@ -898,8 +1006,8 @@ export class ShadowManager {
         if (normalized.includes(`/${OVERLAY_DIR}/`)) {
             return undefined;
         }
-        const rel = relative(this.rootDirFor(normalized), normalized);
-        if (rel.startsWith('..')) {
+        const rel = relative(this.sourceRoot, normalized);
+        if (rel.startsWith('..') || isAbsolute(rel)) {
             return undefined;
         }
         return normalizePath(join(this.mirrorRootFor(normalized), rel));
@@ -909,22 +1017,15 @@ export class ShadowManager {
      * Resolve the user's config far enough to know which files it pulls in and what its
      * `rootDirs` are, so the overlay can extend both rather than overwrite them.
      */
-    private parseBaseConfig(
-        tsconfigOverride?: string,
-        projectRoot?: string
-    ): {
+    private parseBaseConfig(): {
         rootDirs: string[];
         fileNames: string[];
         paths: Record<string, string[]>;
         pathsBasePath: string | undefined;
     } {
-        // Without an override this is the project the server was opened for, and the parse also
-        // establishes instance state (`rootDirsLongestFirst`, `projectSvelteFiles`). With one it
-        // is a sibling package getting its own overlay, and must not disturb either.
-        const isPrimary = !tsconfigOverride;
-        const tsconfigPath = tsconfigOverride ?? this.options.tsconfigPath;
+        const tsconfigPath = this.options.tsconfigPath;
         const fallback = {
-            rootDirs: [projectRoot ?? this.options.projectPath],
+            rootDirs: [this.options.projectPath],
             fileNames: [] as string[],
             paths: {} as Record<string, string[]>,
             pathsBasePath: undefined as string | undefined
@@ -957,16 +1058,7 @@ export class ShadowManager {
 
             const rootDirs = parsed.options.rootDirs?.length
                 ? parsed.options.rootDirs.map((d) => normalizePath(d))
-                : [projectRoot ?? this.options.projectPath];
-
-            // Must be set before the fileNames below are mapped: getShadowPath depends on it,
-            // or the `files` list would name shadows at paths we never write to. Only the primary
-            // parse may set it — a sibling package's rootDirs would move every shadow path.
-            if (isPrimary) {
-                this.rootDirsLongestFirst = [
-                    ...new Set([...rootDirs, normalizePath(this.options.sourceRoot)])
-                ].sort((a, b) => b.length - a.length);
-            }
+                : [this.options.projectPath];
 
             // Substitute each .svelte entry with its shadow. tsgo cannot parse the real file,
             // and the shadows must be listed explicitly: they never exist on disk, so an
@@ -983,11 +1075,9 @@ export class ShadowManager {
                     : (this.writeKitShadow(normalized) ?? normalized);
             });
 
-            if (isPrimary) {
-                this.projectSvelteFiles = parsed.fileNames
-                    .filter((f) => f.endsWith('.svelte'))
-                    .map((f) => normalizePath(f));
-            }
+            this.projectSvelteFiles = parsed.fileNames
+                .filter((f) => f.endsWith('.svelte'))
+                .map((f) => normalizePath(f));
 
             return {
                 rootDirs,
@@ -1148,7 +1238,7 @@ export class ShadowManager {
         // Same layout as a `.svelte` shadow, minus the added extension — the name has to stay
         // `+page.ts` because `upsertKitFile` keys its behaviour off the basename.
         const shadowPath = normalizePath(
-            join(this.mirrorRootFor(filePath), relative(this.rootDirFor(filePath), filePath))
+            join(this.mirrorRootFor(filePath), this.mirrorRelFor(filePath))
         );
         this.writeShadow(shadowPath, result.text);
 
@@ -1164,41 +1254,90 @@ export class ShadowManager {
 
     /** Every `.svelte` file under the source root, which all need shadows. */
     findProjectSvelteFiles(): string[] {
+        // Prefer the registry-shared scan: the walk is over the workspace root, which is the
+        // same directory for every manager, and re-walking it once per opened package is the
+        // bulk of a first request's latency in a monorepo.
+        if (this.options.workspaceSvelteFiles) {
+            return this.options.workspaceSvelteFiles();
+        }
         // Memoised: the overlay config needs this list to work out which packages' subpath
         // imports to mirror, and the caller needs it again to write the shadows.
         if (this.projectSvelteFileScan) {
             return this.projectSvelteFileScan;
         }
-        const found: string[] = [];
-        const excluded = new Set(['node_modules', '.git', '.svelte-kit', 'dist', 'build']);
-        const walk = (dir: string, depth: number) => {
-            if (depth > 12) {
-                return;
-            }
-            let entries: fs.Dirent[];
-            try {
-                entries = fs.readdirSync(dir, { withFileTypes: true });
-            } catch {
-                return;
-            }
-            for (const entry of entries) {
-                if (entry.name.startsWith('.') && entry.name !== '.svelte-kit') {
-                    continue;
-                }
-                const full = join(dir, entry.name);
-                if (entry.isDirectory()) {
-                    if (!excluded.has(entry.name)) {
-                        walk(full, depth + 1);
-                    }
-                } else if (entry.name.endsWith('.svelte')) {
-                    found.push(normalizePath(full));
-                }
-            }
-        };
-        walk(this.options.sourceRoot, 0);
-        this.projectSvelteFileScan = found;
-        return found;
+        this.projectSvelteFileScan = scanWorkspaceSvelteFiles(this.options.sourceRoot);
+        return this.projectSvelteFileScan;
     }
+}
+
+/** Every `.svelte` file under a source root. One full recursive walk — share the result. */
+export function scanWorkspaceSvelteFiles(sourceRoot: string): string[] {
+    const found: string[] = [];
+    const excluded = new Set(['node_modules', '.git', '.svelte-kit', 'dist', 'build']);
+    const walk = (dir: string, depth: number) => {
+        if (depth > 12) {
+            return;
+        }
+        let entries: fs.Dirent[];
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const entry of entries) {
+            if (entry.name.startsWith('.') && entry.name !== '.svelte-kit') {
+                continue;
+            }
+            const full = join(dir, entry.name);
+            if (entry.isDirectory()) {
+                if (!excluded.has(entry.name)) {
+                    walk(full, depth + 1);
+                }
+            } else if (entry.name.endsWith('.svelte')) {
+                found.push(normalizePath(full));
+            }
+        }
+    };
+    walk(sourceRoot, 0);
+    return found;
+}
+
+/**
+ * Delete a package's overlay from the era when it lived at `<pkg>/.svelte-ls-overlay`.
+ *
+ * Guarded on the markers only this code ever created — the fingerprint file, or a `svelte`
+ * mirror *directory* together with the generated tsconfig — so an unrelated directory that
+ * happens to share the name survives.
+ */
+function removeLegacyOverlay(packageRoot: string) {
+    const legacy = join(packageRoot, LEGACY_OVERLAY_DIR);
+    try {
+        const looksLikeOurs =
+            fs.existsSync(join(legacy, '.fingerprint')) ||
+            (fs.statSync(join(legacy, SHADOW_ROOT), { throwIfNoEntry: false })?.isDirectory() ===
+                true &&
+                fs.existsSync(join(legacy, 'tsconfig.json')));
+        if (!looksLikeOurs) {
+            return;
+        }
+        fs.rmSync(legacy, { recursive: true, force: true });
+        Logger.log(`[tsgo] removed legacy overlay ${legacy}`);
+    } catch (e) {
+        Logger.debug(`[tsgo] could not remove legacy overlay ${legacy}`, e);
+    }
+}
+
+/**
+ * Cheap identity for a shadow's text: length plus an FNV-1a hash. Retaining the text itself
+ * would keep the whole generated tree in memory just to skip rewrites.
+ */
+function contentStamp(text: string): string {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return `${text.length}:${hash >>> 0}`;
 }
 
 /** Nearest ancestor of `from` (inclusive) holding a package.json, bounded by `stopAt`. */

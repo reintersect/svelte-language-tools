@@ -217,6 +217,11 @@ export function startServer(options?: LSOptions) {
         const tsGoPlugin = isTsGoEnabled(evt.initializationOptions)
             ? createTsGoPlugin({
                   workspacePath: urlToPath(normalizedWorkspaceUris[0] ?? '') ?? process.cwd(),
+                  // Every folder, not just the first: project resolution is bounded by these,
+                  // and a multi-root workspace must not lose its other folders' projects.
+                  workspacePaths: normalizedWorkspaceUris
+                      .map((uri) => urlToPath(uri))
+                      .filter((path): path is string => !!path),
                   docManager
               })
             : undefined;

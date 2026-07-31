@@ -96,8 +96,10 @@ go through tsgo too.
 
 - **No refactorings.** TypeScript 7 does not implement `refactor` code actions yet, so "Extract to
   function", "Move to file" and friends are absent. Quickfixes work, but not all of them.
-- **A `.svelte-ls-overlay` directory** appears in each package that has components. It holds the
-  generated `.tsx` twins tsgo type-checks, and it gitignores itself. Deleting it is always safe.
+- **A `node_modules/.cache/svelte-lsp` directory** appears in each package that has components. It
+  holds the generated `.tsx` twins tsgo type-checks; being under `node_modules/.cache` it is
+  already ignored by git and search tools. Deleting it is always safe. (Older builds used a
+  visible `.svelte-ls-overlay` directory instead — the server removes those on sight.)
 - **`.ts` files still use the JavaScript engine.** `typescript-svelte-plugin` has no tsgo migration
   path, so Svelte intellisense inside plain `.ts` files is unchanged from upstream.
 

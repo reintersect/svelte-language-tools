@@ -3,7 +3,7 @@ import ts from 'typescript';
 import { Logger } from '../../../logger';
 import { normalizePath } from '../../../utils';
 import { SvelteDocumentSnapshot } from '../../typescript/DocumentSnapshot';
-import { ShadowManager } from './ShadowManager';
+import { scanWorkspaceSvelteFiles, ShadowManager } from './ShadowManager';
 
 /**
  * The subset of {@link ShadowManager} the mapping layer needs.
@@ -16,6 +16,27 @@ import { ShadowManager } from './ShadowManager';
 export interface ShadowLookup {
     getOriginalPath(shadowPath: string): string | undefined;
     ensureSnapshot(svelteFilePath: string): SvelteDocumentSnapshot | undefined;
+}
+
+export interface ProjectRegistryOptions {
+    /**
+     * Build a manager for a project. `writeConfig` is false for the shared fallback manager,
+     * which shadows files that belong to no project (so navigation into them still maps) but
+     * must never describe a program of its own.
+     */
+    createShadows: (
+        projectRoot: string,
+        tsconfigPath: string | undefined,
+        writeConfig: boolean
+    ) => ShadowManager;
+    /**
+     * The directories the editor is opened on. Project resolution never leaves them: a tsconfig
+     * above the workspace describes someone else's project, and following it once wrote a
+     * mirror tree into an entirely different repository.
+     */
+    workspaceRoots: string[];
+    /** Used when a file sits outside any tsconfig — normally the server's own root. */
+    fallbackRoot: string;
 }
 
 /**
@@ -35,15 +56,17 @@ export class ProjectRegistry implements ShadowLookup {
     private readonly byProjectRoot = new Map<string, ShadowManager>();
     /** Resolved tsconfig per containing directory, since the walk hits the filesystem. */
     private readonly tsconfigByDir = new Map<string, string | undefined>();
+    private readonly workspaceRoots: string[];
+    /**
+     * One `.svelte` scan per source root, shared by every manager. The walk covers the whole
+     * workspace and is identical for all of them; without sharing, the first request in each
+     * newly-opened package re-walked the entire monorepo.
+     */
+    private readonly svelteFileScans = new Map<string, string[]>();
 
-    constructor(
-        private readonly createShadows: (
-            projectRoot: string,
-            tsconfigPath: string | undefined
-        ) => ShadowManager,
-        /** Used when a file sits outside any tsconfig — normally the server's own root. */
-        private readonly fallbackRoot: string
-    ) {}
+    constructor(private readonly options: ProjectRegistryOptions) {
+        this.workspaceRoots = options.workspaceRoots.map((root) => normalizePath(root));
+    }
 
     /** Every project opened so far. */
     all(): ShadowManager[] {
@@ -58,23 +81,91 @@ export class ProjectRegistry implements ShadowLookup {
      * makes an editor opened at the repo root behave differently from one opened at an app.
      */
     forFile(filePath: string): ShadowManager {
-        const dir = dirname(normalizePath(filePath));
+        const normalized = normalizePath(filePath);
+        const dir = dirname(normalized);
         let tsconfigPath = this.tsconfigByDir.get(dir);
         if (!this.tsconfigByDir.has(dir)) {
-            tsconfigPath = findNearestTsconfig(dir);
+            tsconfigPath = this.findNearestTsconfig(normalized, dir);
             this.tsconfigByDir.set(dir, tsconfigPath);
         }
 
-        const projectRoot = normalizePath(tsconfigPath ? dirname(tsconfigPath) : this.fallbackRoot);
-        const existing = this.byProjectRoot.get(projectRoot);
+        const projectRoot = normalizePath(
+            tsconfigPath ? dirname(tsconfigPath) : this.fallbackRootFor(normalized)
+        );
+        // A real project and the config-less fallback can share a directory (a workspace root
+        // with a genuine tsconfig); they must not share a manager.
+        const key = tsconfigPath ? projectRoot : `fallback:${projectRoot}`;
+        const existing = this.byProjectRoot.get(key);
         if (existing) {
             return existing;
         }
 
         Logger.log(`[tsgo] project ${projectRoot}${tsconfigPath ? '' : ' (no tsconfig)'}`);
-        const shadows = this.createShadows(projectRoot, tsconfigPath);
-        this.byProjectRoot.set(projectRoot, shadows);
+        const shadows = this.options.createShadows(projectRoot, tsconfigPath, !!tsconfigPath);
+        this.byProjectRoot.set(key, shadows);
         return shadows;
+    }
+
+    /** The shared workspace `.svelte` scan, memoised per source root. */
+    workspaceSvelteFiles(sourceRoot: string): string[] {
+        const key = normalizePath(sourceRoot);
+        let scan = this.svelteFileScans.get(key);
+        if (!scan) {
+            scan = scanWorkspaceSvelteFiles(key);
+            this.svelteFileScans.set(key, scan);
+        }
+        return scan;
+    }
+
+    /** Forget the workspace scans, e.g. when a `.svelte` file is created or deleted. */
+    invalidateWorkspaceScans() {
+        this.svelteFileScans.clear();
+    }
+
+    /**
+     * Nearest `tsconfig.json`/`jsconfig.json` at or above a directory — bounded the same way
+     * the JS engine's `findTsConfigPath` is.
+     *
+     * `ts.findConfigFile` walks upward without limits, and unbounded is wrong in both
+     * directions: above the workspace it adopts a config from a tree the user never opened,
+     * and from inside `node_modules` it lets a dependency's file mint a whole project around
+     * a config that was never meant to be one.
+     */
+    private findNearestTsconfig(filePath: string, dir: string): string | undefined {
+        const tsconfig = ts.findConfigFile(dir, ts.sys.fileExists, 'tsconfig.json') ?? '';
+        const jsconfig = ts.findConfigFile(dir, ts.sys.fileExists, 'jsconfig.json') ?? '';
+        // Prefer the closest of the two.
+        const found = tsconfig.length >= jsconfig.length ? tsconfig : jsconfig;
+        if (!found) {
+            return undefined;
+        }
+        const config = normalizePath(found);
+        if (!this.workspaceRoots.some((root) => isWithin(root, config))) {
+            return undefined;
+        }
+        // A config *inside* node_modules never becomes a project: dependencies routinely ship
+        // their tsconfig, and minting a manager for one means writing overlays into the store.
+        if (config.split('/').includes('node_modules')) {
+            return undefined;
+        }
+        // Nor may a config be adopted *across* a node_modules boundary: a file inside
+        // node_modules does not belong to the enclosing user project.
+        const configDir = dirname(config);
+        const below = isWithin(configDir, filePath)
+            ? filePath.slice(configDir.length + 1)
+            : filePath;
+        if (below.split('/').includes('node_modules')) {
+            return undefined;
+        }
+        return config;
+    }
+
+    /** The workspace root a file belongs to, for files that resolve to no project. */
+    private fallbackRootFor(filePath: string): string {
+        return (
+            this.workspaceRoots.find((root) => isWithin(root, filePath)) ??
+            normalizePath(this.options.fallbackRoot)
+        );
     }
 
     /** Search every open project for the one that owns a generated path. */
@@ -109,16 +200,7 @@ export class ProjectRegistry implements ShadowLookup {
     }
 }
 
-/**
- * Nearest `tsconfig.json`/`jsconfig.json` at or above a directory.
- *
- * `ts.findConfigFile` walks upward and stops at the first hit, which is exactly the semantics
- * wanted — but it does not stop at a package boundary, so a package without its own config
- * adopts its parent's. That matches how `tsc` itself would treat those files.
- */
-function findNearestTsconfig(dir: string): string | undefined {
-    const found =
-        ts.findConfigFile(dir, ts.sys.fileExists, 'tsconfig.json') ??
-        ts.findConfigFile(dir, ts.sys.fileExists, 'jsconfig.json');
-    return found ? normalizePath(found) : undefined;
+/** Whether `path` is `root` or inside it. Both must be normalized. */
+function isWithin(root: string, path: string): boolean {
+    return path === root || path.startsWith(root + '/');
 }

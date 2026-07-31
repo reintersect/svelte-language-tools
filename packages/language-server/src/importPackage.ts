@@ -57,8 +57,8 @@ export function importPrettier(fromPath: string): typeof prettier {
     return dynamicRequire(main);
 }
 
-export function importSvelte(fromPath: string): typeof svelte {
-    const pkg = getPackageInfo('svelte', fromPath);
+export function importSvelte(fromPath: string, use_fallback = true): typeof svelte {
+    const pkg = getPackageInfo('svelte', fromPath, use_fallback);
     const main = resolve(pkg.path, 'compiler');
     Logger.debug('Using Svelte v' + pkg.version.full, 'from', main);
     if (pkg.version.major === 4) {

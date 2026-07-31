@@ -44,7 +44,7 @@ export function parseOptions(cb: (opts: SvelteCheckCliOptions) => any) {
         )
         .option(
             '--tsgo',
-            'Use tsgo for TypeScript diagnostics, through the same overlay the language server uses. Requires a tsconfig/jsconfig and writes transpiled Svelte files to a .svelte-ls-overlay directory in each package that has components',
+            'Use tsgo for TypeScript diagnostics, through the same overlay the language server uses. Requires a tsconfig/jsconfig and writes transpiled Svelte files to node_modules/.cache/svelte-lsp in each package that has components',
             false
         )
         .option('--tsgo-experimental-api', 'Deprecated alias for --tsgo.', false)
