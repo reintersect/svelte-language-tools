@@ -1,5 +1,12 @@
 # @reintersect/svelte-load-config
 
+## 0.2.3
+
+### Patch Changes
+
+-   Publish the config runtime under the clearer `@reintersect/svelte-load-config`
+    package name.
+
 ## 0.2.2
 
 ### Patch Changes

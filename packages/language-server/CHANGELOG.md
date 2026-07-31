@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.5
+
+### Patch Changes
+
+-   Use `@reintersect/svelte-load-config@0.2.3` as the scoped config runtime.
+
 ## 0.19.4
 
 ### Patch Changes
