@@ -21,6 +21,15 @@ export class TsGoComponentInfo {
      * would be repaid with an identical answer each time.
      */
     private readonly cache = new Map<string, { token: string; parts: ComponentPartInfo }>();
+    /**
+     * Where a tag name in a given usage file declares its component. The identity of `<Button>`
+     * inside one file only changes when imports change — a watched-file event — while the
+     * definition lookup is an LSP round trip paid on every keystroke inside the tag otherwise.
+     */
+    private readonly definitionCache = new Map<
+        string,
+        { filePath: string; offset: number } | undefined
+    >();
 
     constructor(
         private readonly session: TsGoApiSession,
@@ -40,14 +49,23 @@ export class TsGoComponentInfo {
     /** Drop every memoised answer — a watched file changed, or tsgo restarted. */
     clearCache() {
         this.cache.clear();
+        this.definitionCache.clear();
     }
 
-    async getProps(shadowPath: string, generatedOffset: number): Promise<ComponentPartInfo> {
-        return this.getPart(shadowPath, generatedOffset, 'props');
+    async getProps(
+        shadowPath: string,
+        generatedOffset: number,
+        tagName?: string
+    ): Promise<ComponentPartInfo> {
+        return this.getPart(shadowPath, generatedOffset, 'props', undefined, tagName);
     }
 
-    async getEvents(shadowPath: string, generatedOffset: number): Promise<ComponentPartInfo> {
-        return this.getPart(shadowPath, generatedOffset, 'events');
+    async getEvents(
+        shadowPath: string,
+        generatedOffset: number,
+        tagName?: string
+    ): Promise<ComponentPartInfo> {
+        return this.getPart(shadowPath, generatedOffset, 'events', undefined, tagName);
     }
 
     async getSlotLets(
@@ -62,12 +80,24 @@ export class TsGoComponentInfo {
         shadowPath: string,
         generatedOffset: number,
         part: 'props' | 'events' | 'slots',
-        slot?: string
+        slot?: string,
+        tagName?: string
     ): Promise<ComponentPartInfo> {
         try {
             // Resolve the declaration first: it is both the anchor for the type walk and the
-            // cache key. The definition round trip is the cheap part of this path.
-            const definition = await this.definitionAt(shadowPath, generatedOffset);
+            // cache key. Memoised per (usage file, tag name) so a keystroke inside the tag
+            // costs no LSP round trip at all once the component is known.
+            const definitionKey = tagName ? `${shadowPath}::${tagName}` : undefined;
+            let definition = definitionKey ? this.definitionCache.get(definitionKey) : undefined;
+            if (
+                definition === undefined &&
+                (!definitionKey || !this.definitionCache.has(definitionKey))
+            ) {
+                definition = await this.definitionAt(shadowPath, generatedOffset);
+                if (definitionKey) {
+                    this.definitionCache.set(definitionKey, definition);
+                }
+            }
             const cacheKey = definition
                 ? `${definition.filePath}:${definition.offset}:${part}:${slot ?? ''}`
                 : undefined;

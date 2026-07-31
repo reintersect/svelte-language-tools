@@ -28,17 +28,17 @@ import { Logger } from '../../../logger';
  * never be `{}`.
  */
 function tsGoConfiguration() {
+    // Only keys with a `config:` path in tsgo's settings unmarshalling are listed — verified
+    // against the binary; `allowIncompleteCompletions`, `includePackageJsonAutoImports` and
+    // `suggest.completeFunctionCalls` have none and were silently ignored.
     return {
         preferences: {
             // 'js' would leak the shadow's own extension into inserted imports
             // (`./Button.svelte.tsx`); 'index' keeps them as `./Button.svelte`.
-            importModuleSpecifierEnding: 'index',
-            includePackageJsonAutoImports: 'auto',
-            allowIncompleteCompletions: true
+            importModuleSpecifierEnding: 'index'
         },
         suggest: {
-            autoImports: true,
-            completeFunctionCalls: false
+            autoImports: true
         },
         inlayHints: {}
     };
@@ -103,6 +103,11 @@ export class TsGoServer {
     /** The version last sent for a document, if it is open. */
     documentVersion(filePath: string): number | undefined {
         return this.versions.get(pathToUrl(filePath));
+    }
+
+    /** The text last sent for a document, if it is open — the diff base for ranged changes. */
+    getOpenText(filePath: string): string | undefined {
+        return this.openDocuments.get(pathToUrl(filePath))?.text;
     }
 
     async start(): Promise<void> {

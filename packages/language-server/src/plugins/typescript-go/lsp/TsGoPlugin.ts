@@ -38,16 +38,17 @@ import fs from 'fs';
 import {
     Document,
     DocumentManager,
+    getLineOffsets,
     getNodeIfIsInComponentStartTag,
     isInTag,
     mapRangeToGenerated,
-    mapRangeToOriginal
+    mapRangeToOriginal,
+    positionAt
 } from '../../../lib/documents';
 import { getSemanticTokenLegends } from '../../../lib/semanticToken/semanticTokenLegend';
 import { Logger } from '../../../logger';
 import { isNotNullOrUndefined, isZeroLengthRange, pathToUrl, urlToPath } from '../../../utils';
-import { SvelteDocumentSnapshot } from '../../typescript/DocumentSnapshot';
-import { isInGeneratedCode } from '../../typescript/features/utils';
+import { computeChangeRange, SvelteDocumentSnapshot } from '../../typescript/DocumentSnapshot';
 import { isInScript } from '../../typescript/utils';
 import {
     AppCompletionItem,
@@ -140,7 +141,7 @@ export class TsGoPlugin implements Plugin {
         document: Document,
         snapshot: SvelteDocumentSnapshot,
         position: Position
-    ): number | undefined {
+    ): { offset: number; tag: string | undefined } | undefined {
         if (snapshot.parserError) {
             return undefined;
         }
@@ -191,7 +192,10 @@ export class TsGoPlugin implements Plugin {
         const identifierEnd = generatedText.indexOf(')', identifierStart);
         const identifier = generatedText.slice(identifierStart, identifierEnd);
         const lastDot = identifier.lastIndexOf('.');
-        return lastDot >= 0 ? identifierStart + lastDot + 1 : identifierStart;
+        return {
+            offset: lastDot >= 0 ? identifierStart + lastDot + 1 : identifierStart,
+            tag: typeof (node as any).tag === 'string' ? (node as any).tag : undefined
+        };
     }
 
     private fallback(reason: string): null {
@@ -289,21 +293,18 @@ export class TsGoPlugin implements Plugin {
         // Only documents the editor actually has open become LSP overlays; everything else
         // lives on disk. Each didOpen costs tsgo a synchronous snapshot rebuild, so this stays
         // proportional to what the user is looking at rather than to project size.
+        //
+        // No disk write here: the on-disk shadow only feeds the editor's *TypeScript* server
+        // (ts-support config), whose freshness is documented as save-granular — the watcher
+        // path rewrites it on save. Writing per request meant several syncs per keystroke.
         const text = snapshot.getFullText();
         if (this.server.isOpen(shadowPath)) {
-            // Full-text sync for now. Ranged changes derived from computeChangeRange are a
-            // later optimisation; correctness first.
-            await this.server.updateDocument(shadowPath, [{ text }], text);
+            const previous = this.server.getOpenText(shadowPath);
+            await this.server.updateDocument(shadowPath, incrementalChanges(previous, text), text);
         } else {
             shadows.ensureShadowDirectory(shadowPath);
             await this.server.openDocument(shadowPath, text);
         }
-
-        // Keep the on-disk shadow current with the unsaved buffer, not just with the last save.
-        // Our own tsgo session reads the overlay above and does not need this — the reader is the
-        // editor's *TypeScript* server, which resolves `.svelte` imports from `.ts` files through
-        // the shadow tree (see ShadowManager.writeTsSupportConfig) and only ever sees disk.
-        shadows.writeShadow(shadowPath, text);
 
         if (TIMING) {
             timing('transform', t1 - t0);
@@ -348,6 +349,32 @@ export class TsGoPlugin implements Plugin {
         if (previousResultId === resultId) {
             return { kind: 'unchanged', resultId };
         }
+
+        // Wait for the typing burst to settle before paying for a program check: tsgo has no
+        // incremental checking, so every pull it serves costs a full re-check of the project.
+        // A pull overtaken while waiting (cancelled by the client, or the generation moved)
+        // keeps whatever is on screen; the client re-pulls when things calm down.
+        if (PULL_QUIESCENCE_MS > 0) {
+            await new Promise<void>((resolve) => {
+                const timer = setTimeout(() => {
+                    disposable?.dispose();
+                    resolve();
+                }, PULL_QUIESCENCE_MS);
+                const disposable = cancellationToken?.onCancellationRequested(() => {
+                    clearTimeout(timer);
+                    resolve();
+                });
+            });
+            if (
+                cancellationToken?.isCancellationRequested ||
+                `g${this.server.generation}` !== resultId
+            ) {
+                return previousResultId
+                    ? { kind: 'unchanged', resultId: previousResultId }
+                    : { kind: 'full', items: [] };
+            }
+        }
+
         const items = await this.collectDiagnostics(synced, cancellationToken, tStart);
         if (items === null) {
             // Cancelled or failed: never a full report with this generation's resultId — the
@@ -416,16 +443,12 @@ export class TsGoPlugin implements Plugin {
             timing('items', items.length);
         }
 
-        const generatedText = snapshot.getFullText();
-
         const mapped = items
             .map((diagnostic) => {
                 // svelte2tsx wraps its own scaffolding in Ω ignore markers. Diagnostics inside
                 // those regions are about generated code the user never wrote — reporting them
                 // is how you get "'x' is declared but never read" on an invisible variable.
-                const startOffset = snapshot.offsetAt(diagnostic.range.start);
-                const endOffset = snapshot.offsetAt(diagnostic.range.end);
-                if (isInGeneratedCode(generatedText, startOffset, endOffset)) {
+                if (inGeneratedRegion(snapshot, snapshot.offsetAt(diagnostic.range.start))) {
                     return null;
                 }
 
@@ -463,7 +486,11 @@ export class TsGoPlugin implements Plugin {
             ? this.componentOffsetAt(document, snapshot, position)
             : undefined;
         if (componentOffset !== undefined) {
-            const props = await this.componentInfo!.getProps(shadowPath, componentOffset);
+            const props = await this.componentInfo!.getProps(
+                shadowPath,
+                componentOffset.offset,
+                componentOffset.tag
+            );
             if (props.length) {
                 this.stats.served++;
                 const rendered = props.map((prop) => `  ${prop.name}: ${prop.type}`).join('\n');
@@ -514,7 +541,11 @@ export class TsGoPlugin implements Plugin {
             ? this.componentOffsetAt(document, snapshot, position)
             : undefined;
         if (componentOffset !== undefined) {
-            const props = await this.componentInfo!.getProps(shadowPath, componentOffset);
+            const props = await this.componentInfo!.getProps(
+                shadowPath,
+                componentOffset.offset,
+                componentOffset.tag
+            );
             if (props.length) {
                 this.stats.served++;
                 return {
@@ -549,10 +580,11 @@ export class TsGoPlugin implements Plugin {
         }
         this.stats.served++;
 
-        const rawItems: any[] = Array.isArray(result) ? result : (result.items ?? []);
+        const items: any[] = Array.isArray(result) ? result : (result.items ?? []);
         const uri = document.uri;
-        const items: CompletionItem[] = rawItems.map((item) => {
-            const mapped: CompletionItem = { ...item };
+        // Mutated in place: a global completion is thousands of items, and cloning each one
+        // just to attach `data` dominated the post-request time.
+        for (const item of items) {
             // `connection.onCompletionResolve` reads `item.data` as a TextDocumentIdentifier to
             // find the document the item belongs to, so an item whose data is tsgo's own payload
             // resolves against `undefined` and throws "Cannot call methods on an unopened
@@ -561,28 +593,26 @@ export class TsGoPlugin implements Plugin {
             //
             // tsgo's payload is nested rather than merged, so it round-trips back to tsgo exactly
             // as issued rather than with an extra key it never emitted.
-            mapped.data = { uri, [TSGO_DATA]: item.data };
+            item.data = { uri, [TSGO_DATA]: item.data };
             // Component completions surface as `Button__SvelteComponent_`; the user wants to
             // see and insert `Button`.
-            if (typeof mapped.label === 'string') {
-                mapped.label = stripComponentSuffix(mapped.label);
+            if (typeof item.label === 'string' && item.label.endsWith(COMPONENT_SUFFIX)) {
+                item.label = stripComponentSuffix(item.label);
             }
-            if (typeof mapped.insertText === 'string') {
-                mapped.insertText = stripComponentSuffix(mapped.insertText);
+            if (typeof item.insertText === 'string' && item.insertText.endsWith(COMPONENT_SUFFIX)) {
+                item.insertText = stripComponentSuffix(item.insertText);
             }
-            if (item.textEdit?.range) {
-                const range = mapRangeToOriginal(snapshot, item.textEdit.range);
-                mapped.textEdit =
-                    range.start.line < 0
-                        ? undefined
-                        : {
-                              ...item.textEdit,
-                              range,
-                              newText: stripComponentSuffix(item.textEdit.newText)
-                          };
+            // Rare under our capabilities (tsgo mostly omits edits), but when present it comes
+            // in either the plain `{range}` or the insert/replace shape — both in generated
+            // coordinates that must not leak to the editor.
+            if (item.textEdit) {
+                const mappedEdit = mapCompletionEdit(snapshot, item.textEdit);
+                if (mappedEdit) {
+                    mappedEdit.newText = stripComponentSuffix(mappedEdit.newText);
+                }
+                item.textEdit = mappedEdit;
             }
-            return mapped;
-        });
+        }
 
         return {
             isIncomplete: Array.isArray(result) ? false : (result.isIncomplete ?? false),
@@ -783,14 +813,33 @@ export class TsGoPlugin implements Plugin {
         }
         const { snapshot, shadowPath } = synced;
 
+        // A range request (the editor asks viewport-sized ones) maps to the generated range
+        // and lets tsgo skip most of the file — decoding and per-token mapping shrink with it.
+        // Ranges that don't survive mapping fall back to the full document. The generated range
+        // is padded a line either way so tokens at the boundary aren't clipped.
+        let generatedRange: Range | undefined;
+        if (range) {
+            const start = snapshot.getGeneratedPosition(range.start);
+            const end = snapshot.getGeneratedPosition(range.end);
+            if (start.line >= 0 && end.line >= 0) {
+                const [low, high] =
+                    start.line <= end.line ? [start.line, end.line] : [end.line, start.line];
+                generatedRange = {
+                    start: { line: Math.max(0, low - 1), character: 0 },
+                    end: { line: high + 2, character: 0 }
+                };
+            }
+        }
+
         let result: any;
         try {
-            // Always ask for the full document: a range request would need the *generated*
-            // range, and mapping a partial range risks clipping tokens at the boundary.
             result = await this.server.sendRequest(
-                'textDocument/semanticTokens/full',
+                generatedRange
+                    ? 'textDocument/semanticTokens/range'
+                    : 'textDocument/semanticTokens/full',
                 {
-                    textDocument: { uri: pathToUrl(shadowPath) }
+                    textDocument: { uri: pathToUrl(shadowPath) },
+                    ...(generatedRange ? { range: generatedRange } : {})
                 },
                 cancellationToken
             );
@@ -852,7 +901,6 @@ export class TsGoPlugin implements Plugin {
         this.stats.served++;
 
         const out: SymbolInformation[] = [];
-        const generatedText = synced.snapshot.getFullText();
         const visit = (node: any, container?: string) => {
             const selection = node.selectionRange ?? node.range ?? node.location?.range;
             if (!selection) {
@@ -869,11 +917,7 @@ export class TsGoPlugin implements Plugin {
                 node.name.startsWith('$$_') ||
                 isZeroLengthRange(mapped) ||
                 !isInScript(mapped.start, synced.snapshot) ||
-                isInGeneratedCode(
-                    generatedText,
-                    synced.snapshot.offsetAt(selection.start),
-                    synced.snapshot.offsetAt(selection.end)
-                );
+                inGeneratedRegion(synced.snapshot, synced.snapshot.offsetAt(selection.start));
             if (!isSynthetic && isMapped(mapped)) {
                 out.push({
                     name: node.name,
@@ -1436,6 +1480,115 @@ function timing(phase: string, ms: number) {
         } catch {}
     }
 }
+
+/**
+ * One ranged change from the previous overlay text to the next, or a full-text change when
+ * there is no usable base. tsgo has no incremental re-parse — this saves serializing the whole
+ * generated file (often 100KB+) across the pipe twice per keystroke, not tsgo CPU.
+ */
+function incrementalChanges(
+    previous: string | undefined,
+    text: string
+): TextDocumentContentChangeEvent[] {
+    if (previous === undefined || previous === text) {
+        return [{ text }];
+    }
+    const change = computeChangeRange(previous, text);
+    // A rewrite touching most of the document isn't worth the position bookkeeping.
+    if (change.span.length > previous.length * 0.7) {
+        return [{ text }];
+    }
+    const lineOffsets = getLineOffsets(previous);
+    return [
+        {
+            range: {
+                start: positionAt(change.span.start, previous, lineOffsets),
+                end: positionAt(change.span.start + change.span.length, previous, lineOffsets)
+            },
+            text: text.slice(change.span.start, change.span.start + change.newLength)
+        }
+    ];
+}
+
+/**
+ * Ω-ignore regions of a generated text, computed once per snapshot instead of three full-text
+ * scans per diagnostic (`isInGeneratedCode`); a document's diagnostics run is O(items · log
+ * regions) against this.
+ */
+const generatedRegionsCache = new WeakMap<SvelteDocumentSnapshot, Array<[number, number]>>();
+const IGNORE_START = '/*Ωignore_startΩ*/';
+const IGNORE_END = '/*Ωignore_endΩ*/';
+
+function generatedRegionsOf(snapshot: SvelteDocumentSnapshot): Array<[number, number]> {
+    let regions = generatedRegionsCache.get(snapshot);
+    if (!regions) {
+        regions = [];
+        const text = snapshot.getFullText();
+        let from = 0;
+        for (;;) {
+            const start = text.indexOf(IGNORE_START, from);
+            if (start < 0) {
+                break;
+            }
+            const end = text.indexOf(IGNORE_END, start);
+            if (end < 0) {
+                regions.push([start, text.length]);
+                break;
+            }
+            regions.push([start, end + IGNORE_END.length]);
+            from = end + IGNORE_END.length;
+        }
+        generatedRegionsCache.set(snapshot, regions);
+    }
+    return regions;
+}
+
+/**
+ * Whether a span starts inside an Ω-ignore region. Mirrors `isInGeneratedCode`, which also
+ * keys off where the span *starts*.
+ */
+function inGeneratedRegion(snapshot: SvelteDocumentSnapshot, start: number): boolean {
+    const regions = generatedRegionsOf(snapshot);
+    let low = 0;
+    let high = regions.length - 1;
+    while (low <= high) {
+        const mid = (low + high) >> 1;
+        const [regionStart, regionEnd] = regions[mid];
+        if (start >= regionEnd) {
+            low = mid + 1;
+        } else if (start < regionStart) {
+            high = mid - 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Map a completion edit — plain `{range}` or the LSP `{insert, replace}` shape — back to
+ * original coordinates. Undefined when any involved range lives purely in generated code.
+ */
+function mapCompletionEdit(snapshot: SvelteDocumentSnapshot, edit: any): any | undefined {
+    if (edit.range) {
+        const range = mapRangeToOriginal(snapshot, edit.range);
+        return isMapped(range) ? { ...edit, range } : undefined;
+    }
+    if (edit.insert && edit.replace) {
+        const insert = mapRangeToOriginal(snapshot, edit.insert);
+        const replace = mapRangeToOriginal(snapshot, edit.replace);
+        return isMapped(insert) && isMapped(replace) ? { ...edit, insert, replace } : undefined;
+    }
+    return undefined;
+}
+
+/**
+ * How long a diagnostics pull waits for the typing burst to settle. Tunable for benchmarks via
+ * the same env the (dead) push path used.
+ */
+const PULL_QUIESCENCE_MS = process.env.SVELTE_LS_DIAGNOSTICS_DEBOUNCE_MS
+    ? Number(process.env.SVELTE_LS_DIAGNOSTICS_DEBOUNCE_MS)
+    : 150;
 
 /** Where tsgo's own completion payload is parked while `data` carries the document uri. */
 const TSGO_DATA = '__tsgoData';
