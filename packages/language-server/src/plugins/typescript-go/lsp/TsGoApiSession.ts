@@ -41,12 +41,15 @@ export class TsGoApiSession {
     private module: TsGoApiModule | undefined;
     private connecting: Promise<boolean> | undefined;
     private snapshot: any;
+    /** The server generation the current snapshot reflects; see {@link getProjectForFile}. */
+    private snapshotGeneration = -1;
+    /** In-flight refresh, so concurrent callers share one instead of double-disposing. */
+    private refreshing: Promise<void> | undefined;
     private failed = false;
 
     constructor(
         private readonly server: TsGoServer,
-        private readonly resolveFrom: string,
-        private readonly overlayTsconfigPath: string
+        private readonly resolveFrom: string
     ) {}
 
     get signatureKind() {
@@ -94,39 +97,74 @@ export class TsGoApiSession {
     }
 
     /**
-     * The project for our overlay config, refreshed against the session's current state.
+     * The project a *file* belongs to, refreshed against the session's current state.
      *
-     * The previous snapshot is released on each refresh: they are ref-counted server-side and
+     * Per file, exactly like the LSP side's project selection — this used to be pinned to one
+     * overlay tsconfig chosen from the editor's root, which in a monorepo was the workspace
+     * stub: an empty three-shim program, with `getProjects()[0]` as an arbitrary-project
+     * fallback. Every component-props lookup then ran against a program that had never heard
+     * of the component. No fallback here on purpose: an empty answer degrades to plain LSP
+     * behaviour, a wrong-project answer looks correct and lies.
+     *
+     * The snapshot is reused until the server's generation moves — `updateSnapshot` is a full
+     * IPC round trip and this gets called on every keystroke inside a component tag. The
+     * previous snapshot is released on each refresh: they are ref-counted server-side and
      * holding every one of them leaks the whole AST cache over an editing session.
      */
-    async getProject(): Promise<any | undefined> {
+    async getProjectForFile(shadowPath: string): Promise<any | undefined> {
         if (!(await this.connect())) {
             return undefined;
         }
         try {
-            const previous = this.snapshot;
-            this.snapshot = await this.api.updateSnapshot();
-            if (previous && previous !== this.snapshot) {
-                await previous.dispose?.();
+            const generation = this.server.generation;
+            if (!this.snapshot || generation !== this.snapshotGeneration) {
+                // Single-flight: two feature requests racing here would each capture the same
+                // `previous` and dispose it twice — the server-side refcount underflows and a
+                // snapshot still in use gets released.
+                this.refreshing ??= (async () => {
+                    const previous = this.snapshot;
+                    this.snapshot = await this.api.updateSnapshot();
+                    this.snapshotGeneration = generation;
+                    if (previous && previous !== this.snapshot) {
+                        await previous.dispose?.();
+                    }
+                })().finally(() => {
+                    this.refreshing = undefined;
+                });
+                await this.refreshing;
             }
-            return (
-                this.snapshot.getProject(this.overlayTsconfigPath) ??
-                this.snapshot.getProjects()?.[0]
-            );
+            return await this.snapshot.getDefaultProjectForFile(shadowPath);
         } catch (e) {
             Logger.debug('[tsgo] could not obtain a checker project', e);
             return undefined;
         }
     }
 
+    /**
+     * Forget the attachment after the tsgo child died, so the next call reconnects to the new
+     * process instead of talking to a dead pipe forever.
+     */
+    reset() {
+        void this.dispose();
+        this.module = undefined;
+        this.connecting = undefined;
+        this.failed = false;
+        this.snapshotGeneration = -1;
+    }
+
     async dispose() {
-        try {
-            await this.snapshot?.dispose?.();
-        } catch {}
-        try {
-            await this.api?.close?.();
-        } catch {}
+        // Detach the fields *synchronously* before the async closes settle: dispose races the
+        // next doConnect after a restart, and a late continuation must not null out a freshly
+        // attached api.
+        const api = this.api;
+        const snapshot = this.snapshot;
         this.api = undefined;
         this.snapshot = undefined;
+        try {
+            await snapshot?.dispose?.();
+        } catch {}
+        try {
+            await api?.close?.();
+        } catch {}
     }
 }

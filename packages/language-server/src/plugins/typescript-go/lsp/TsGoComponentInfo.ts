@@ -13,14 +13,34 @@ import { TsGoApiSession } from './TsGoApiSession';
  * `displayPartsToString` step.
  */
 export class TsGoComponentInfo {
+    /**
+     * Memoised part descriptions, keyed on the component's *declaration* — where the type
+     * lives — not on the usage site. Typing inside `<Button …>` re-asks for Button's props on
+     * every keystroke, but every keystroke is in the *usage* file; the declaration hasn't
+     * moved, so the walk (one `updateSnapshot`, then several checker round trips per property)
+     * would be repaid with an identical answer each time.
+     */
+    private readonly cache = new Map<string, { token: string; parts: ComponentPartInfo }>();
+
     constructor(
         private readonly session: TsGoApiSession,
         /** Resolves a generated position to the declaration it points at, via LSP. */
         private readonly definitionAt: (
             shadowPath: string,
             offset: number
-        ) => Promise<{ filePath: string; offset: number } | undefined>
+        ) => Promise<{ filePath: string; offset: number } | undefined>,
+        /**
+         * The overlay version of a shadow document, when it is open in tsgo. Cache validity:
+         * an open declaration changes through didChange (version moves), a closed one only
+         * through watched-file events (the plugin calls {@link clearCache} for those).
+         */
+        private readonly documentVersion: (filePath: string) => number | undefined = () => undefined
     ) {}
+
+    /** Drop every memoised answer — a watched file changed, or tsgo restarted. */
+    clearCache() {
+        this.cache.clear();
+    }
 
     async getProps(shadowPath: string, generatedOffset: number): Promise<ComponentPartInfo> {
         return this.getPart(shadowPath, generatedOffset, 'props');
@@ -44,15 +64,36 @@ export class TsGoComponentInfo {
         part: 'props' | 'events' | 'slots',
         slot?: string
     ): Promise<ComponentPartInfo> {
-        const project = await this.session.getProject();
-        const kinds = this.session.signatureKind;
-        if (!project || !kinds) {
-            return [];
-        }
-        const checker = project.checker;
-
         try {
-            const type = await this.componentTypeAt(checker, shadowPath, generatedOffset);
+            // Resolve the declaration first: it is both the anchor for the type walk and the
+            // cache key. The definition round trip is the cheap part of this path.
+            const definition = await this.definitionAt(shadowPath, generatedOffset);
+            const cacheKey = definition
+                ? `${definition.filePath}:${definition.offset}:${part}:${slot ?? ''}`
+                : undefined;
+            if (cacheKey) {
+                const cached = this.cache.get(cacheKey);
+                if (cached && cached.token === this.cacheToken(definition!.filePath)) {
+                    return cached.parts;
+                }
+            }
+
+            // Connecting (inside getProjectForFile) is what populates `signatureKind`, so the
+            // kinds check has to come after it — not before, where it would always be empty on
+            // the very first lookup and silently disable the feature.
+            const project = await this.session.getProjectForFile(shadowPath);
+            const kinds = this.session.signatureKind;
+            if (!project || !kinds) {
+                return [];
+            }
+            const checker = project.checker;
+
+            const type = await this.componentTypeAt(
+                checker,
+                shadowPath,
+                generatedOffset,
+                definition
+            );
             if (!type) {
                 return [];
             }
@@ -62,20 +103,36 @@ export class TsGoComponentInfo {
                 return [];
             }
 
+            let parts: ComponentPartInfo;
             if (part === 'slots') {
                 const slotSymbol = await checker.getPropertyOfType(carrier, slot ?? 'default');
                 if (!slotSymbol) {
                     return [];
                 }
                 const slotType = await checker.getTypeOfSymbol(slotSymbol);
-                return slotType ? this.describe(checker, slotType) : [];
+                parts = slotType ? await this.describe(checker, slotType) : [];
+            } else {
+                parts = await this.describe(checker, carrier);
             }
 
-            return this.describe(checker, carrier);
+            if (cacheKey && parts.length) {
+                if (this.cache.size >= 200) {
+                    this.cache.delete(this.cache.keys().next().value!);
+                }
+                this.cache.set(cacheKey, {
+                    token: this.cacheToken(definition!.filePath),
+                    parts
+                });
+            }
+            return parts;
         } catch (e) {
             Logger.debug('[tsgo] component info lookup failed', e);
             return [];
         }
+    }
+
+    private cacheToken(declarationPath: string): string {
+        return `v${this.documentVersion(declarationPath) ?? 'disk'}`;
     }
 
     /**
@@ -90,14 +147,14 @@ export class TsGoComponentInfo {
     private async componentTypeAt(
         checker: any,
         shadowPath: string,
-        generatedOffset: number
+        generatedOffset: number,
+        definition: { filePath: string; offset: number } | undefined
     ): Promise<any | undefined> {
         // Follow go-to-definition first, exactly as the JS engine does. At the usage site the
         // symbol frequently resolves through a barrel re-export to svelte's ambient
         // `declare module '*.svelte'`, whose type is `LegacyComponentType` with a
         // `Record<string, any>` props carrier — useless for completions. The declaration lands
         // on the component's own generated shadow, where the real type lives.
-        const definition = await this.definitionAt(shadowPath, generatedOffset);
         if (definition) {
             const atDefinition = await checker.getTypeAtPosition(
                 definition.filePath,
@@ -169,18 +226,24 @@ export class TsGoComponentInfo {
         if (!properties?.length) {
             return [];
         }
-        const out: ComponentPartInfo = [];
-        for (const property of properties) {
-            if (property.name.startsWith('$$')) {
-                continue;
-            }
-            const propertyType = await checker.getTypeOfSymbol(property);
-            out.push({
-                name: property.name,
-                type: propertyType ? await checker.typeToString(propertyType) : 'any',
-                doc: await checker.getDocumentationCommentOfSymbol(property)
-            });
-        }
-        return out;
+        // Every checker call is an IPC round trip over the API pipe. Serially, a 30-prop
+        // component was ~90 of them back to back — the dominant cost of the first completion
+        // inside its tag. In parallel the wall time is one round trip deep per layer.
+        const described = await Promise.all(
+            properties
+                .filter((property: any) => !property.name.startsWith('$$'))
+                .map(async (property: any) => {
+                    const [propertyType, doc] = await Promise.all([
+                        checker.getTypeOfSymbol(property),
+                        checker.getDocumentationCommentOfSymbol(property)
+                    ]);
+                    return {
+                        name: property.name,
+                        type: propertyType ? await checker.typeToString(propertyType) : 'any',
+                        doc
+                    };
+                })
+        );
+        return described;
     }
 }

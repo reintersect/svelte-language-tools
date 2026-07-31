@@ -12,6 +12,7 @@ import {
     Diagnostic,
     DiagnosticSeverity,
     DefinitionLink,
+    DocumentDiagnosticReport,
     DocumentHighlight,
     FileChangeType,
     FoldingRange,
@@ -109,6 +110,23 @@ export class TsGoPlugin implements Plugin {
         this.projects = options.projects;
         this.docManager = options.docManager;
         this.componentInfo = options.componentInfo;
+
+        // Warm the project as soon as a file is opened, instead of making the first completion
+        // pay for materialising it. `ensureProjectOpened` memoises its promise, so the request
+        // that does come in awaits the already-running pass rather than starting another.
+        this.docManager.on('documentOpen', (document: Document) => {
+            const filePath = document.getFilePath();
+            if (!filePath || !filePath.endsWith('.svelte')) {
+                return;
+            }
+            try {
+                void this.ensureProjectOpened(this.projects.forFile(filePath)).catch((e) =>
+                    Logger.debug('[tsgo] background project warm-up failed', e)
+                );
+            } catch (e) {
+                Logger.debug('[tsgo] background project warm-up failed', e);
+            }
+        });
     }
 
     /**
@@ -202,7 +220,14 @@ export class TsGoPlugin implements Plugin {
                 const started = Date.now();
                 const written = new Set<string>();
                 let reused = 0;
+                let sinceYield = 0;
                 for (const filePath of files) {
+                    // The loop is synchronous fs work end to end; without yielding it blocks
+                    // the event loop for the whole pass and every LSP request queues behind it.
+                    if (++sinceYield >= 50) {
+                        sinceYield = 0;
+                        await new Promise(setImmediate);
+                    }
                     try {
                         const shadowPathIfFresh = shadows.getShadowPath(filePath);
                         // A shadow newer than its source is already what the transform would produce,
@@ -296,6 +321,51 @@ export class TsGoPlugin implements Plugin {
         if (!synced) {
             return [];
         }
+        return (await this.collectDiagnostics(synced, cancellationToken, tStart)) ?? [];
+    }
+
+    /**
+     * The pull-mode counterpart. This is not optional plumbing: whenever the client supports
+     * pull diagnostics — every current VS Code does — the server routes *all* diagnostics
+     * through here, and a plugin without this method simply contributes none. The push-mode
+     * `getDiagnostics` above then never runs, which is how tsgo diagnostics were absent from
+     * the editor while working fine in svelte-check.
+     */
+    async getDiagnosticsForPullMode(
+        document: Document,
+        previousResultId?: string,
+        cancellationToken?: CancellationToken
+    ): Promise<DocumentDiagnosticReport> {
+        const tStart = TIMING ? Date.now() : 0;
+        const synced = await this.syncDocument(document);
+        if (!synced) {
+            return { kind: 'full', items: [] };
+        }
+        // The mapped result is a function of the shadow text and of everything else tsgo
+        // knows, all of which move the server generation (the sync above just bumped it if
+        // this document changed). Same generation ⇒ same answer, without asking tsgo.
+        const resultId = `g${this.server.generation}`;
+        if (previousResultId === resultId) {
+            return { kind: 'unchanged', resultId };
+        }
+        const items = await this.collectDiagnostics(synced, cancellationToken, tStart);
+        if (items === null) {
+            // Cancelled or failed: never a full report with this generation's resultId — the
+            // next pull's `unchanged` short-circuit would freeze the accidental blank answer in
+            // place of the real diagnostics. Keep whatever the client already shows instead.
+            return previousResultId
+                ? { kind: 'unchanged', resultId: previousResultId }
+                : { kind: 'full', items: [] };
+        }
+        return { kind: 'full', resultId, items };
+    }
+
+    /** The mapped diagnostics, or null when the answer is unusable (cancelled, tsgo error). */
+    private async collectDiagnostics(
+        synced: { snapshot: SvelteDocumentSnapshot; shadowPath: string },
+        cancellationToken: CancellationToken | undefined,
+        tStart: number
+    ): Promise<Diagnostic[] | null> {
         const { snapshot, shadowPath } = synced;
 
         // A template that doesn't parse yields no usable generated code; report the parser
@@ -313,19 +383,23 @@ export class TsGoPlugin implements Plugin {
         }
 
         if (cancellationToken?.isCancellationRequested) {
-            return [];
+            return null;
         }
 
         let report: any;
         const tCheck = TIMING ? Date.now() : 0;
         try {
-            report = await this.server.sendRequest('textDocument/diagnostic', {
-                textDocument: { uri: pathToUrl(shadowPath) }
-            });
+            report = await this.server.sendRequest(
+                'textDocument/diagnostic',
+                {
+                    textDocument: { uri: pathToUrl(shadowPath) }
+                },
+                cancellationToken
+            );
         } catch (e) {
             Logger.debug('[tsgo] diagnostic request failed', e);
             this.fallback('diagnostic-request-failed');
-            return [];
+            return null;
         }
 
         const items: any[] = report?.items ?? [];
@@ -461,11 +535,15 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
 
-        const result: any = await this.server.sendRequest('textDocument/completion', {
-            textDocument: { uri: pathToUrl(shadowPath) },
-            position: generated,
-            context: sanitizeCompletionContext(completionContext)
-        });
+        const result: any = await this.server.sendRequest(
+            'textDocument/completion',
+            {
+                textDocument: { uri: pathToUrl(shadowPath) },
+                position: generated,
+                context: sanitizeCompletionContext(completionContext)
+            },
+            cancellationToken
+        );
         if (!result) {
             return null;
         }
@@ -522,7 +600,8 @@ export class TsGoPlugin implements Plugin {
         document: Document,
         position: Position,
         method: string,
-        extra: Record<string, unknown> = {}
+        extra: Record<string, unknown> = {},
+        token?: CancellationToken
     ): Promise<{ result: T; snapshot: SvelteDocumentSnapshot } | null> {
         const synced = await this.syncDocument(document);
         if (!synced) {
@@ -533,11 +612,15 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
         try {
-            const result = await this.server.sendRequest<T>(method, {
-                textDocument: { uri: pathToUrl(synced.shadowPath) },
-                position: generated,
-                ...extra
-            });
+            const result = await this.server.sendRequest<T>(
+                method,
+                {
+                    textDocument: { uri: pathToUrl(synced.shadowPath) },
+                    position: generated,
+                    ...extra
+                },
+                token
+            );
             this.stats.served++;
             return { result, snapshot: synced.snapshot };
         } catch (e) {
@@ -596,11 +679,16 @@ export class TsGoPlugin implements Plugin {
     async findReferences(
         document: Document,
         position: Position,
-        context: ReferenceContext
+        context: ReferenceContext,
+        cancellationToken?: CancellationToken
     ): Promise<Location[] | null> {
-        const response = await this.requestAt<any>(document, position, 'textDocument/references', {
-            context: { includeDeclaration: context?.includeDeclaration ?? true }
-        });
+        const response = await this.requestAt<any>(
+            document,
+            position,
+            'textDocument/references',
+            { context: { includeDeclaration: context?.includeDeclaration ?? true } },
+            cancellationToken
+        );
         return response ? this.toLocations(response.result) : null;
     }
 
@@ -628,13 +716,15 @@ export class TsGoPlugin implements Plugin {
     async getSignatureHelp(
         document: Document,
         position: Position,
-        context: SignatureHelpContext | undefined
+        context: SignatureHelpContext | undefined,
+        cancellationToken?: CancellationToken
     ): Promise<SignatureHelp | null> {
         const response = await this.requestAt<any>(
             document,
             position,
             'textDocument/signatureHelp',
-            context ? { context } : {}
+            context ? { context } : {},
+            cancellationToken
         );
         return response?.result ?? null;
     }
@@ -682,7 +772,11 @@ export class TsGoPlugin implements Plugin {
     // Whole-document features.
     // ---------------------------------------------------------------------------------------
 
-    async getSemanticTokens(document: Document, range?: Range): Promise<SemanticTokens | null> {
+    async getSemanticTokens(
+        document: Document,
+        range?: Range,
+        cancellationToken?: CancellationToken
+    ): Promise<SemanticTokens | null> {
         const synced = await this.syncDocument(document);
         if (!synced) {
             return null;
@@ -693,9 +787,13 @@ export class TsGoPlugin implements Plugin {
         try {
             // Always ask for the full document: a range request would need the *generated*
             // range, and mapping a partial range risks clipping tokens at the boundary.
-            result = await this.server.sendRequest('textDocument/semanticTokens/full', {
-                textDocument: { uri: pathToUrl(shadowPath) }
-            });
+            result = await this.server.sendRequest(
+                'textDocument/semanticTokens/full',
+                {
+                    textDocument: { uri: pathToUrl(shadowPath) }
+                },
+                cancellationToken
+            );
         } catch (e) {
             Logger.debug('[tsgo] semanticTokens failed', e);
             this.fallback('semanticTokens');
@@ -733,14 +831,21 @@ export class TsGoPlugin implements Plugin {
         return builder.build();
     }
 
-    async getDocumentSymbols(document: Document): Promise<SymbolInformation[]> {
+    async getDocumentSymbols(
+        document: Document,
+        cancellationToken?: CancellationToken
+    ): Promise<SymbolInformation[]> {
         const synced = await this.syncDocument(document);
         if (!synced) {
             return [];
         }
-        const result: any = await this.server.sendRequest('textDocument/documentSymbol', {
-            textDocument: { uri: pathToUrl(synced.shadowPath) }
-        });
+        const result: any = await this.server.sendRequest(
+            'textDocument/documentSymbol',
+            {
+                textDocument: { uri: pathToUrl(synced.shadowPath) }
+            },
+            cancellationToken
+        );
         if (!Array.isArray(result)) {
             return [];
         }
@@ -787,7 +892,11 @@ export class TsGoPlugin implements Plugin {
         return out;
     }
 
-    async getInlayHints(document: Document, range: Range): Promise<InlayHint[] | null> {
+    async getInlayHints(
+        document: Document,
+        range: Range,
+        cancellationToken?: CancellationToken
+    ): Promise<InlayHint[] | null> {
         const synced = await this.syncDocument(document);
         if (!synced) {
             return null;
@@ -797,10 +906,14 @@ export class TsGoPlugin implements Plugin {
         if (start.line < 0 || end.line < 0) {
             return null;
         }
-        const result: any = await this.server.sendRequest('textDocument/inlayHint', {
-            textDocument: { uri: pathToUrl(synced.shadowPath) },
-            range: { start, end }
-        });
+        const result: any = await this.server.sendRequest(
+            'textDocument/inlayHint',
+            {
+                textDocument: { uri: pathToUrl(synced.shadowPath) },
+                range: { start, end }
+            },
+            cancellationToken
+        );
         if (!Array.isArray(result)) {
             return null;
         }
@@ -885,7 +998,8 @@ export class TsGoPlugin implements Plugin {
     async getCodeActions(
         document: Document,
         range: Range,
-        context: CodeActionContext
+        context: CodeActionContext,
+        cancellationToken?: CancellationToken
     ): Promise<CodeAction[]> {
         const synced = await this.syncDocument(document);
         if (!synced) {
@@ -908,11 +1022,15 @@ export class TsGoPlugin implements Plugin {
 
         let result: any;
         try {
-            result = await this.server.sendRequest('textDocument/codeAction', {
-                textDocument: { uri: pathToUrl(synced.shadowPath) },
-                range: { start, end },
-                context: { diagnostics, only: context?.only }
-            });
+            result = await this.server.sendRequest(
+                'textDocument/codeAction',
+                {
+                    textDocument: { uri: pathToUrl(synced.shadowPath) },
+                    range: { start, end },
+                    context: { diagnostics, only: context?.only }
+                },
+                cancellationToken
+            );
         } catch (e) {
             Logger.debug('[tsgo] codeAction failed', e);
             this.fallback('codeAction');
@@ -948,7 +1066,8 @@ export class TsGoPlugin implements Plugin {
 
     async resolveCompletion(
         _document: Document,
-        completionItem: AppCompletionItem
+        completionItem: AppCompletionItem,
+        cancellationToken?: CancellationToken
     ): Promise<AppCompletionItem> {
         try {
             const data: any = completionItem.data;
@@ -958,7 +1077,8 @@ export class TsGoPlugin implements Plugin {
                     : completionItem;
             const resolved: any = await this.server.sendRequest(
                 'completionItem/resolve',
-                forwarded
+                forwarded,
+                cancellationToken
             );
             if (!resolved) {
                 return completionItem;
@@ -1028,12 +1148,19 @@ export class TsGoPlugin implements Plugin {
     // Project-wide features.
     // ---------------------------------------------------------------------------------------
 
-    async getWorkspaceSymbols(query: string): Promise<WorkspaceSymbol[] | null> {
+    async getWorkspaceSymbols(
+        query: string,
+        cancellationToken?: CancellationToken
+    ): Promise<WorkspaceSymbol[] | null> {
         // Workspace-wide, so every project opened so far has to have been materialised. Projects
         // nobody has touched are not searched, which matches what the JS engine does.
         await Promise.all(this.projects.all().map((s) => this.ensureProjectOpened(s)));
         try {
-            const result: any = await this.server.sendRequest('workspace/symbol', { query });
+            const result: any = await this.server.sendRequest(
+                'workspace/symbol',
+                { query },
+                cancellationToken
+            );
             if (!Array.isArray(result)) {
                 return null;
             }
@@ -1205,6 +1332,15 @@ export class TsGoPlugin implements Plugin {
     }
 
     onWatchFileChanges(changes: OnWatchFileChangesPara[]): void {
+        if (changes.length) {
+            // Any watched change — a saved .ts file, a tsconfig edit, not just .svelte — can
+            // change what tsgo reports for open documents. The generation is what pull
+            // diagnostics answer `unchanged` against and what the checker snapshot and props
+            // caches key on, so leaving it untouched here serves stale answers after every
+            // cross-file edit.
+            this.server.noteExternalChange();
+            this.componentInfo?.clearCache();
+        }
         for (const change of changes) {
             if (!change.fileName.endsWith('.svelte')) {
                 continue;
@@ -1217,6 +1353,10 @@ export class TsGoPlugin implements Plugin {
                 void this.server.closeDocument(shadowPath);
                 continue;
             }
+            if (change.changeType === FileChangeType.Created) {
+                // The memoised workspace scan no longer reflects reality.
+                this.projects.invalidateWorkspaceScans();
+            }
             try {
                 const text = fs.readFileSync(change.fileName, 'utf8');
                 const document = new Document(pathToUrl(change.fileName), text);
@@ -1226,6 +1366,15 @@ export class TsGoPlugin implements Plugin {
                 Logger.debug(`[tsgo] could not refresh shadow for ${change.fileName}`, e);
             }
         }
+    }
+
+    /**
+     * Forget which projects were materialised — after a tsgo restart the new process needs the
+     * didOpen/materialisation pass again. Cheap to re-run: the shadows on disk are current, so
+     * the pass mostly stat()s them and moves on.
+     */
+    resetProjects() {
+        this.opened.clear();
     }
 
     private getLegendMap(): number[] | undefined {
