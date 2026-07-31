@@ -7,7 +7,10 @@ import { Logger } from '../../../logger';
 import { pathToUrl, urlToPath } from '../../../utils';
 import { Plugin } from '../../interfaces';
 import { SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
+import { getRsvelte } from '../rsvelte';
 import { findWorkspaceRoot, resolveTsGoPath, ShadowManager } from './ShadowManager';
+
+export { preloadRsvelte } from '../rsvelte';
 import { ProjectRegistry } from './ProjectRegistry';
 import { TsGoPlugin } from './TsGoPlugin';
 import { TsGoApiSession } from './TsGoApiSession';
@@ -191,6 +194,15 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
                 Logger.debug(`[tsgo] could not import the Svelte compiler from ${home}`, e);
             }
         }
+        // The Rust transform, when it was preloaded (server.ts awaits that before building
+        // this plugin, so the decision is fixed for the session — a mid-session switch would
+        // split the shared fingerprint between engines). Svelte 5 + `lang="ts"` only: the
+        // Rust JSDoc emission and version-4 mode both produce semantically different TSX
+        // (verified against the svelte-check fixtures), and per-file engine choice stays
+        // deterministic so the shared fingerprint remains sound.
+        const rsvelte = getRsvelte();
+        const svelteMajor = Number((compiler?.VERSION ?? '5').split('.')[0]);
+        const useRust = !!rsvelte && svelteMajor >= 5;
         const resolved: SvelteSnapshotOptions = {
             parse: compiler?.parse,
             version: compiler?.VERSION,
@@ -198,7 +210,21 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
             // without this every keystroke inside markup would blank the file's types.
             transformOnTemplateError: true,
             typingsNamespace: 'svelteHTML',
-            emitJsDoc: true
+            emitJsDoc: true,
+            fastTransform: useRust
+                ? (text, opts) =>
+                      opts.isTsFile
+                          ? rsvelte!.svelte2tsx(text, {
+                                filename: opts.filename,
+                                isTsFile: true,
+                                mode: 'ts',
+                                version: '5',
+                                namespace: opts.namespace,
+                                accessors: opts.accessors
+                            })
+                          : undefined
+                : undefined,
+            transformFingerprint: useRust ? rsvelte!.fingerprint : undefined
         };
         optionsCache.set(packageRoot, resolved);
         return resolved;

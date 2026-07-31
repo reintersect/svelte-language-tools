@@ -10,6 +10,7 @@ import { Logger } from '../../../logger';
 import { normalizePath, pathToUrl } from '../../../utils';
 import { SvelteDocumentSnapshot, SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
 import { mapAndFilterDiagnostics } from '../../typescript/features/DiagnosticsProvider';
+import { preloadRsvelte } from '../rsvelte';
 import {
     findProjectTsconfig,
     findWorkspaceRoot,
@@ -127,6 +128,11 @@ export class TsGoBatchOverlay {
 
         // The project's own Svelte compiler, so the transform matches what it builds with.
         const svelteCompiler = importSvelte(tsconfigPath || options.workspacePath);
+        // Svelte 5 + `lang="ts"` only — the Rust JSDoc emission and version-4 mode produce
+        // semantically different TSX (verified against this package's own sanity fixtures).
+        const rsvelte = await preloadRsvelte();
+        const svelteMajor = Number((svelteCompiler?.VERSION ?? '5').split('.')[0]);
+        const useRust = !!rsvelte && svelteMajor >= 5;
         const snapshotOptions: SvelteSnapshotOptions = {
             parse: svelteCompiler?.parse,
             version: svelteCompiler?.VERSION,
@@ -135,7 +141,21 @@ export class TsGoBatchOverlay {
             // the script-only fallback would bury it under a cascade of consequences.
             transformOnTemplateError: false,
             typingsNamespace: 'svelteHTML',
-            emitJsDoc: true
+            emitJsDoc: true,
+            fastTransform: useRust
+                ? (text, opts) =>
+                      opts.isTsFile
+                          ? rsvelte!.svelte2tsx(text, {
+                                filename: opts.filename,
+                                isTsFile: true,
+                                mode: 'ts',
+                                version: '5',
+                                namespace: opts.namespace,
+                                accessors: opts.accessors
+                            })
+                          : undefined
+                : undefined,
+            transformFingerprint: useRust ? rsvelte!.fingerprint : undefined
         };
 
         const sourceRoot = findWorkspaceRoot(projectPath);

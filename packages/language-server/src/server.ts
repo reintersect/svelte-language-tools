@@ -49,7 +49,7 @@ import {
     OnWatchFileChangesPara,
     LSAndTSDocResolver
 } from './plugins';
-import { createTsGoPlugin, isTsGoEnabled } from './plugins/typescript-go/lsp';
+import { createTsGoPlugin, isTsGoEnabled, preloadRsvelte } from './plugins/typescript-go/lsp';
 import { debounceThrottle, isNotNullOrUndefined, normalizeUri, urlToPath } from './utils';
 import { FallbackWatcher } from './lib/FallbackWatcher';
 import { configLoader } from './lib/documents/configLoader';
@@ -124,7 +124,14 @@ export function startServer(options?: LSOptions) {
         '*.{' + watchExtensions.map((ext) => ext.slice(1)).join(',') + '}';
     const recursiveWatchPattern = '**/' + nonRecursiveWatchPattern;
 
-    connection.onInitialize((evt) => {
+    connection.onInitialize(async (evt) => {
+        // The Rust transform is ESM-only and can only be loaded asynchronously, while the
+        // transform call sites are synchronous — so it has to be resolved before the plugin
+        // exists. Deciding the engine once per session also keeps the shadow fingerprint
+        // stable; a mid-session switch would split it between engines.
+        if (isTsGoEnabled(evt.initializationOptions)) {
+            await preloadRsvelte();
+        }
         const workspaceUris = evt.workspaceFolders?.map((folder) => folder.uri.toString()) ?? [
             evt.rootUri ?? ''
         ];

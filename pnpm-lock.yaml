@@ -33,9 +33,15 @@ importers:
 
   packages/language-server:
     dependencies:
+      '@jridgewell/sourcemap-codec':
+        specifier: ^1.5.0
+        version: 1.5.0
       '@jridgewell/trace-mapping':
         specifier: ^0.3.25
         version: 0.3.25
+      '@rsvelte/svelte2tsx':
+        specifier: ^0.2.7
+        version: 0.2.7
       '@sveltejs/load-config':
         specifier: ^0.2.1
         version: 0.2.1
@@ -139,6 +145,9 @@ importers:
       '@jridgewell/trace-mapping':
         specifier: ^0.3.25
         version: 0.3.25
+      '@rsvelte/svelte2tsx':
+        specifier: ^0.2.7
+        version: 0.2.7
       '@sveltejs/load-config':
         specifier: ^0.2.1
         version: 0.2.1
@@ -793,6 +802,12 @@ packages:
     resolution: {integrity: sha512-M/fKi4sasCdM8i0aWJjCSFm2qEnYRR8AMLG2kxp6wD13+tMGA4Z1tVAuHkNRjud5SW2EM3naLuK35w9twvf6aA==}
     cpu: [x64]
     os: [win32]
+
+  '@rsvelte/compiler@0.10.0':
+    resolution: {integrity: sha512-p/OqWCOwO9yETZyiEoyfcPPhtkcPQx5yjiM7y0CfYsQ9+kW2KF7NHH/FZlKn2CtzWTrE1V+tSlZ1Tba4ovdj+A==}
+
+  '@rsvelte/svelte2tsx@0.2.7':
+    resolution: {integrity: sha512-zSHTfIdoz5KMKxNW2DuKR3LqykaX39tBryKmNO+507YrB8taoIxtlg7I5Shfb5clTfGAUrtzf5izEgapengKrw==}
 
   '@serkonda7/ts-result@1.0.1':
     resolution: {integrity: sha512-6LoFKDzA8Yul9hjMSCpIkYdWkNKjIhG1rm1GQgPZpHA+VCatwKgQmJ/dUVF9kWZci+SYmT7ZV4NNkLHa+gZEFw==}
@@ -2676,6 +2691,12 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.45.1':
     optional: true
+
+  '@rsvelte/compiler@0.10.0': {}
+
+  '@rsvelte/svelte2tsx@0.2.7':
+    dependencies:
+      '@rsvelte/compiler': 0.10.0
 
   '@serkonda7/ts-result@1.0.1': {}
 

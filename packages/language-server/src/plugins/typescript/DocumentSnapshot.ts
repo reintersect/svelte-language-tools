@@ -108,6 +108,27 @@ export interface SvelteSnapshotOptions {
         workspacePath: string;
         generatedPath: string;
     };
+    /**
+     * An alternative (native) svelte2tsx. When set and it returns a result, its `code`/`map`
+     * stand in for the JS transform's; when it throws or returns undefined, the JS path below
+     * runs unchanged. The consumers of the fast path (the tsgo engine) only need `code`, `map`
+     * and `exportedNames` — `htmlAst` is a JS-engine concern and stays undefined.
+     */
+    fastTransform?: (
+        text: string,
+        options: {
+            filename: string | undefined;
+            isTsFile: boolean;
+            namespace?: string;
+            accessors?: boolean;
+        }
+    ) => { code: string; map: any; exportedNames?: IExportedNames } | undefined;
+    /**
+     * Identity of the active transform's behavior, for shadow-cache fingerprints. Two engines
+     * (or two versions of one) produce texts that differ at least in whitespace, and a shadow
+     * written by one must not be trusted as fresh by the other.
+     */
+    transformFingerprint?: string;
 }
 
 const ambientPathPattern = /node_modules[\/\\]svelte[\/\\]types[\/\\]ambient\.d\.ts$/;
@@ -219,6 +240,36 @@ export namespace DocumentSnapshot {
 }
 
 /**
+ * Run the configured fast (native) transform, or fall through to the JS transform on any
+ * failure. Failure is expected mid-edit — the native transform has no `emitOnTemplateError`
+ * escape hatch — and must be silent: the JS path handles the same input right below.
+ */
+function tryFastTransform(
+    document: Document,
+    options: SvelteSnapshotOptions,
+    text: string,
+    scriptKind: ts.ScriptKind
+): { code: string; map: any; exportedNames?: IExportedNames } | undefined {
+    if (!options.fastTransform) {
+        return undefined;
+    }
+    try {
+        return options.fastTransform(text, {
+            filename: document.getFilePath() ?? undefined,
+            isTsFile: scriptKind === ts.ScriptKind.TS,
+            namespace: document.config?.compilerOptions?.namespace,
+            accessors:
+                document.config?.compilerOptions?.accessors ??
+                (typeof document.config?.compilerOptions?.customElement === 'boolean'
+                    ? document.config.compilerOptions.customElement
+                    : undefined)
+        });
+    } catch {
+        return undefined;
+    }
+}
+
+/**
  * Tries to preprocess the svelte document and convert the contents into better analyzable js/ts(x) content.
  */
 function preprocessSvelteFile(document: Document, options: SvelteSnapshotOptions) {
@@ -237,29 +288,31 @@ function preprocessSvelteFile(document: Document, options: SvelteSnapshotOptions
         : ts.ScriptKind.JS;
 
     try {
-        const tsx = svelte2tsx(text, {
-            parse: options.parse,
-            version: options.version,
-            filename: document.getFilePath() ?? undefined,
-            isTsFile: scriptKind === ts.ScriptKind.TS,
-            mode: 'ts',
-            typingsNamespace: options.typingsNamespace,
-            emitOnTemplateError: options.transformOnTemplateError,
-            namespace: document.config?.compilerOptions?.namespace,
-            accessors:
-                document.config?.compilerOptions?.accessors ??
-                (typeof document.config?.compilerOptions?.customElement === 'function'
-                    ? // @ts-ignore with Svelte 4 this is never callable
-                      document.config.compilerOptions.customElement({
-                          filename: document.getFilePath() ?? ''
-                      })
-                    : document.config?.compilerOptions?.customElement),
-            emitJsDoc: options.emitJsDoc,
-            rewriteExternalImports: options.rewriteExternalImports
-        });
+        const tsx =
+            tryFastTransform(document, options, text, scriptKind) ??
+            svelte2tsx(text, {
+                parse: options.parse,
+                version: options.version,
+                filename: document.getFilePath() ?? undefined,
+                isTsFile: scriptKind === ts.ScriptKind.TS,
+                mode: 'ts',
+                typingsNamespace: options.typingsNamespace,
+                emitOnTemplateError: options.transformOnTemplateError,
+                namespace: document.config?.compilerOptions?.namespace,
+                accessors:
+                    document.config?.compilerOptions?.accessors ??
+                    (typeof document.config?.compilerOptions?.customElement === 'function'
+                        ? // @ts-ignore with Svelte 4 this is never callable
+                          document.config.compilerOptions.customElement({
+                              filename: document.getFilePath() ?? ''
+                          })
+                        : document.config?.compilerOptions?.customElement),
+                emitJsDoc: options.emitJsDoc,
+                rewriteExternalImports: options.rewriteExternalImports
+            });
         text = tsx.code;
         tsxMap = tsx.map as EncodedSourceMap;
-        exportedNames = tsx.exportedNames;
+        exportedNames = tsx.exportedNames ?? exportedNames;
         // We know it's there, it's not part of the public API so people don't start using it
         htmlAst = (tsx as any).htmlAst;
 
