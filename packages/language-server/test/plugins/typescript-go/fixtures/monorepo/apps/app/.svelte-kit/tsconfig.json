@@ -1,0 +1,7 @@
+{
+    "compilerOptions": {
+        "rootDirs": ["..", "./types"],
+        "paths": { "$lib": ["../src/lib"], "$lib/*": ["../src/lib/*"] }
+    },
+    "include": ["./types/**/$types.d.ts", "../src/**/*.js", "../src/**/*.ts", "../src/**/*.svelte"]
+}
