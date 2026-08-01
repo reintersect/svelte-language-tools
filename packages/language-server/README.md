@@ -17,11 +17,11 @@
 > | editor: keystroke → diagnostics       | 948ms    | **420ms** |
 >
 > These figures predate the current correctness and lifecycle hardening and are historical context,
-> not current performance claims. The 1 August 2026 paired acceptance run on the same corpus found
-> fresh-process p50 of 5.65s for classic versus 16.31s for stock tsgo (Effect: 16.32s versus 5.71s).
-> Dependency discovery consumed roughly 13s of the native path; warm shadow materialisation itself
-> reused all 663 candidates in about 168ms with zero transforms or writes. That cold-start regression
-> is measured and not hidden behind the older table.
+> not current performance claims. The post-fix 1 August 2026 acceptance run found editor
+> fresh-process p50/p95 of 6.41s/7.97s classic versus 4.59s/5.40s stock tsgo. A separate strict
+> whole-project checker oracle completed in 17.3s classic versus 6.7s stock. Fail-fast dependency
+> discovery reduced the native adapter phase from roughly 13-17s to 1.45s; a warm checker reused all
+> 663 Svelte shadows in 148ms with zero transforms or writes.
 >
 > `pnpm test:tsgo-oracle` compares meaningful editor features against the classic engine, and the
 > whole-project checker oracle compares diagnostics plus normalized program membership. Exact parity
@@ -108,12 +108,12 @@ the default JS transform reports everything.
 ### Historical performance context
 
 An earlier build measured diagnostics after a keystroke at roughly 400ms instead of roughly 950ms,
-and a large-project open at roughly 3.5s instead of roughly 7.5s. The current paired run did not
-preserve that cold-start result: stock tsgo was 16.31s p50 against classic's 5.65s because dependency
-discovery took roughly 13s. The 80ms pull-diagnostic candidate improved stock native latency but
-raised CPU by 26.8% and native checks by 34.6%; Effect also regressed p95, so the tested default
-remains 150ms. Hover, completion, go-to-definition and rename are all routed through tsgo when the
-engine is enabled.
+and a large-project open at roughly 3.5s instead of roughly 7.5s. The current paired editor run
+measured stock tsgo at 4.59s p50 against classic's 6.41s after aborting dependency proof work as soon
+as the conservative fallback became inevitable. The 80ms pull-diagnostic candidate improved
+p50/p95 latency by 10.2%/11.6%, but raised CPU by 31.4% and native checks by 46.7%, so the tested
+default remains 150ms. Hover, completion, go-to-definition and rename are all routed through tsgo
+when the engine is enabled.
 
 ### What to expect that is different
 

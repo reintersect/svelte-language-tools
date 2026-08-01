@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.7
+
+### Patch Changes
+
+-   Stop native dependency reachability analysis as soon as an ambiguity requires the conservative
+    declared-package fallback. This avoids parsing the rest of a dependency graph whose result cannot be
+    used, while preserving the same fallback components, diagnostics, and source-program membership.
+
 ## 0.19.6
 
 ### Patch Changes

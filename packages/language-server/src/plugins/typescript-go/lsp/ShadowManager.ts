@@ -966,6 +966,7 @@ export class ShadowManager {
                 this.batchConfigDirectory,
                 this.sourceRoot,
                 this.reachabilityCache,
+                false,
                 this.batchForwardSourceEdges,
                 this.batchReverseSourceEdges,
                 this.batchPackagePrivateSourceEdges
@@ -5331,6 +5332,7 @@ function collectPublicPackageSourceGraph(
     configDirectory = packageRoot,
     sourceRoot = packageRoot,
     cache = createReachabilityCache(compilerOptions, configDirectory),
+    failFastOnFallback = false,
     forwardEdges?: Map<string, Set<string>>,
     reverseEdges?: Map<string, Set<string>>,
     packagePrivateEdges?: Map<string, Set<string>>
@@ -5349,6 +5351,15 @@ function collectPublicPackageSourceGraph(
     const fallbackReasons = new Set(entries.fallbackReasons);
     const packageNames = new Set<string>();
     const sourceFiles = new Set<string>();
+    const result = () => ({
+        packageNames: [...packageNames],
+        sourceFiles: [...sourceFiles],
+        fallbackReasons: [...fallbackReasons]
+    });
+    const shouldStop = () => failFastOnFallback && fallbackReasons.size > 0;
+    if (shouldStop()) {
+        return result();
+    }
     const normalizedPackageRoot = normalizePath(packageRoot);
     const realPackageRoot = realPathOrSelf(packageRoot);
     const isInsidePackage = (fileName: string) => {
@@ -5429,12 +5440,21 @@ function collectPublicPackageSourceGraph(
             analysis = analyzeReachabilitySource(fileName, cache);
         } catch {
             fallbackReasons.add(`unreadable-dependency-entry:${fileName}`);
+            if (shouldStop()) {
+                return result();
+            }
             continue;
         }
         followDirectiveReferences(fileName, analysis, publicQueue, 'public');
+        if (shouldStop()) {
+            return result();
+        }
         const publicEdges = collectPublicExportEdges(fileName, analysis.text);
         if (publicEdges.computed) {
             fallbackReasons.add(`computed-dependency-entry:${fileName}`);
+            if (shouldStop()) {
+                return result();
+            }
         }
         for (const specifier of publicEdges.specifiers) {
             const packageName = packageNameFromSpecifier(specifier);
@@ -5456,6 +5476,9 @@ function collectPublicPackageSourceGraph(
                         trackUnresolvedRelativePublicEdge(specifier, fileName, cache))
                 ) {
                     fallbackReasons.add(`unresolved-dependency-entry:${fileName}:${specifier}`);
+                    if (shouldStop()) {
+                        return result();
+                    }
                 }
                 continue;
             }
@@ -5480,6 +5503,9 @@ function collectPublicPackageSourceGraph(
     }
     if (publicCursor < publicQueue.length) {
         fallbackReasons.add(`dependency-public-source-graph-limit:${packageRoot}`);
+        if (shouldStop()) {
+            return result();
+        }
     }
 
     // Then follow implementation imports only while they stay inside this package. This keeps
@@ -5498,9 +5524,15 @@ function collectPublicPackageSourceGraph(
             analysis = analyzeReachabilitySource(fileName, cache);
         } catch {
             fallbackReasons.add(`unreadable-dependency-entry:${fileName}`);
+            if (shouldStop()) {
+                return result();
+            }
             continue;
         }
         followDirectiveReferences(fileName, analysis, queue, 'source');
+        if (shouldStop()) {
+            return result();
+        }
         for (const imported of analysis.preprocessed.importedFiles) {
             const specifier = imported.fileName;
             if (
@@ -5542,11 +5574,7 @@ function collectPublicPackageSourceGraph(
     if (cursor < queue.length) {
         fallbackReasons.add(`dependency-source-graph-limit:${packageRoot}`);
     }
-    return {
-        packageNames: [...packageNames],
-        sourceFiles: [...sourceFiles],
-        fallbackReasons: [...fallbackReasons]
-    };
+    return result();
 }
 
 /** Traverse only packages named by reachable public entry/import edges. */
@@ -5599,10 +5627,17 @@ function collectReachableDependencyRoots(
             compilerOptions,
             configDirectory,
             sourceRoot,
-            cache
+            cache,
+            true
         );
         for (const reason of graph.fallbackReasons) {
             fallbackReasons.add(reason);
+        }
+        // Any ambiguity makes the narrow dependency proof unusable and the caller performs the
+        // authoritative declared-closure scan. Return immediately instead of parsing and caching
+        // a dependency graph that will be discarded.
+        if (fallbackReasons.size) {
+            return { roots, fallbackReasons: [...fallbackReasons] };
         }
         for (const packageName of graph.packageNames) {
             const root = resolveDependencyRoot(packageName, current, cache);

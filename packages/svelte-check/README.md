@@ -17,11 +17,11 @@
 > | editor: keystroke → diagnostics       | 948ms    | **420ms** |
 >
 > These figures predate the current correctness and lifecycle hardening and are historical context,
-> not current performance claims. The 1 August 2026 paired acceptance run on the same corpus found
-> fresh-process p50 of 5.65s for classic versus 16.31s for stock tsgo (Effect: 16.32s versus 5.71s).
-> Dependency discovery consumed roughly 13s of the native path; warm shadow materialisation itself
-> reused all 663 candidates in about 168ms with zero transforms or writes. That cold-start regression
-> is measured and not hidden behind the older table.
+> not current performance claims. The post-fix 1 August 2026 acceptance run found editor
+> fresh-process p50/p95 of 6.41s/7.97s classic versus 4.59s/5.40s stock tsgo. A separate strict
+> whole-project checker oracle completed in 17.3s classic versus 6.7s stock. Fail-fast dependency
+> discovery reduced the native adapter phase from roughly 13-17s to 1.45s; a warm checker reused all
+> 663 Svelte shadows in 148ms with zero transforms or writes.
 >
 > Focused fixtures are diffed against the classic engine including code, message, severity and full
 > range. That is a tested invariant rather than a universal promise: TypeScript 6 and the evolving
@@ -49,7 +49,7 @@ the flag it behaves exactly like upstream.
 same for every package at once):
 
 ```bash
-pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.5 @reintersect/effect-tsgo
+pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.6 @reintersect/effect-tsgo
 ```
 
 **2. Add `--tsgo` to your check script.** It requires an explicit tsconfig:

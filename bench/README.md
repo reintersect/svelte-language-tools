@@ -29,20 +29,23 @@ transformed, reused, and written shadow counts plus phase timings and the exact 
 
 ## Reintersect acceptance, 1 August 2026
 
-The full uncontended run used warm disk state, 10 alternating fresh-process pairs, 20 edit rounds at
-each required gap, and 200 open/change/close cycles per native engine.
+The post-fix full uncontended run used warm disk state, 10 alternating fresh-process pairs, 20 edit
+rounds at each required gap, and 200 open/change/close cycles with stock
+`@typescript/native-preview@7.0.0-dev.20260703.1`.
 
--   Stock `@typescript/native-preview@7.0.0-dev.20260703.1`: classic p50/p95 5.65s/5.97s;
-    native 16.31s/16.89s. Lifecycle overlays returned 0 -> 0 and plateau RSS grew 2.5%.
--   `@reintersect/effect-tsgo@0.27.3`: classic p50/p95 5.71s/6.17s; native
-    16.32s/17.17s. Lifecycle overlays returned 0 -> 0 and plateau RSS grew 2.7%.
--   Both warm checker runs produced field-identical records, left 924 shadow mtimes stable, and
-    reused 663 Svelte shadows with zero transforms or writes.
--   The 80ms candidate failed the resource gate. Stock improved p50/p95 latency by 14.9%/10.7% but
-    raised CPU 26.8% and checks 34.6%; Effect raised CPU 25.0%, checks 25.6%, and regressed p95
-    51.6%. The default therefore remains 150ms.
+-   Editor cold p50/p95 was 6.41s/7.97s classic versus 4.59s/5.40s native (1.4x at p50).
+-   A separate strict whole-project checker oracle completed in 17.3s classic versus 6.7s stock,
+    with field-identical diagnostics and normalized source-program membership.
+-   Dependency discovery fell from roughly 13-17s to 1.45s by stopping at the first ambiguity and
+    immediately taking the same conservative declared-package fallback.
+-   The warm incremental checker reused 663 Svelte shadows in 148ms with zero transforms or writes,
+    identical diagnostics, and stable shadow mtimes.
+-   After 200 lifecycle cycles, open overlays returned 0 -> 0 and plateau RSS grew 3.9%.
+-   The 80ms candidate failed the resource gate: p50/p95 improved 10.2%/11.6%, but CPU rose 31.4%
+    and native checks rose 46.7%. The default therefore remains 150ms.
+-   The Effect engine passed the separate source-program comparison with only diagnostic codes
+    377021 and 377025 explicitly allowlisted as its intentional Effect checks.
 
-The cold native regression is dominated by dependency discovery (roughly 13-13.5s), not shadow
-transformation. This corpus falls back to the declared dependency closure after computed dependency
-entries make exact reachability unprovable. Treat the older speedup snapshots as historical until
-that graph work is reduced without changing source-program membership.
+The native compiler phase is roughly 1.0-1.2s on this corpus. The remaining adapter cost is mainly
+project/config graph setup and the bounded dependency proof before fallback, not shadow
+transformation or native TypeScript execution.

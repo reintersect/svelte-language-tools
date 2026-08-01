@@ -1881,6 +1881,67 @@ describe('typescript-go ShadowManager', () => {
         );
     });
 
+    it('stops dependency proof work after the first ambiguity before taking the broad fallback', () => {
+        const root = tempProject();
+        fs.writeFileSync(
+            `${root}/package.json`,
+            JSON.stringify({
+                name: 'consumer',
+                dependencies: { 'a-ambiguous': '1.0.0', 'z-component': '1.0.0' }
+            })
+        );
+        fs.writeFileSync(`${root}/src/main.ts`, 'import "a-ambiguous"; import "z-component";');
+        const ambiguous = `${root}/node_modules/a-ambiguous`;
+        const later = `${root}/node_modules/z-component`;
+        fs.mkdirSync(ambiguous, { recursive: true });
+        fs.mkdirSync(later, { recursive: true });
+        fs.writeFileSync(
+            `${ambiguous}/package.json`,
+            JSON.stringify({ name: 'a-ambiguous', version: '1.0.0', main: './index.js' })
+        );
+        fs.writeFileSync(
+            `${ambiguous}/index.js`,
+            'const target = "somewhere"; module.exports = require(target);'
+        );
+        fs.writeFileSync(
+            `${later}/package.json`,
+            JSON.stringify({
+                name: 'z-component',
+                version: '1.0.0',
+                main: './index.js',
+                peerDependencies: { svelte: '^5' }
+            })
+        );
+        fs.writeFileSync(`${later}/index.js`, 'module.exports = {};');
+        const component = `${later}/Component.svelte`;
+        fs.writeFileSync(component, '<p />');
+
+        const shadows = new ShadowManager({
+            projectPath: root,
+            sourceRoot: root,
+            tsconfigPath: `${root}/tsconfig.json`,
+            snapshotOptions
+        });
+        shadows.writeOverlayTsconfig([]);
+
+        assert.deepStrictEqual(shadows.findDependencySvelteFiles(), [component]);
+        const stats = shadows.getDependencyScopeStats();
+        assert.strictEqual(stats.mode, 'declared-fallback');
+        assert.strictEqual(
+            stats.fallbackReasons.some((reason) =>
+                reason.startsWith('dependency-root-closure-limit:')
+            ),
+            false
+        );
+        assert.strictEqual(
+            shadows
+                .getBatchGraphPlanSourceInputs()
+                .some((input) => input.path === `${later}/index.js`),
+            false,
+            'the later public entry must not be parsed after fallback is inevitable'
+        );
+    });
+
     it('retains declared dependency scanning when the project graph is ambiguous', () => {
         const root = tempProject();
         fs.writeFileSync(
