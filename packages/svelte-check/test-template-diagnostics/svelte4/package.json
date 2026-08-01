@@ -1,0 +1,8 @@
+{
+    "name": "svelte-check-template-diagnostics-svelte4",
+    "private": true,
+    "type": "module",
+    "dependencies": {
+        "svelte": "4.2.20"
+    }
+}

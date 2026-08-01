@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.19.6
+
+### Patch Changes
+
+-   Harden the tsgo editor engine across UTF-16 template mappings, definitions and component
+    references, dirty Svelte and TS-family document lifecycles, crash replay, watched-file forwarding,
+    configuration gates, workspace trust, project invalidation, dependency graphs, mapped edits and
+    single-flight diagnostics. Resolve each native executable with its exact matching API and version,
+    and use `@reintersect/svelte-load-config` as the canonical configuration runtime.
+-   Updated dependencies []:
+    -   @reintersect/svelte-load-config@0.2.4
+
 ## 0.19.5
 
 ### Patch Changes

@@ -12,6 +12,7 @@ export class LspClient {
         this.stderr = '';
         this.exited = null;
         this.exitHandlers = new Set();
+        this.forceKillTimer = undefined;
 
         this.proc.stdout.on('data', (d) => this._onData(d));
         this.proc.stderr.on('data', (d) => (this.stderr += d.toString()));
@@ -21,6 +22,10 @@ export class LspClient {
     }
 
     _terminate(exit) {
+        if (this.forceKillTimer) {
+            clearTimeout(this.forceKillTimer);
+            this.forceKillTimer = undefined;
+        }
         if (this.exited) return;
         if (!exit.error && this.buf.length) {
             exit = {
@@ -84,9 +89,25 @@ export class LspClient {
         const error = new Error(`malformed LSP output: ${message}\n${this.stderr}`);
         this.buf = Buffer.alloc(0);
         this._terminate({ code: null, sig: null, error });
+        this._killProcessBounded();
+    }
+
+    _killProcessBounded() {
+        if (this.proc.exitCode !== null || this.proc.signalCode !== null) return;
         try {
-            this.proc.kill();
+            this.proc.kill('SIGTERM');
         } catch {}
+        if (this.forceKillTimer) return;
+        this.forceKillTimer = setTimeout(() => {
+            this.forceKillTimer = undefined;
+            try {
+                this.proc.kill('SIGKILL');
+            } catch {}
+            this.proc.stdin.destroy();
+            this.proc.stdout.destroy();
+            this.proc.stderr.destroy();
+            this.proc.unref();
+        }, 1_000);
     }
 
     _dispatch(msg) {
@@ -184,9 +205,7 @@ export class LspClient {
     }
 
     dispose() {
-        try {
-            this.proc.kill();
-        } catch {}
+        this._killProcessBounded();
     }
 }
 

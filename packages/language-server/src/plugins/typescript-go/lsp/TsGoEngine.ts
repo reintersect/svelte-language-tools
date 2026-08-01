@@ -47,6 +47,16 @@ export function resolveTsGoEngine(
         }
         try {
             const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            // `package.json` is normally resolved by package name, but packages may export that
+            // subpath to an arbitrary JSON file. Never pair a requested engine name with a
+            // launcher/API owned by a different package.
+            if (manifest.name !== packageName) {
+                continue;
+            }
+            const version = manifest.version;
+            if (typeof version !== 'string' || version.trim().length === 0) {
+                continue;
+            }
             const bin = manifest.bin;
             const binRelative = typeof bin === 'string' ? bin : (bin?.tsgo ?? bin?.tsc);
             if (typeof binRelative !== 'string') {
@@ -61,7 +71,7 @@ export function resolveTsGoEngine(
             const nodeLauncher = isNodeLauncher(binPath);
             return {
                 packageName,
-                version: String(manifest.version ?? 'unknown'),
+                version,
                 packageRoot,
                 binPath,
                 command: nodeLauncher ? process.execPath : binPath,

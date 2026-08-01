@@ -34,11 +34,24 @@ export {
 } from './TsGoEngine';
 export { ShadowManager, findProjectTsconfig, findWorkspaceRoot } from './ShadowManager';
 export {
+    BatchMaterialisationPlanTelemetry,
+    BatchMaterialisePhaseTimings,
+    BatchMaterialiseResult,
+    BatchOverlayCreationTimings,
     TsGoBatchOverlay,
     FileDiagnostics,
     GeneratedDiagnostic,
     TsGoBatchOverlayOptions
 } from './BatchOverlay';
+export {
+    MATERIALISATION_PLAN_SCHEMA_VERSION,
+    MaterialisationPlanCache,
+    MaterialisationPlanCacheCounters,
+    MaterialisationPlanIdentity,
+    MaterialisationPlanLookup,
+    MaterialisationPlanMissReason,
+    MaterialisationPlanWriteResult
+} from './MaterialisationPlanCache';
 
 /**
  * Feature flag for the tsgo engine, off by default.
@@ -111,7 +124,7 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
     if (!engine) {
         Logger.error(
             '[tsgo] SVELTE_LS_TSGO is set but no tsgo binary was found. ' +
-                'Install @reintersect/effect-tsgo or @typescript/native-preview.'
+                'Install @reintersect/effect-tsgo, @typescript/native, or @typescript/native-preview.'
         );
         return undefined;
     }
@@ -260,6 +273,10 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
             });
             shadows.setShimResolver(resolveShims);
             shadows.setSnapshotOptionsResolver(resolveSnapshotOptions);
+            // Shared checker mirrors can affect native extension substitution in the editor too.
+            // Discover/adopt their source graph before paths/rootDirs are frozen into the config;
+            // TsGoPlugin publishes every resulting output in one source-root transaction.
+            shadows.prepareBatchModuleMirrors();
             shadows.writeOverlayTsconfig(resolveShims(root));
             return shadows;
         },
@@ -269,7 +286,7 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
         fallbackRoot: options.workspacePath
     });
 
-    const server = new TsGoServer({
+    const server: TsGoServer = new TsGoServer({
         engine,
         // Root tsgo at the source root, which is the one directory guaranteed to contain every
         // mirror. Project selection is per-file — tsgo walks up from the opened file until it
@@ -291,6 +308,8 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
             );
         },
         onDidRegisterWatchers: options.onDidRegisterWatchers,
+        beforeStart: (): Promise<void> =>
+            plugin?.awaitProjectPublicationsBeforeStart() ?? Promise.resolve(),
         onRestart: () => {
             Logger.error('[tsgo] server exited; a new one will replay the open documents');
             // Everything attached to the dead process has to let go of it: the checker pipe,
@@ -343,7 +362,7 @@ export function createTsGoPlugin(options: TsGoSetupOptions): TsGoPlugin | undefi
     );
 
     Logger.log(`[tsgo] enabled, using ${engine.packageName}@${engine.version} (${engine.binPath})`);
-    const plugin = new TsGoPlugin({
+    const plugin: TsGoPlugin = new TsGoPlugin({
         server,
         projects,
         docManager: options.docManager,

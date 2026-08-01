@@ -46,7 +46,7 @@ jobs:
               const p = require(f);
               return (p.devDependencies?.['@reintersect/effect-tsgo']
                 ?? p.dependencies?.['@reintersect/effect-tsgo']
-                ?? '').replace(/^[^0-9]*/, '') || 'none';
+                ?? 'none');
             });
             new Set(versions).size === 1 ? versions[0] : 'mismatched'
           ")
@@ -98,6 +98,7 @@ jobs:
             console.log(engine.packageName + '@' + engine.version + ' -> ' + engine.binPath);
           "
           pnpm --filter @reintersect/svelte-language-server test
+          node bench/compare-lsp-features.mjs --effect
           cd packages/svelte-check && npx rollup -c && pnpm test:sanity && pnpm test:flush
 
       - name: Open the PR
@@ -121,3 +122,9 @@ jobs:
             this fork depends on that are not stable API: the undocumented `tsgo --lsp -stdio`
             entry point, `custom/initializeAPISession`, and the `--pretty`/`--listFiles` output
             shapes that `svelte-check --tsgo` parses. If the sanity tests went red, start there.
+
+      # Keep the reporting PR even when verification fails, but never let its successful creation
+      # hide the failed engine gate in the workflow conclusion.
+      - name: Enforce native-engine verification
+        if: always() && steps.v.outputs.changed == 'yes' && steps.verify.outcome != 'success'
+        run: exit 1

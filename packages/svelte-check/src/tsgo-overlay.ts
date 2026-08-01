@@ -2,6 +2,8 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+    BatchOverlayCreationTimings,
+    BatchMaterialiseResult,
     FileDiagnostics,
     GeneratedDiagnostic,
     SvelteCheck,
@@ -43,8 +45,8 @@ export async function runTsGoCheck(opts: SvelteCheckCliOptions): Promise<FileDia
     });
     if (!overlay) {
         throw new Error(
-            'svelte-check --tsgo could not find a tsgo binary. Install @reintersect/effect-tsgo ' +
-                'or @typescript/native-preview in the workspace.'
+            'svelte-check --tsgo could not find a tsgo binary. Install @reintersect/effect-tsgo, ' +
+                '@typescript/native, or @typescript/native-preview in the workspace.'
         );
     }
 
@@ -132,6 +134,7 @@ export async function runTsGoCheck(opts: SvelteCheckCliOptions): Promise<FileDia
         materialise,
         phases: {
             createOverlayMs: createDurationMs,
+            createOverlay: overlay.creationTimings,
             nativeCheckMs: nativeDurationMs,
             mapDiagnosticsMs: mappingDurationMs,
             svelteAndCssMs: svelteDurationMs,
@@ -164,15 +167,10 @@ interface TsGoCheckStats {
     engine: { packageName: string; version: string };
     incremental: boolean;
     cacheState: 'warm' | 'cold-or-invalidated' | 'mixed';
-    materialise: {
-        shadowCount: number;
-        transformedCount: number;
-        reusedCount: number;
-        writtenCount: number;
-        durationMs: number;
-    };
+    materialise: BatchMaterialiseResult;
     phases: {
         createOverlayMs: number;
+        createOverlay: BatchOverlayCreationTimings;
         nativeCheckMs: number;
         mapDiagnosticsMs: number;
         svelteAndCssMs: number;
@@ -227,6 +225,7 @@ const ansiEscape = /\x1b\[[0-9;]*m/g;
 interface NativeOutputParseResult {
     diagnostics: ParsedDiagnostic[];
     files: string[];
+    terminalErrorCount?: number;
     outputTail: string;
 }
 
@@ -243,6 +242,8 @@ class NativeCompilerStreamParser {
     private readonly files: string[] = [];
     private readonly seenFiles = new Set<string>();
     private tail = '';
+    private inSummaryTable = false;
+    private terminalErrorCount: number | undefined;
 
     constructor(private readonly baseDir: string) {}
 
@@ -261,14 +262,24 @@ class NativeCompilerStreamParser {
         }
     }
 
-    finish(): { diagnostics: ParsedDiagnostic[]; files: string[]; tail: string } {
+    finish(): {
+        diagnostics: ParsedDiagnostic[];
+        files: string[];
+        terminalErrorCount?: number;
+        tail: string;
+    } {
         if (this.pending) {
             const line = this.pending.endsWith('\r') ? this.pending.slice(0, -1) : this.pending;
             this.pending = '';
             this.acceptLine(line);
         }
         this.flushDiagnostic();
-        return { diagnostics: this.diagnostics, files: this.files, tail: this.tail.trimEnd() };
+        return {
+            diagnostics: this.diagnostics,
+            files: this.files,
+            terminalErrorCount: this.terminalErrorCount,
+            tail: this.tail.trimEnd()
+        };
     }
 
     outputTail(): string {
@@ -281,21 +292,46 @@ class NativeCompilerStreamParser {
         const isHeader = diagnosticHeader.test(trimmed);
         const listed = parseListedFiles(line)[0];
         const isSummary = diagnosticSummary.test(trimmed);
+        const terminalSummary = /^Found (\d+) errors?\b/i.exec(trimmed);
+        const isSummaryRow = this.inSummaryTable && /^\d+\s{2,}.+:\d+$/.test(trimmed);
         if (isHeader || listed || isSummary) {
             this.flushDiagnostic();
+        }
+        if (isHeader || listed) {
+            this.inSummaryTable = false;
+        } else if (isSummary) {
+            this.inSummaryTable = /^Errors\s+Files?\b/i.test(trimmed);
         }
         if (isHeader) {
             this.block = [line];
             this.blockBytes = Buffer.byteLength(line);
-        } else if (listed && !this.seenFiles.has(listed)) {
-            this.seenFiles.add(listed);
-            this.files.push(listed);
+        } else if (listed) {
+            if (this.terminalErrorCount !== undefined) {
+                throw new Error(
+                    `native compiler emitted a program file after its terminal summary: ${listed}`
+                );
+            }
+            if (!this.seenFiles.has(listed)) {
+                this.seenFiles.add(listed);
+                this.files.push(listed);
+            }
         } else if (this.block.length) {
             this.block.push(line);
             this.blockBytes += Buffer.byteLength(line) + 1;
             if (this.blockBytes > 16 * 1024 * 1024) {
                 throw new Error('native compiler emitted a diagnostic block larger than 16 MiB');
             }
+        } else if (trimmed && !isSummary && !isSummaryRow) {
+            throw new Error(`native compiler emitted an unrecognized output line: ${trimmed}`);
+        }
+        if (terminalSummary) {
+            const count = Number(terminalSummary[1]);
+            if (this.terminalErrorCount !== undefined && this.terminalErrorCount !== count) {
+                throw new Error(
+                    `native compiler emitted conflicting terminal summaries: ${this.terminalErrorCount} and ${count}`
+                );
+            }
+            this.terminalErrorCount = count;
         }
         this.tail = `${this.tail}${line}\n`.slice(-64 * 1024);
     }
@@ -343,9 +379,18 @@ export class NativeCompilerOutputCollector {
             seen.add(file);
             return true;
         });
+        const terminalCounts = [stdout.terminalErrorCount, stderr.terminalErrorCount].filter(
+            (count): count is number => count !== undefined
+        );
+        if (new Set(terminalCounts).size > 1) {
+            throw new Error(
+                `native compiler streams emitted conflicting terminal summaries: ${terminalCounts.join(' and ')}`
+            );
+        }
         return {
             diagnostics: [...stdout.diagnostics, ...stderr.diagnostics],
             files,
+            terminalErrorCount: terminalCounts[0],
             outputTail: [stdout.tail, stderr.tail].filter(Boolean).join('\n')
         };
     }
@@ -394,38 +439,82 @@ async function runTsGo(
         const collector = new NativeCompilerOutputCollector(cwd);
         let outputBytes = 0;
         let terminalError: Error | undefined;
+        let settled = false;
+        let forceKill: NodeJS.Timeout | undefined;
         const outputLimit = 64 * 1024 * 1024;
         const configuredTimeout = Number(process.env.SVELTE_LS_TSGO_TIMEOUT_MS);
         const timeoutMs =
             Number.isFinite(configuredTimeout) && configuredTimeout > 0
                 ? configuredTimeout
                 : 5 * 60_000;
-        const timeout = setTimeout(() => {
-            terminalError = new Error(
-                `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) timed out after ${timeoutMs}ms`
+        const clearTimers = () => {
+            clearTimeout(timeout);
+            if (forceKill) clearTimeout(forceKill);
+        };
+        const rejectOnce = (error: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimers();
+            reject(error);
+        };
+        const rejectTerminalError = () => {
+            const error = terminalError ?? new Error('native compiler terminated unexpectedly');
+            rejectOnce(
+                new Error(`${error.message}${formatCompilerOutput(collector.outputTail())}`)
             );
-            proc.kill();
-        }, timeoutMs);
+        };
+        const terminate = (error: Error) => {
+            if (terminalError || settled) return;
+            terminalError = error;
+            try {
+                proc.kill('SIGTERM');
+            } catch {
+                // The close/error path below is still authoritative when the process already died.
+            }
+            // SIGTERM is catchable. Never let a broken engine defeat the checker timeout or a
+            // parser/output-limit failure by retaining its pipes forever.
+            forceKill = setTimeout(() => {
+                try {
+                    proc.kill('SIGKILL');
+                } catch {
+                    // Reject below even if the OS already reaped the child.
+                }
+                proc.stdout.destroy();
+                proc.stderr.destroy();
+                proc.unref();
+                rejectTerminalError();
+            }, 1_000);
+        };
+        const timeout = setTimeout(
+            () =>
+                terminate(
+                    new Error(
+                        `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) timed out after ${timeoutMs}ms`
+                    )
+                ),
+            timeoutMs
+        );
         const collect = (target: 'stdout' | 'stderr', data: string) => {
             if (terminalError) {
                 return;
             }
             outputBytes += Buffer.byteLength(data);
             if (outputBytes > outputLimit) {
-                terminalError = new Error(
-                    `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) produced more than ${outputLimit} bytes of output`
+                terminate(
+                    new Error(
+                        `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) produced more than ${outputLimit} bytes of output`
+                    )
                 );
-                proc.kill();
                 return;
             }
             try {
                 collector.push(target, data);
             } catch (error) {
-                terminalError =
+                terminate(
                     error instanceof Error
                         ? error
-                        : new Error(`could not parse native compiler output: ${String(error)}`);
-                proc.kill();
+                        : new Error(`could not parse native compiler output: ${String(error)}`)
+                );
             }
         };
         proc.stdout.setEncoding('utf-8');
@@ -433,26 +522,27 @@ async function runTsGo(
         proc.stdout.on('data', (data: string) => collect('stdout', data));
         proc.stderr.on('data', (data: string) => collect('stderr', data));
         proc.stdout.on('error', (error) => {
-            terminalError = error;
-            proc.kill();
+            terminate(error);
         });
         proc.stderr.on('error', (error) => {
-            terminalError = error;
-            proc.kill();
+            terminate(error);
         });
         proc.on('error', (error) => {
-            clearTimeout(timeout);
-            reject(error);
+            if (terminalError) rejectTerminalError();
+            else rejectOnce(error);
         });
         proc.on('close', (code, signal) => {
-            clearTimeout(timeout);
+            if (settled) return;
+            clearTimers();
             const outputTail = collector.outputTail();
             if (terminalError) {
-                reject(new Error(`${terminalError.message}${formatCompilerOutput(outputTail)}`));
+                rejectOnce(
+                    new Error(`${terminalError.message}${formatCompilerOutput(outputTail)}`)
+                );
                 return;
             }
             if (signal) {
-                reject(
+                rejectOnce(
                     new Error(
                         `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) was terminated by ${signal}${formatCompilerOutput(outputTail)}`
                     )
@@ -460,9 +550,11 @@ async function runTsGo(
                 return;
             }
             try {
-                resolve({ parsed: collector.finish(), exitCode: code ?? -1 });
+                const completed = collector.finish();
+                settled = true;
+                resolve({ parsed: completed, exitCode: code ?? -1 });
             } catch (error) {
-                reject(
+                rejectOnce(
                     new Error(
                         `could not parse tsgo (${overlay.engine.packageName}@${overlay.engine.version}) output: ${
                             error instanceof Error ? error.message : String(error)
@@ -483,17 +575,27 @@ async function runTsGo(
         }))
     }));
     const files = parsed.files.map(preservePathSpelling);
+    const errorCount = diagnostics.filter(
+        (diagnostic) => diagnostic.severity === DiagnosticSeverity.Error
+    ).length;
     if (![0, 1, 2].includes(exitCode)) {
         throw new Error(
             `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) exited with invalid status ${exitCode}${formatCompilerOutput(parsed.outputTail)}`
         );
     }
-    if (
-        exitCode !== 0 &&
-        !diagnostics.some((diagnostic) => diagnostic.severity === DiagnosticSeverity.Error)
-    ) {
+    if (exitCode !== 0 && errorCount === 0) {
         throw new Error(
             `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) exited with code ${exitCode} without an error diagnostic${formatCompilerOutput(parsed.outputTail)}`
+        );
+    }
+    if (exitCode !== 0 && parsed.terminalErrorCount === undefined) {
+        throw new Error(
+            `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) exited with code ${exitCode} before emitting its terminal error summary${formatCompilerOutput(parsed.outputTail)}`
+        );
+    }
+    if (parsed.terminalErrorCount !== undefined && parsed.terminalErrorCount !== errorCount) {
+        throw new Error(
+            `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) terminal summary reported ${parsed.terminalErrorCount} errors but ${errorCount} complete error diagnostics were parsed${formatCompilerOutput(parsed.outputTail)}`
         );
     }
     if (
@@ -599,7 +701,15 @@ function remapOverlayConfigDiagnostic(
     if (!isOverlayConfig) {
         return diagnostic;
     }
-    return { ...diagnostic, filePath: null, line: 0, character: 0, length: 1 };
+    return {
+        ...diagnostic,
+        filePath: null,
+        line: 0,
+        character: 0,
+        length: 1,
+        endLine: undefined,
+        endCharacter: undefined
+    };
 }
 
 function isConfigurationDiagnostic(diagnostic: GeneratedDiagnostic): boolean {
@@ -618,7 +728,7 @@ async function getSvelteAndCssDiagnostics(
     svelteFiles: string[]
 ): Promise<FileDiagnostics[]> {
     const sources = opts.diagnosticSources.filter((source) => source !== 'js');
-    if (!sources.length || !svelteFiles.length) {
+    if (!svelteFiles.length) {
         return [];
     }
 
@@ -628,6 +738,10 @@ async function getSvelteAndCssDiagnostics(
         configPath: opts.config,
         watch: false
     });
+
+    if (!sources.length) {
+        return svelteCheck.getConfigLoadDiagnostics(svelteFiles);
+    }
 
     for (const filePath of svelteFiles) {
         try {

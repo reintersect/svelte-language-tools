@@ -52,6 +52,15 @@ export class TsGoComponentInfo {
         this.definitionCache.clear();
     }
 
+    /**
+     * A dirty TS/JS overlay can retarget a barrel without touching either the Svelte usage or
+     * the old/new component declaration. Definition dependencies are not exposed by tsgo, so
+     * fail closed by re-resolving tag definitions while retaining declaration type descriptions.
+     */
+    invalidateResolutionGraph() {
+        this.definitionCache.clear();
+    }
+
     async dispose() {
         this.clearCache();
         await this.session.dispose();

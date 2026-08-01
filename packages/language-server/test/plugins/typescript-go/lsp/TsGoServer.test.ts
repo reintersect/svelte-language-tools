@@ -13,7 +13,8 @@ import {
     FileChangeType,
     InitializeRequest,
     RegistrationRequest,
-    TextDocumentSyncKind
+    TextDocumentSyncKind,
+    UnregistrationRequest
 } from 'vscode-languageserver-protocol';
 import { registerTsOrJsTextSynchronization } from '../../../../src/server';
 import { TsGoServer } from '../../../../src/plugins/typescript-go/lsp/TsGoServer';
@@ -176,6 +177,27 @@ describe('typescript-go TsGoServer lifecycle', () => {
         assert.deepStrictEqual(initialize?.params.capabilities.textDocument.publishDiagnostics, {
             relatedInformation: true
         });
+        assert.strictEqual(initialize?.params.capabilities.workspace.workspaceFolders, true);
+        assert.strictEqual(initialize?.params.capabilities.window.workDoneProgress, true);
+        assert.deepStrictEqual(initialize?.params.capabilities.workspace.didChangeWatchedFiles, {
+            dynamicRegistration: true,
+            relativePatternSupport: true
+        });
+        assert.deepStrictEqual(initialize?.params.capabilities.textDocument.synchronization, {
+            dynamicRegistration: true,
+            didSave: true
+        });
+        for (const capability of [
+            'documentSymbol',
+            'foldingRange',
+            'selectionRange',
+            'callHierarchy'
+        ]) {
+            assert.ok(
+                initialize?.params.capabilities.textDocument[capability],
+                `${capability} client capability was not advertised`
+            );
+        }
 
         const [configuration] = await connection.request(ConfigurationRequest.type, {
             items: [{ section: 'typescript', scopeUri: 'file:///workspace/a.ts' }]
@@ -233,6 +255,32 @@ describe('typescript-go TsGoServer lifecycle', () => {
             'events outside the child registration are not forwarded'
         );
 
+        await connection.request(UnregistrationRequest.type, {
+            unregisterations: [{ id: 'watch-ts', method: DidChangeWatchedFilesNotification.method }]
+        });
+        await server.notifyWatchedFiles([
+            { uri: 'file:///workspace/a.ts', type: FileChangeType.Changed }
+        ]);
+        assert.strictEqual(
+            notifications(connection, DidChangeWatchedFilesNotification.type).length,
+            watchedCount,
+            'an unregistered child watcher must stop matching outer events'
+        );
+
+        await connection.request(RegistrationRequest.type, registration);
+        assert.deepStrictEqual(
+            registered,
+            [{ globPattern: '**/*.ts', kind: 7 }],
+            're-registering an already-installed outer watcher must not duplicate it'
+        );
+        await server.notifyWatchedFiles([
+            { uri: 'file:///workspace/a.ts', type: FileChangeType.Changed }
+        ]);
+        assert.strictEqual(
+            notifications(connection, DidChangeWatchedFilesNotification.type).length,
+            watchedCount + 1
+        );
+
         await Promise.all([server.updateConfiguration(), server.updateConfiguration()]);
         assert.deepStrictEqual(
             notifications(connection, DidChangeConfigurationNotification.type).at(-1)?.params,
@@ -241,6 +289,118 @@ describe('typescript-go TsGoServer lifecycle', () => {
         assert.strictEqual(
             notifications(connection, DidChangeConfigurationNotification.type).length,
             1
+        );
+        server.dispose();
+    });
+
+    it('publishes every desired overlay in one generation after the startup barrier', async () => {
+        const publication = deferred<void>();
+        const connection = new FakeConnection();
+        const beforeStart = sinon.stub().callsFake(() => publication.promise);
+        const { server, spawnProcess } = setup([connection], { beforeStart });
+
+        const first = server.openDocument(
+            '/workspace/First.svelte.tsx',
+            'export const first = true;'
+        );
+        const second = server.openDocument(
+            '/workspace/Second.svelte.tsx',
+            'export const second = true;'
+        );
+        await Promise.resolve();
+
+        assert.strictEqual(spawnProcess.callCount, 0, 'the child observed a partial project graph');
+        assert.strictEqual(server.openDocumentCount, 2, 'desired overlays were not retained');
+        assert.strictEqual(server.childOpenDocumentCount, 0);
+        assert.strictEqual(server.generation, 0);
+
+        publication.resolve();
+        await Promise.all([first, second]);
+
+        sinon.assert.calledOnce(beforeStart);
+        sinon.assert.calledOnce(spawnProcess);
+        assert.strictEqual(
+            server.generation,
+            1,
+            'the initial batch advanced more than one generation'
+        );
+        assert.strictEqual(server.openDocumentCount, 2);
+        assert.strictEqual(server.childOpenDocumentCount, 2);
+        assert.deepStrictEqual(
+            notifications(connection, DidOpenTextDocumentNotification.type).map(
+                ({ params }) => params.textDocument.uri
+            ),
+            ['file:///workspace/First.svelte.tsx', 'file:///workspace/Second.svelte.tsx']
+        );
+        server.dispose();
+    });
+
+    it('does not spawn after a publication failure and starts after a successful retry', async () => {
+        const failure = new Error('project publication failed');
+        const connection = new FakeConnection();
+        let attempts = 0;
+        const beforeStart = sinon.stub().callsFake(async () => {
+            if (attempts++ === 0) {
+                throw failure;
+            }
+        });
+        const { server, spawnProcess } = setup([connection], { beforeStart });
+        const file = '/workspace/Component.svelte.tsx';
+        const text = 'export default class Component {}';
+
+        await assert.rejects(server.openDocument(file, text), failure);
+        sinon.assert.notCalled(spawnProcess);
+        assert.strictEqual(server.generation, 0);
+        assert.strictEqual(server.openDocumentCount, 1, 'retry intent was not retained');
+        assert.strictEqual(server.childOpenDocumentCount, 0);
+
+        await server.openDocument(file, text);
+        sinon.assert.calledTwice(beforeStart);
+        sinon.assert.calledOnce(spawnProcess);
+        assert.strictEqual(server.generation, 1);
+        assert.strictEqual(server.openDocumentCount, 1);
+        assert.strictEqual(server.childOpenDocumentCount, 1);
+        assert.strictEqual(
+            notifications(connection, DidOpenTextDocumentNotification.type).length,
+            1
+        );
+        server.dispose();
+    });
+
+    it('waits for active requests before restart and sends queued work to the new child', async () => {
+        const first = new FakeConnection();
+        const second = new FakeConnection();
+        const response = deferred<{ ok: true }>();
+        const sendFirst = first.sendRequest.bind(first);
+        first.sendRequest = ((type: any, params: any) => {
+            if (methodOf(type) === 'textDocument/hover') {
+                first.requests.push({ method: methodOf(type), params });
+                return response.promise;
+            }
+            return sendFirst(type, params);
+        }) as any;
+        const { server, processes } = setup([first, second]);
+        await server.start();
+
+        const active = server.sendRequest<{ ok: true }>('textDocument/hover', { position: 1 });
+        await Promise.resolve();
+        const restarting = server.restart();
+        const queued = server.sendRequest('textDocument/definition', { position: 2 });
+        await Promise.resolve();
+        assert.strictEqual(processes[0].killed, false, 'active request child was killed early');
+        assert.ok(
+            !first.requests.some(({ method }) => method === 'textDocument/definition'),
+            'new work leaked to the retiring child'
+        );
+
+        response.resolve({ ok: true });
+        assert.deepStrictEqual(await active, { ok: true });
+        await restarting;
+        await queued;
+        assert.strictEqual(processes[0].killed, true);
+        assert.ok(
+            second.requests.some(({ method }) => method === 'textDocument/definition'),
+            'queued request did not reach the replacement child'
         );
         server.dispose();
     });
@@ -264,6 +424,7 @@ describe('typescript-go TsGoServer lifecycle', () => {
         const { server, processes } = setup([connection]);
 
         const starting = server.start();
+        await Promise.resolve();
         const error = Object.assign(new Error('spawn EACCES'), { code: 'EACCES' });
         processes[0].emit('error', error);
 
@@ -281,6 +442,24 @@ describe('typescript-go TsGoServer lifecycle', () => {
         const starting = server.start();
         initialize.reject(new Error('initialize request failed'));
         await assert.rejects(starting, /initialize request failed/);
+
+        assert.strictEqual(first.disposed, true);
+        assert.strictEqual(processes[0].killed, true);
+        await server.start();
+        assert.strictEqual(spawnProcess.callCount, 2);
+        assert.strictEqual(second.disposed, false);
+        server.dispose();
+    });
+
+    it('times out a stalled initialization, terminates its child and permits retry', async () => {
+        const never = new Promise(() => {});
+        const first = new FakeConnection(never);
+        const second = new FakeConnection();
+        const { server, processes, spawnProcess } = setup([first, second], {
+            initializationTimeoutMs: 20
+        });
+
+        await assert.rejects(server.start(), /initialize request timed out after 20ms/);
 
         assert.strictEqual(first.disposed, true);
         assert.strictEqual(processes[0].killed, true);

@@ -6,8 +6,8 @@
 > which upstream does not do at all, and in **`svelte-check`**, replacing the two experimental tsgo
 > modes that were there.
 >
-> One recorded comparison against upstream's classic engine, on the Reintersect ~800-component
-> SvelteKit app in its pnpm monorepo:
+> Historical snapshot only: one earlier build was compared with upstream's classic engine on the
+> Reintersect ~800-component SvelteKit app in its pnpm monorepo:
 >
 > |                                       | upstream | this fork |
 > | ------------------------------------- | -------- | --------- |
@@ -15,6 +15,13 @@
 > | `svelte-check` on a SvelteKit app     | 15.5s    | **3.9s**  |
 > | editor: cold project load             | 7.7s     | **3.6s**  |
 > | editor: keystroke → diagnostics       | 948ms    | **420ms** |
+>
+> These figures predate the current correctness and lifecycle hardening and are historical context,
+> not current performance claims. The 1 August 2026 paired acceptance run on the same corpus found
+> fresh-process p50 of 5.65s for classic versus 16.31s for stock tsgo (Effect: 16.32s versus 5.71s).
+> Dependency discovery consumed roughly 13s of the native path; warm shadow materialisation itself
+> reused all 663 candidates in about 168ms with zero transforms or writes. That cold-start regression
+> is measured and not hidden behind the older table.
 >
 > `pnpm test:tsgo-oracle` compares meaningful editor features against the classic engine, and the
 > whole-project checker oracle compares diagnostics plus normalized program membership. Exact parity
@@ -54,8 +61,10 @@ so there is nothing to build or sideload — keep the extension you already have
 pnpm add -D @reintersect/svelte-language-server @reintersect/effect-tsgo
 ```
 
-(`@typescript/native` works in place of `@reintersect/effect-tsgo`; the server resolves the binary
-from the project, so each project pins its own. In a pnpm workspace, install both at the root.)
+(`@typescript/native` or `@typescript/native-preview` works in place of
+`@reintersect/effect-tsgo`; the server resolves the binary and matching API from the project. In a
+pnpm workspace, install both at the root and commit the lockfile so every developer runs the tested
+engine version.)
 
 **2. Point the extension at it and turn the engine on**, in the workspace's
 `.vscode/settings.json`:
@@ -64,7 +73,7 @@ from the project, so each project pins its own. In a pnpm workspace, install bot
 {
     "svelte.language-server.ls-path": "./node_modules/@reintersect/svelte-language-server/bin/server.js",
     "svelte.language-server.tsgo": true,
-    // The classic TS plugin still runs the JavaScript engine; keep it out of the way.
+    // This separate plugin still runs the JavaScript engine; keep it out of the way.
     "svelte.enable-ts-plugin": false
 }
 ```
@@ -81,6 +90,11 @@ setting, for CI and benchmarks where there is no settings.json.)
 open the workspace root and every app and package gets its own program, its own Svelte version and
 its own shims. You do not need to open individual apps as workspace folders.
 
+Open/change/close state for imported `.ts`, `.tsx`, `.js` and `.jsx` files is forwarded to the same
+tsgo child, so template diagnostics and navigation observe unsaved dependency edits. VS Code still
+uses its built-in TypeScript service for the UI of a plain TS/JS tab; this does not migrate the
+separate `typescript-svelte-plugin`.
+
 ### Experimental: the Rust transform
 
 With `@rsvelte/svelte2tsx` installed, `"svelte.language-server.rsvelte": true` (or
@@ -91,11 +105,15 @@ and even repaired they lose template-level positions, so diagnostics on markup (
 `<Component>`, a bad prop) can silently disappear. Turn it on only if that trade is acceptable;
 the default JS transform reports everything.
 
-### What you should notice
+### Historical performance context
 
-Diagnostics after a keystroke land in roughly 400ms instead of roughly 950ms, and opening a large
-project takes about 3.5s instead of about 7.5s. Hover, completion, go-to-definition and rename all
-go through tsgo too.
+An earlier build measured diagnostics after a keystroke at roughly 400ms instead of roughly 950ms,
+and a large-project open at roughly 3.5s instead of roughly 7.5s. The current paired run did not
+preserve that cold-start result: stock tsgo was 16.31s p50 against classic's 5.65s because dependency
+discovery took roughly 13s. The 80ms pull-diagnostic candidate improved stock native latency but
+raised CPU by 26.8% and native checks by 34.6%; Effect also regressed p95, so the tested default
+remains 150ms. Hover, completion, go-to-definition and rename are all routed through tsgo when the
+engine is enabled.
 
 ### What to expect that is different
 
@@ -105,8 +123,9 @@ go through tsgo too.
     holds the generated `.tsx` twins tsgo type-checks; being under `node_modules/.cache` it is
     already ignored by git and search tools. Deleting it is always safe. (Older builds used a
     visible `.svelte-ls-overlay` directory instead — the server removes those on sight.)
--   **`.ts` files still use the JavaScript engine.** `typescript-svelte-plugin` has no tsgo migration
-    path, so Svelte intellisense inside plain `.ts` files is unchanged from upstream.
+-   **The separate TypeScript plugin is unchanged.** `typescript-svelte-plugin` has no tsgo
+    migration path. The language server nevertheless forwards the full TS/TSX/JS/JSX buffer
+    lifecycle to tsgo so Svelte features see dirty imported modules.
 
 ### Turning it off
 
@@ -118,11 +137,21 @@ point — the flag was kept so a bad day is a settings change rather than a rein
 
 `@reintersect/effect-tsgo` (preferred), `@typescript/native` or `@typescript/native-preview`
 installed in the workspace being edited. The server resolves the binary from the project, not from
-itself, so each project can pin its own; `SVELTE_LS_TSGO_PACKAGE` pins a specific one for A/B runs.
-With none present it logs an error and falls back to the JavaScript engine. Component-props
-completions additionally need the checker API client (`dist/api/async/api.js`), which ships with
-`@typescript/native`; without it the server logs that component-level features are limited and
-everything else keeps working.
+itself, so each project controls its exact installed version; `SVELTE_LS_TSGO_PACKAGE` selects one
+package for A/B runs. Repository CI asserts that the root, language-server and checker manifests all
+name the same exact stock-engine version and verifies the resolved package and version. With no
+supported engine present it logs an error and falls back to the JavaScript engine. Component-props
+completions additionally need the selected engine package's matching checker API client
+(`dist/api/async/api.js`). The server verifies that entry instead of borrowing another package's
+API; without it, component-level features are limited and everything else keeps working.
+
+In an untrusted workspace the native path is disabled before package resolution: workspace engine
+code and configuration are neither imported nor spawned, and the server logs that it is using the
+classic engine with reduced capabilities.
+
+The published server depends on **`@reintersect/svelte-load-config`**, the canonical scoped runtime
+for Svelte/Vite config discovery and invalidation. Do not add the superseded
+`@reintersect/load-config` package to a workspace.
 
 ### Tunables
 

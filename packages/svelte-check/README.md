@@ -6,8 +6,8 @@
 > which upstream does not do at all, and in **`svelte-check`**, replacing the two experimental tsgo
 > modes that were there.
 >
-> One recorded comparison against upstream's classic engine, on the Reintersect ~800-component
-> SvelteKit app in its pnpm monorepo:
+> Historical snapshot only: one earlier build was compared with upstream's classic engine on the
+> Reintersect ~800-component SvelteKit app in its pnpm monorepo:
 >
 > |                                       | upstream | this fork |
 > | ------------------------------------- | -------- | --------- |
@@ -15,6 +15,13 @@
 > | `svelte-check` on a SvelteKit app     | 15.5s    | **3.9s**  |
 > | editor: cold project load             | 7.7s     | **3.6s**  |
 > | editor: keystroke → diagnostics       | 948ms    | **420ms** |
+>
+> These figures predate the current correctness and lifecycle hardening and are historical context,
+> not current performance claims. The 1 August 2026 paired acceptance run on the same corpus found
+> fresh-process p50 of 5.65s for classic versus 16.31s for stock tsgo (Effect: 16.32s versus 5.71s).
+> Dependency discovery consumed roughly 13s of the native path; warm shadow materialisation itself
+> reused all 663 candidates in about 168ms with zero transforms or writes. That cold-start regression
+> is measured and not hidden behind the older table.
 >
 > Focused fixtures are diffed against the classic engine including code, message, severity and full
 > range. That is a tested invariant rather than a universal promise: TypeScript 6 and the evolving
@@ -42,7 +49,7 @@ the flag it behaves exactly like upstream.
 same for every package at once):
 
 ```bash
-pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.2 @reintersect/effect-tsgo
+pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.5 @reintersect/effect-tsgo
 ```
 
 **2. Add `--tsgo` to your check script.** It requires an explicit tsconfig:
@@ -56,14 +63,20 @@ pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.2 @reintersect/effec
 ```
 
 Generated `.tsx` twins land in `node_modules/.cache/svelte-lsp/` in each package that has
-components — already ignored by git and search tools and safe to delete. A transform/config
-fingerprint plus source mtimes lets warm checks reuse unchanged twins; stale or unproven entries are
-regenerated.
+components — already ignored by git and search tools and safe to delete. The implementation uses a
+transform/config fingerprint plus source freshness to reuse proven unchanged twins and regenerates
+stale or unproven entries. Treat zero-transform/zero-write warm runs as an acceptance result to
+measure on your project, not a blanket cache guarantee.
 
 **Requirements:** a tsconfig/jsconfig, and `@reintersect/effect-tsgo`, `@typescript/native` or
-`@typescript/native-preview` in the workspace. `SVELTE_LS_RSVELTE=1` opts the transform into
-rsvelte's Rust svelte2tsx (fast, but its source-map bug can lose template-level diagnostics —
-off by default).
+`@typescript/native-preview` in the workspace. Commit the lockfile to pin the exact engine you have
+verified; this repository's CI independently asserts its exact stock-engine package and version.
+`SVELTE_LS_RSVELTE=1` opts the transform into rsvelte's Rust svelte2tsx (fast, but its source-map
+bug can lose template-level diagnostics — off by default).
+
+The checker uses **`@reintersect/svelte-load-config`** as the canonical scoped runtime for
+Svelte/Vite config discovery and invalidation. It is installed transitively with the checker; the
+superseded `@reintersect/load-config` package is not required.
 
 The native compiler follows TypeScript 7 rather than the JavaScript TypeScript 6 engine. Removed or
 not-yet-supported settings such as `baseUrl`, `moduleResolution: "node"`/`"node10"`, `outFile`, ES5

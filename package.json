@@ -9,7 +9,7 @@
         "build": "tsc -b",
         "test": "cross-env CI=true pnpm test -r",
         "test:tsgo-oracle": "pnpm --filter svelte2tsx build && pnpm --filter @reintersect/svelte-language-server build && node --test bench/lsp-client.test.mjs bench/inferred-project.test.mjs && node --test bench/template-diagnostics.test.mjs && node bench/compare-lsp-features.mjs",
-        "test:tsgo-checker-oracle": "node bench/compare-checker-engines.mjs",
+        "test:tsgo-checker-oracle": "node --test bench/bounded-process.test.mjs bench/checker-program-membership.test.mjs && node bench/compare-checker-engines.mjs",
         "test:tsgo-performance-tools": "node --test bench/perf-utils.test.mjs",
         "bench:tsgo-performance": "node bench/performance-acceptance.mjs",
         "watch": "tsc -b -watch",

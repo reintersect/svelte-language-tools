@@ -22,12 +22,16 @@ import {
     RegistrationParams,
     RegistrationRequest,
     TextDocumentContentChangeEvent,
+    UnregistrationParams,
+    UnregistrationRequest,
     WorkDoneProgressCreateRequest
 } from 'vscode-languageserver-protocol';
 import { getSemanticTokenLegends } from '../../../lib/semanticToken/semanticTokenLegend';
 import { normalizePath, pathToUrl, urlToPath } from '../../../utils';
 import { Logger } from '../../../logger';
 import { ResolvedTsGoEngine } from './TsGoEngine';
+
+const DEFAULT_INITIALIZATION_TIMEOUT_MS = 60_000;
 
 /**
  * Preferences handed to tsgo. These arrive through a `workspace/configuration` *response*,
@@ -84,10 +88,18 @@ export interface TsGoServerOptions {
     onDidRegisterWatchers?: (watchers: FileSystemWatcher[]) => void;
     /** Called when the child dies unexpectedly, so documents can be replayed into a new one. */
     onRestart?: () => void;
+    /**
+     * Finish publishing the current project graph before a new child observes the filesystem.
+     * This runs only for initial startup and replacement-child startup, never for an ordinary
+     * didOpen against an already-running child.
+     */
+    beforeStart?: () => Promise<void>;
     /** @internal Process factory used by focused lifecycle tests. */
     spawnProcess?: typeof spawn;
     /** @internal Protocol factory used by focused lifecycle tests. */
     createConnection?: (process: ChildProcess) => ProtocolConnection;
+    /** @internal Bounded initialize deadline, shortened by focused lifecycle tests. */
+    initializationTimeoutMs?: number;
 }
 
 interface OpenDocumentState {
@@ -133,6 +145,12 @@ export class TsGoServer {
     private configurationUpdateQueued = false;
     /** Child restarts repeat the same dynamic registrations; install each outer watcher once. */
     private readonly registeredWatcherKeys = new Set<string>();
+    /** Active child registration id -> watchers. Installed outer watchers remain reusable. */
+    private readonly watcherRegistrations = new Map<string, FileSystemWatcher[]>();
+    /** A deliberate restart waits for active feature requests and gates newly arriving ones. */
+    private restartWork: Promise<void> | undefined;
+    private activeRequests = 0;
+    private readonly requestIdleWaiters = new Set<() => void>();
     private readonly registeredWatchers: Array<{
         watcher: FileSystemWatcher;
         regex: RegExp;
@@ -173,6 +191,41 @@ export class TsGoServer {
         this.generationCounter++;
     }
 
+    private rebuildRegisteredWatchers(): void {
+        const active = new Map<string, FileSystemWatcher>();
+        for (const watchers of this.watcherRegistrations.values()) {
+            for (const watcher of watchers) {
+                active.set(JSON.stringify(watcher), watcher);
+            }
+        }
+
+        this.registeredWatchers.length = 0;
+        const newlyInstalled: FileSystemWatcher[] = [];
+        for (const [key, watcher] of active) {
+            const globPattern = watcher.globPattern;
+            const pattern = typeof globPattern === 'string' ? globPattern : globPattern.pattern;
+            const baseUri = typeof globPattern === 'string' ? undefined : globPattern.baseUri;
+            const basePath = baseUri
+                ? urlToPath(typeof baseUri === 'string' ? baseUri : baseUri.uri)
+                : undefined;
+            this.registeredWatchers.push({
+                watcher,
+                regex: globrex(normalizePath(pattern), {
+                    globstar: true,
+                    extended: true
+                }).regex,
+                ...(basePath ? { basePath: normalizePath(basePath) } : {})
+            });
+            if (!this.registeredWatcherKeys.has(key)) {
+                this.registeredWatcherKeys.add(key);
+                newlyInstalled.push(watcher);
+            }
+        }
+        if (newlyInstalled.length) {
+            this.options.onDidRegisterWatchers?.(newlyInstalled);
+        }
+    }
+
     /** The version last sent for a document, if it is open. */
     documentVersion(filePath: string): number | undefined {
         return this.versions.get(pathToUrl(filePath));
@@ -205,10 +258,26 @@ export class TsGoServer {
      * `desiredDocuments` is left intact and is replayed by {@link start}; callers should close
      * obsolete shadow URIs before invoking this so only the atomically rebuilt overlays return.
      */
-    async restart(): Promise<void> {
+    restart(): Promise<void> {
+        if (this.restartWork) {
+            return this.restartWork;
+        }
+        const attempt = this.doRestart();
+        this.restartWork = attempt;
+        const clear = () => {
+            if (this.restartWork === attempt) {
+                this.restartWork = undefined;
+            }
+        };
+        void attempt.then(clear, clear);
+        return attempt;
+    }
+
+    private async doRestart(): Promise<void> {
         if (this.disposed) {
             throw new Error('TsGoServer has been disposed');
         }
+        await this.waitForActiveRequests();
         const proc = this.proc;
         const connection = this.connection;
         if (proc) {
@@ -227,13 +296,26 @@ export class TsGoServer {
             connection?.dispose();
         } catch {}
         try {
-            proc?.kill();
+            if (proc) terminateChildProcess(proc);
         } catch {}
         this.options.onRestart?.();
         await this.start();
     }
 
+    private waitForActiveRequests(): Promise<void> {
+        if (this.activeRequests === 0) {
+            return Promise.resolve();
+        }
+        return new Promise((resolve) => this.requestIdleWaiters.add(resolve));
+    }
+
     private async doStart(): Promise<void> {
+        await this.options.beforeStart?.();
+        if (this.disposed) {
+            throw new Error('TsGoServer has been disposed');
+        }
+        this.watcherRegistrations.clear();
+        this.registeredWatchers.length = 0;
         // `--lsp -stdio` is deliberate: `--stdio` and `lsp -stdio` both exit 1.
         const proc = (this.options.spawnProcess ?? spawn)(
             this.options.engine.command,
@@ -289,43 +371,26 @@ export class TsGoServer {
             );
             // Accept dynamic registrations and relay file-watch requests to the outer LSP client.
             connection.onRequest(RegistrationRequest.type, (params: RegistrationParams) => {
-                const watchers = params.registrations
-                    .filter(
-                        (registration) =>
-                            registration.method === DidChangeWatchedFilesNotification.method
-                    )
-                    .flatMap(
-                        (registration) =>
-                            ((registration.registerOptions as any)?.watchers ??
-                                []) as FileSystemWatcher[]
-                    );
-                const newWatchers = watchers.filter((watcher) => {
-                    const key = JSON.stringify(watcher);
-                    if (this.registeredWatcherKeys.has(key)) {
-                        return false;
+                for (const registration of params.registrations) {
+                    if (registration.method !== DidChangeWatchedFilesNotification.method) {
+                        continue;
                     }
-                    this.registeredWatcherKeys.add(key);
-                    const globPattern = watcher.globPattern;
-                    const pattern =
-                        typeof globPattern === 'string' ? globPattern : globPattern.pattern;
-                    const baseUri =
-                        typeof globPattern === 'string' ? undefined : globPattern.baseUri;
-                    const basePath = baseUri
-                        ? urlToPath(typeof baseUri === 'string' ? baseUri : baseUri.uri)
-                        : undefined;
-                    this.registeredWatchers.push({
-                        watcher,
-                        regex: globrex(normalizePath(pattern), {
-                            globstar: true,
-                            extended: true
-                        }).regex,
-                        ...(basePath ? { basePath: normalizePath(basePath) } : {})
-                    });
-                    return true;
-                });
-                if (newWatchers.length) {
-                    this.options.onDidRegisterWatchers?.(newWatchers);
+                    this.watcherRegistrations.set(
+                        registration.id,
+                        ((registration.registerOptions as any)?.watchers ??
+                            []) as FileSystemWatcher[]
+                    );
                 }
+                this.rebuildRegisteredWatchers();
+                return null;
+            });
+            connection.onRequest(UnregistrationRequest.type, (params: UnregistrationParams) => {
+                for (const unregistration of params.unregisterations) {
+                    if (unregistration.method === DidChangeWatchedFilesNotification.method) {
+                        this.watcherRegistrations.delete(unregistration.id);
+                    }
+                }
+                this.rebuildRegisteredWatchers();
                 return null;
             });
             connection.onRequest(WorkDoneProgressCreateRequest.type, () => null);
@@ -338,83 +403,115 @@ export class TsGoServer {
                 ...(this.options.workspacePaths ?? [])
             ].filter((folder, index, all) => all.indexOf(folder) === index);
 
-            const initResult: unknown = await Promise.race([
-                connection.sendRequest(InitializeRequest.type, {
-                    processId: process.pid,
-                    rootUri: pathToUrl(this.options.workspacePath),
-                    workspaceFolders: workspaceFolders.map((folder, index) => ({
-                        uri: pathToUrl(folder),
-                        name: index === 0 ? 'svelte-language-server' : `workspace-${index}`
-                    })),
-                    capabilities: {
-                        // LSP/Document offsets are JavaScript UTF-16 code units throughout this server.
-                        // Advertising UTF-8 lets tsgo select it and shifts every position after a
-                        // non-ASCII character, including the ranged edits used for didChange.
-                        general: { positionEncodings: ['utf-16'] },
-                        workspace: {
-                            configuration: true,
-                            didChangeWatchedFiles: { dynamicRegistration: true }
-                        },
-                        textDocument: {
-                            synchronization: { dynamicRegistration: true },
-                            diagnostic: { dynamicRegistration: true },
-                            // Native diagnostics conditionally include their secondary source
-                            // locations. Without this capability, the checker CLI retains notes
-                            // such as "declared here" while editor pull diagnostics silently
-                            // drop them, even though the outer VS Code client supports them.
-                            publishDiagnostics: {
-                                relatedInformation: true
-                            },
-                            hover: { contentFormat: ['markdown', 'plaintext'] },
-                            completion: {
-                                completionItem: {
-                                    snippetSupport: true,
-                                    documentationFormat: ['markdown', 'plaintext'],
-                                    labelDetailsSupport: true,
-                                    resolveSupport: {
-                                        properties: [
-                                            'documentation',
-                                            'detail',
-                                            'additionalTextEdits'
-                                        ]
-                                    }
+            const initializationTimeoutMs =
+                this.options.initializationTimeoutMs ?? DEFAULT_INITIALIZATION_TIMEOUT_MS;
+            let initializationTimer: ReturnType<typeof setTimeout> | undefined;
+            const initializationTimeout = new Promise<never>((_, reject) => {
+                initializationTimer = setTimeout(
+                    () =>
+                        reject(
+                            new Error(
+                                `tsgo initialize request timed out after ${initializationTimeoutMs}ms`
+                            )
+                        ),
+                    initializationTimeoutMs
+                );
+                initializationTimer.unref();
+            });
+            let initResult: unknown;
+            try {
+                initResult = await Promise.race([
+                    connection.sendRequest(InitializeRequest.type, {
+                        processId: process.pid,
+                        rootUri: pathToUrl(this.options.workspacePath),
+                        workspaceFolders: workspaceFolders.map((folder, index) => ({
+                            uri: pathToUrl(folder),
+                            name: index === 0 ? 'svelte-language-server' : `workspace-${index}`
+                        })),
+                        capabilities: {
+                            // LSP/Document offsets are JavaScript UTF-16 code units throughout this server.
+                            // Advertising UTF-8 lets tsgo select it and shifts every position after a
+                            // non-ASCII character, including the ranged edits used for didChange.
+                            general: { positionEncodings: ['utf-16'] },
+                            workspace: {
+                                configuration: true,
+                                workspaceFolders: true,
+                                didChangeWatchedFiles: {
+                                    dynamicRegistration: true,
+                                    relativePatternSupport: true
                                 }
                             },
-                            definition: { linkSupport: true },
-                            typeDefinition: { linkSupport: true },
-                            implementation: { linkSupport: true },
-                            signatureHelp: {},
-                            references: {},
-                            documentHighlight: {},
-                            rename: { prepareSupport: true },
-                            codeAction: {
-                                codeActionLiteralSupport: {
-                                    codeActionKind: {
-                                        valueSet: [
-                                            'quickfix',
-                                            'source.organizeImports',
-                                            'source.fixAll'
-                                        ]
+                            window: { workDoneProgress: true },
+                            textDocument: {
+                                synchronization: { dynamicRegistration: true, didSave: true },
+                                diagnostic: { dynamicRegistration: true },
+                                // Native diagnostics conditionally include their secondary source
+                                // locations. Without this capability, the checker CLI retains notes
+                                // such as "declared here" while editor pull diagnostics silently
+                                // drop them, even though the outer VS Code client supports them.
+                                publishDiagnostics: {
+                                    relatedInformation: true
+                                },
+                                hover: { contentFormat: ['markdown', 'plaintext'] },
+                                completion: {
+                                    completionItem: {
+                                        snippetSupport: true,
+                                        documentationFormat: ['markdown', 'plaintext'],
+                                        labelDetailsSupport: true,
+                                        resolveSupport: {
+                                            properties: [
+                                                'documentation',
+                                                'detail',
+                                                'additionalTextEdits'
+                                            ]
+                                        }
                                     }
                                 },
-                                resolveSupport: { properties: ['edit'] }
-                            },
-                            inlayHint: { resolveSupport: { properties: ['tooltip'] } },
-                            semanticTokens: {
-                                requests: { full: true, range: true },
-                                // tsgo encodes tokens against the *client's* legend, so this must be
-                                // the same legend we advertise to the editor. Sending an empty list
-                                // makes every token untypeable and the whole response is discarded.
-                                tokenTypes: getSemanticTokenLegends().tokenTypes,
-                                tokenModifiers: getSemanticTokenLegends().tokenModifiers,
-                                formats: ['relative']
+                                definition: { linkSupport: true },
+                                typeDefinition: { linkSupport: true },
+                                implementation: { linkSupport: true },
+                                signatureHelp: {},
+                                references: {},
+                                documentHighlight: {},
+                                documentSymbol: { hierarchicalDocumentSymbolSupport: true },
+                                foldingRange: {},
+                                selectionRange: {},
+                                callHierarchy: {},
+                                rename: { prepareSupport: true },
+                                codeAction: {
+                                    codeActionLiteralSupport: {
+                                        codeActionKind: {
+                                            valueSet: [
+                                                'quickfix',
+                                                'source.organizeImports',
+                                                'source.fixAll'
+                                            ]
+                                        }
+                                    },
+                                    resolveSupport: { properties: ['edit'] }
+                                },
+                                inlayHint: { resolveSupport: { properties: ['tooltip'] } },
+                                semanticTokens: {
+                                    requests: { full: true, range: true },
+                                    // tsgo encodes tokens against the *client's* legend, so this must be
+                                    // the same legend we advertise to the editor. Sending an empty list
+                                    // makes every token untypeable and the whole response is discarded.
+                                    tokenTypes: getSemanticTokenLegends().tokenTypes,
+                                    tokenModifiers: getSemanticTokenLegends().tokenModifiers,
+                                    formats: ['relative']
+                                }
                             }
-                        }
-                    },
-                    initializationOptions: {}
-                } as any),
-                spawnFailure
-            ]);
+                        },
+                        initializationOptions: {}
+                    } as any),
+                    spawnFailure,
+                    initializationTimeout
+                ]);
+            } finally {
+                if (initializationTimer) {
+                    clearTimeout(initializationTimer);
+                }
+            }
 
             if (
                 !initResult ||
@@ -471,7 +568,7 @@ export class TsGoServer {
                 connection.dispose();
             } catch {}
             try {
-                proc.kill();
+                terminateChildProcess(proc);
             } catch {}
             throw startupError;
         }
@@ -734,14 +831,31 @@ export class TsGoServer {
      * tsgo and the request the user was actually waiting on queued behind the corpses.
      */
     async sendRequest<R>(method: string, params: unknown, token?: CancellationToken): Promise<R> {
-        await this.start();
-        // The token must be *omitted*, not passed as undefined: the string overload of
-        // `sendRequest` treats trailing arguments as positional params unless the last one is
-        // a real token, so `(params, undefined)` goes over the wire as the array
-        // `[params, null]` and tsgo rejects it ("expected object start, but encountered [").
-        return token
-            ? this.conn.sendRequest<R>(method, params, token)
-            : this.conn.sendRequest<R>(method, params);
+        // A settings/project restart must not dispose a connection underneath an outstanding
+        // JSON-RPC request: vscode-jsonrpc can leave that promise pending forever. Requests which
+        // arrive after the restart is scheduled wait for the replacement child instead.
+        while (this.restartWork) {
+            await this.restartWork;
+        }
+        this.activeRequests++;
+        try {
+            await this.start();
+            // The token must be *omitted*, not passed as undefined: the string overload of
+            // `sendRequest` treats trailing arguments as positional params unless the last one is
+            // a real token, so `(params, undefined)` goes over the wire as the array
+            // `[params, null]` and tsgo rejects it ("expected object start, but encountered [").
+            return await (token
+                ? this.conn.sendRequest<R>(method, params, token)
+                : this.conn.sendRequest<R>(method, params));
+        } finally {
+            this.activeRequests--;
+            if (this.activeRequests === 0) {
+                for (const resolve of this.requestIdleWaiters) {
+                    resolve();
+                }
+                this.requestIdleWaiters.clear();
+            }
+        }
     }
 
     dispose() {
@@ -750,7 +864,7 @@ export class TsGoServer {
             this.connection?.dispose();
         } catch {}
         try {
-            this.proc?.kill();
+            if (this.proc) terminateChildProcess(this.proc);
         } catch {}
         this.connection = undefined;
         this.proc = undefined;
@@ -759,4 +873,31 @@ export class TsGoServer {
         this.desiredDocuments.clear();
         this.documentRevisions.clear();
     }
+}
+
+/** A catchable SIGTERM must never leave a superseded native child retaining its stdio pipes. */
+function terminateChildProcess(proc: ChildProcess): void {
+    const hasExited = () =>
+        typeof proc.exitCode === 'number' || typeof proc.signalCode === 'string';
+    if (hasExited()) {
+        return;
+    }
+    try {
+        proc.kill('SIGTERM');
+    } catch {
+        // The exit event or hard-kill fallback remains authoritative.
+    }
+    const forceKill = setTimeout(() => {
+        if (!hasExited()) {
+            try {
+                proc.kill('SIGKILL');
+            } catch {}
+        }
+        proc.stdin?.destroy?.();
+        proc.stdout?.destroy?.();
+        proc.stderr?.destroy?.();
+        proc.unref?.();
+    }, 1_000);
+    forceKill.unref();
+    proc.once('exit', () => clearTimeout(forceKill));
 }

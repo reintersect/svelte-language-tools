@@ -183,8 +183,6 @@ async function loadConfigFromDirectory(dir: string, epoch: number): Promise<Load
     return (await loadSvelteConfig(svelteConfigPath, epoch)) ?? viteError;
 }
 
-let resolving: Promise<void> | null = null;
-
 async function loadSvelteConfigFromVite(
     root: string,
     configFilePath: string
@@ -194,17 +192,10 @@ async function loadSvelteConfigFromVite(
         return undefined;
     }
 
-    // Make sure that only one Vite config is resolved at a time, to prevent race conditions with multiple
-    // calls to `loadConfig` ending up with changing the process' current working directory mid-resolution.
-    const previous = resolving;
-    let resolve;
-    resolving = new Promise((r) => (resolve = r));
-    await previous;
-
-    const cwd = process.cwd();
-
+    // `root` and `configFile` are the Vite API's project-boundary inputs. Do not emulate the
+    // Vite CLI by changing process.cwd(): the language server resolves package configs while
+    // unrelated documents are being preprocessed, and cwd is process-wide across those tasks.
     try {
-        process.chdir(root);
         const resolved = await vite.resolveConfig(
             { root, configFile: configFilePath, logLevel: 'error' },
             'serve'
@@ -239,9 +230,6 @@ async function loadSvelteConfigFromVite(
             configFilePath,
             configSource: 'vite'
         };
-    } finally {
-        process.chdir(cwd);
-        resolve!();
     }
 }
 
@@ -345,18 +333,36 @@ function resolvePackageImportExport(exportEntry: unknown): string | undefined {
     return undefined;
 }
 
+// Importing old Vite releases requires a process-wide warning flag. Serialize only this tiny
+// compatibility path so concurrent projects cannot restore one another's environment value;
+// modern resolveConfig calls remain concurrent and no code changes process.cwd().
+let legacyViteImportQueue: Promise<void> = Promise.resolve();
+
 async function importViteLegacy(fromPath: string): Promise<ViteModule | undefined> {
-    try {
-        const main = require.resolve('vite', { paths: [fromPath] });
-        // require.resolve will use the cjs version
-        const prev = process.env.VITE_CJS_IGNORE_WARNING;
-        process.env.VITE_CJS_IGNORE_WARNING = 'true';
-        const result = await dynamicImport(pathToFileURL(main).href);
-        process.env.VITE_CJS_IGNORE_WARNING = prev;
-        return result;
-    } catch {
-        return undefined;
-    }
+    const loading = legacyViteImportQueue.then(async () => {
+        try {
+            const main = require.resolve('vite', { paths: [fromPath] });
+            // require.resolve will use the cjs version
+            const previous = process.env.VITE_CJS_IGNORE_WARNING;
+            process.env.VITE_CJS_IGNORE_WARNING = 'true';
+            try {
+                return await dynamicImport(pathToFileURL(main).href);
+            } finally {
+                if (previous === undefined) {
+                    delete process.env.VITE_CJS_IGNORE_WARNING;
+                } else {
+                    process.env.VITE_CJS_IGNORE_WARNING = previous;
+                }
+            }
+        } catch {
+            return undefined;
+        }
+    });
+    legacyViteImportQueue = loading.then(
+        () => undefined,
+        () => undefined
+    );
+    return loading;
 }
 
 function findConfigInDirectory(

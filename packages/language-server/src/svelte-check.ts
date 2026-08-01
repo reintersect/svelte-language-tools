@@ -25,8 +25,10 @@ import { isInGeneratedCode } from './plugins/typescript/features/utils';
 import { mapAndFilterDiagnostics } from './plugins/typescript/features/DiagnosticsProvider';
 import { convertRange, getDiagnosticTag, mapSeverity } from './plugins/typescript/utils';
 import { groupBy, normalizePath, pathToUrl, urlToPath } from './utils';
-import { tsApiSync, tsAst } from './plugins/typescript-go/types';
-import { SvelteCheckTSGoDiagnosticsProvider } from './plugins/typescript-go/features/DiagnosticsProvider';
+import {
+    getConfigLoadErrorDiagnostics,
+    isSvelteConfigLoadDiagnostic
+} from './plugins/svelte/features/getDiagnostics';
 
 export function mapSvelteCheckDiagnostics(
     sourcePath: string,
@@ -73,20 +75,18 @@ export interface SvelteCheckOptions {
      * Provides the absolute file path of the snapshot.
      */
     onFileSnapshotCreated?: (filePath: string) => void;
+}
 
-    experimental?: {
-        tsgo: {
-            apiModule: unknown;
-            astModule: unknown;
-        };
-    };
+export interface SvelteCheckFileDiagnostics {
+    filePath: string;
+    text: string;
+    diagnostics: Diagnostic[];
 }
 
 /**
  * Prime every Svelte config before classic whole-program diagnostics fan out across files and
- * providers. Vite config loading temporarily changes process.cwd(), while preprocessors such as
- * Tailwind resolve their own config lazily from process.cwd(). Letting those operations overlap
- * can therefore make one package preprocess with another package's configuration.
+ * providers. Besides keeping synchronous document transforms deterministic, this prevents a
+ * lazily discovered package config from racing the first preprocess of that package.
  *
  * @internal Exported for the focused checker lifecycle regression.
  */
@@ -113,12 +113,12 @@ export class SvelteCheck {
     private configManager = new LSConfigManager();
     private pluginHost = new PluginHost(this.docManager);
     private lsAndTSDocResolver?: LSAndTSDocResolver;
-    private tsGoDiagnosticsProvider?: SvelteCheckTSGoDiagnosticsProvider;
 
     constructor(
         workspacePath: string,
         private options: SvelteCheckOptions = {}
     ) {
+        rejectLegacyTsGoModuleInjection(options);
         Logger.setLogErrorsOnly(true);
         this.initialize(workspacePath, options);
     }
@@ -165,50 +165,26 @@ export class SvelteCheck {
         }
         if (shouldRegister('js') || options.tsconfig) {
             const workspaceUris = [pathToUrl(workspacePath)];
-            if (options.experimental?.tsgo && options.tsconfig) {
-                const { apiModule, astModule } = options.experimental.tsgo as {
-                    apiModule: typeof tsApiSync;
-                    astModule: typeof tsAst;
-                };
-                if (!apiModule.API || !('ScriptKind' in astModule)) {
-                    throw new Error('Unsupported typescript-go version');
+            this.lsAndTSDocResolver = new LSAndTSDocResolver(
+                this.docManager,
+                workspaceUris,
+                this.configManager,
+                {
+                    tsconfigPath: options.tsconfig,
+                    isSvelteCheck: true,
+                    onProjectReloaded: options.onProjectReload,
+                    watch: options.watch,
+                    onFileSnapshotCreated: options.onFileSnapshotCreated
                 }
-                this.tsGoDiagnosticsProvider = new SvelteCheckTSGoDiagnosticsProvider(
-                    apiModule,
-                    astModule,
-                    options.tsconfig,
-                    'svelte-check',
-                    (filePath: string, text: string) =>
-                        this.docManager.openDocument(
-                            {
-                                text: text,
-                                uri: pathToUrl(filePath)
-                            },
-                            /* openedByClient */ true
-                        )
-                );
-            } else {
-                this.lsAndTSDocResolver = new LSAndTSDocResolver(
-                    this.docManager,
-                    workspaceUris,
+            );
+            this.pluginHost.register(
+                new TypeScriptPlugin(
                     this.configManager,
-                    {
-                        tsconfigPath: options.tsconfig,
-                        isSvelteCheck: true,
-                        onProjectReloaded: options.onProjectReload,
-                        watch: options.watch,
-                        onFileSnapshotCreated: options.onFileSnapshotCreated
-                    }
-                );
-                this.pluginHost.register(
-                    new TypeScriptPlugin(
-                        this.configManager,
-                        this.lsAndTSDocResolver,
-                        workspaceUris,
-                        this.docManager
-                    )
-                );
-            }
+                    this.lsAndTSDocResolver,
+                    workspaceUris,
+                    this.docManager
+                )
+            );
         }
 
         function shouldRegister(source: SvelteCheckDiagnosticSource) {
@@ -224,12 +200,6 @@ export class SvelteCheck {
      */
     async upsertDocument(doc: { text: string; uri: string }, isNew: boolean): Promise<void> {
         const filePath = urlToPath(doc.uri) || '';
-        // in tsgo mode, let typescript check whether the file belongs to the project
-        if (this.tsGoDiagnosticsProvider) {
-            this.tsGoDiagnosticsProvider.watchUpdate(doc, isNew ? 'created' : 'changed');
-            return;
-        }
-
         if (this.options.tsconfig) {
             const lsContainer = await this.getLSContainer(this.options.tsconfig);
             if (!lsContainer.fileBelongsToProject(filePath, isNew)) {
@@ -277,33 +247,89 @@ export class SvelteCheck {
         this.docManager.closeDocument(uri);
         this.docManager.releaseDocument(uri);
         if (this.options.tsconfig) {
-            if (this.tsGoDiagnosticsProvider) {
-                this.tsGoDiagnosticsProvider.watchUpdate({ text: '', uri }, 'deleted');
-            } else {
-                const lsContainer = await this.getLSContainer(this.options.tsconfig);
-                lsContainer.deleteSnapshot(urlToPath(uri) || '');
-            }
+            const lsContainer = await this.getLSContainer(this.options.tsconfig);
+            lsContainer.deleteSnapshot(urlToPath(uri) || '');
         }
     }
 
     /**
      * Gets the diagnostics for all currently open files.
      */
-    async getDiagnostics(): Promise<
-        Array<{ filePath: string; text: string; diagnostics: Diagnostic[] }>
-    > {
+    async getDiagnostics(): Promise<SvelteCheckFileDiagnostics[]> {
+        let diagnostics: SvelteCheckFileDiagnostics[];
         if (this.options.tsconfig) {
-            if (this.tsGoDiagnosticsProvider) {
-                return this.getDiagnosticsForTsconfigTsGo();
-            }
-            return this.getDiagnosticsForTsconfig(this.options.tsconfig);
+            diagnostics = await this.getDiagnosticsForTsconfig(this.options.tsconfig);
+        } else {
+            diagnostics = await Promise.all(
+                this.docManager.getAllOpenedByClient().map(async (doc) => {
+                    const uri = doc[1].uri;
+                    return await this.getDiagnosticsForFile(uri);
+                })
+            );
         }
-        return await Promise.all(
-            this.docManager.getAllOpenedByClient().map(async (doc) => {
-                const uri = doc[1].uri;
-                return await this.getDiagnosticsForFile(uri);
+
+        return this.mergeConfigLoadDiagnostics(diagnostics);
+    }
+
+    /**
+     * Resolve Svelte config failures independently from compiler/CSS/TypeScript feature gates.
+     * Config execution is structural checker work: asking only for JS or CSS diagnostics must
+     * not turn a broken project configuration into a clean result.
+     */
+    async getConfigLoadDiagnostics(
+        filePaths: readonly string[]
+    ): Promise<SvelteCheckFileDiagnostics[]> {
+        const uniqueFiles = new Map<string, string>();
+        for (const filePath of filePaths) {
+            if (filePath.toLowerCase().endsWith('.svelte')) {
+                uniqueFiles.set(normalizePath(filePath), filePath);
+            }
+        }
+
+        const results = await Promise.all(
+            [...uniqueFiles.values()].map(async (filePath) => {
+                const config = await configLoader.awaitConfig(filePath);
+                if (!config?.loadConfigError) {
+                    return undefined;
+                }
+                const openDocument = this.docManager.get(pathToUrl(filePath));
+                return {
+                    filePath,
+                    text: openDocument?.getText() ?? ts.sys.readFile(filePath) ?? '',
+                    diagnostics: getConfigLoadErrorDiagnostics(
+                        config.loadConfigError,
+                        config.configSource
+                    )
+                } satisfies SvelteCheckFileDiagnostics;
             })
         );
+        return results.filter(
+            (result): result is SvelteCheckFileDiagnostics => result !== undefined
+        );
+    }
+
+    private async mergeConfigLoadDiagnostics(
+        diagnostics: SvelteCheckFileDiagnostics[]
+    ): Promise<SvelteCheckFileDiagnostics[]> {
+        const configDiagnostics = await this.getConfigLoadDiagnostics(
+            diagnostics.map((entry) => entry.filePath)
+        );
+        const byFile = new Map(
+            diagnostics.map((entry) => [normalizePath(entry.filePath), entry] as const)
+        );
+        for (const configEntry of configDiagnostics) {
+            const key = normalizePath(configEntry.filePath);
+            const existing = byFile.get(key);
+            if (!existing) {
+                diagnostics.push(configEntry);
+                byFile.set(key, configEntry);
+                continue;
+            }
+            if (!existing.diagnostics.some(isSvelteConfigLoadDiagnostic)) {
+                existing.diagnostics.push(...configEntry.diagnostics);
+            }
+        }
+        return diagnostics;
     }
 
     private async getDiagnosticsForTsconfig(tsconfigPath: string) {
@@ -377,9 +403,9 @@ export class SvelteCheck {
         const files = lang.getProgram()?.getSourceFiles() || [];
         const options = lang.getProgram()?.getCompilerOptions() || {};
 
-        // Config discovery can call into Vite, which temporarily changes the process cwd. Finish
-        // all such work before Svelte style preprocessing starts in the parallel diagnostics
-        // below; otherwise cwd-sensitive PostCSS plugins can observe a sibling package's root.
+        // Finish config discovery before Svelte style preprocessing starts in the parallel
+        // diagnostics below. This also ensures synchronous document transforms see the loaded
+        // package-local config on their first pass.
         await preloadSvelteConfigsForClassicDiagnostics(files);
 
         const diagnostics = await Promise.all(
@@ -515,76 +541,6 @@ export class SvelteCheck {
         }
     }
 
-    private async getDiagnosticsForTsconfigTsGo() {
-        if (!this.tsGoDiagnosticsProvider) {
-            throw new Error(
-                'Cannot get diagnostics for tsconfig without TSGo diagnostics provider'
-            );
-        }
-
-        const project = await this.tsGoDiagnosticsProvider.getProject();
-        if (!project) {
-            throw new Error('Expected to have api project');
-        }
-        let allTsDiagnostics = Array.from(project.program.getConfigFileParsingDiagnostics());
-        const configFileParsingDiagnosticsLength = allTsDiagnostics?.length ?? 0;
-
-        allTsDiagnostics = allTsDiagnostics.concat(project.program.getSyntacticDiagnostics());
-
-        if (allTsDiagnostics.length == configFileParsingDiagnosticsLength) {
-            if (
-                'getProgramDiagnostics' in project.program &&
-                'getGlobalDiagnostics' in project.program
-            ) {
-                const programOrGlobal = project.program
-                    .getProgramDiagnostics()
-                    .concat(project.program.getGlobalDiagnostics());
-                allTsDiagnostics = allTsDiagnostics.concat(
-                    this.tsGoDiagnosticsProvider.deduplicateDiagnostics(programOrGlobal)
-                );
-            }
-
-            if (allTsDiagnostics.length == configFileParsingDiagnosticsLength) {
-                allTsDiagnostics = allTsDiagnostics.concat(
-                    project.program.getSemanticDiagnostics()
-                );
-            }
-        }
-
-        const result = this.tsGoDiagnosticsProvider.mapAndFilterDiagnostics(
-            project,
-            allTsDiagnostics
-        );
-        const map = new Map<
-            string,
-            { filePath: string; text: string; diagnostics: Diagnostic[] }
-        >();
-        for (const diag of result) {
-            map.set(diag.filePath, diag);
-        }
-
-        for (const filePath of this.tsGoDiagnosticsProvider.getAllSvelteFiles()) {
-            const uri = pathToUrl(filePath);
-            if (!uri) {
-                continue;
-            }
-            const doc = this.docManager.get(uri);
-            if (!doc) {
-                continue;
-            }
-
-            const nonTsDiagnostics = await this.getDiagnosticsForFile(uri);
-            let existing = map.get(filePath);
-            if (existing) {
-                existing.diagnostics = existing.diagnostics.concat(nonTsDiagnostics.diagnostics);
-            } else {
-                map.set(filePath, nonTsDiagnostics);
-            }
-        }
-
-        return Array.from(map.values());
-    }
-
     private async getDiagnosticsForFile(uri: string) {
         const diagnostics = deduplicateSvelteParserDiagnostics(
             await this.pluginHost.getDiagnostics({ uri })
@@ -612,13 +568,9 @@ export class SvelteCheck {
             return null;
         }
 
-        let projectConfig: { wildcardDirectories?: Record<string, ts.WatchDirectoryFlags> };
-        if (this.tsGoDiagnosticsProvider) {
-            projectConfig = this.tsGoDiagnosticsProvider.getProjectConfig();
-        } else {
-            const lsContainer = await this.getLSContainer(this.options.tsconfig);
-            projectConfig = lsContainer.getProjectConfig();
-        }
+        const lsContainer = await this.getLSContainer(this.options.tsconfig);
+        const projectConfig: { wildcardDirectories?: Record<string, ts.WatchDirectoryFlags> } =
+            lsContainer.getProjectConfig();
 
         if (!projectConfig.wildcardDirectories) {
             return null;
@@ -628,6 +580,28 @@ export class SvelteCheck {
             path: dir,
             recursive: !!(flags & ts.WatchDirectoryFlags.Recursive)
         }));
+    }
+}
+
+/**
+ * The old programmatic tsgo route accepted two unrelated module objects supplied by the caller.
+ * There was no way to prove that either module belonged to the exact package which supplied the
+ * native executable, so an Effect binary could silently run against the stock API (or vice versa).
+ * Keep an explicit runtime rejection for JavaScript callers compiled against an older declaration;
+ * supported tsgo entry points resolve the executable and package identity through ResolvedTsGoEngine.
+ */
+function rejectLegacyTsGoModuleInjection(options: SvelteCheckOptions): void {
+    const experimental = (options as SvelteCheckOptions & { experimental?: unknown }).experimental;
+    if (
+        experimental !== null &&
+        (typeof experimental === 'object' || typeof experimental === 'function') &&
+        'tsgo' in experimental
+    ) {
+        throw new Error(
+            'SvelteCheckOptions.experimental.tsgo has been removed because caller-provided API ' +
+                'modules cannot be matched to the resolved native engine. Use `svelte-check --tsgo` ' +
+                'or `TsGoBatchOverlay.create(...)` instead.'
+        );
     }
 }
 

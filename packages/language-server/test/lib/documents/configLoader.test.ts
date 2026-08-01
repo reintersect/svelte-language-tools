@@ -60,7 +60,8 @@ describe('ConfigLoader', () => {
 
     function createConfigLoader(
         globSync: any,
-        fs: Pick<typeof import('fs'), 'existsSync'>,
+        fs: Pick<typeof import('fs'), 'existsSync'> &
+            Partial<Pick<typeof import('fs'), 'readFileSync'>>,
         moduleLoader: (module: URL) => Promise<any>,
         processFeatures: (typeof process)['features'] & { typescript?: false | 'transform' },
         loadFromVite?: (root: string) => Promise<any>
@@ -347,6 +348,7 @@ describe('ConfigLoader', () => {
         const component = normalizePath('/some/path/comp.svelte');
         assert.deepStrictEqual(configLoader.getConfig(component), viteConfig());
         assert.deepStrictEqual(await configLoader.awaitConfig(component), viteConfig());
+        assert.strictEqual(configLoader.getResolvedConfig(component)?.configPath, viteConfigPath);
         assert.deepStrictEqual(loadFromVite.calledOnce, true);
         assert.deepStrictEqual(loadFromVite.firstCall.args, [root]);
         assert.deepStrictEqual(moduleLoader.notCalled, true);
@@ -599,6 +601,279 @@ describe('ConfigLoader', () => {
 
         assert.strictEqual(loader.getConfig(component)?.compilerOptions?.customElement, true);
         assert.strictEqual(loads, 2);
+    });
+
+    it('returns cached config metadata and reads the authored config once', async () => {
+        const configPath = normalizePath('/workspace/svelte.config.js');
+        let existsCalls = 0;
+        let readCalls = 0;
+        const loader = createConfigLoader(
+            mockFdir([]),
+            {
+                existsSync: (candidate) => {
+                    existsCalls++;
+                    return candidate === configPath;
+                },
+                readFileSync: ((candidate: fs.PathOrFileDescriptor) => {
+                    assert.strictEqual(candidate, configPath);
+                    readCalls++;
+                    return 'export default { compilerOptions: { namespace: "svg" } };';
+                }) as typeof fs.readFileSync
+            },
+            async () => ({
+                default: {
+                    compilerOptions: { namespace: 'svg' },
+                    preprocess: { script: () => ({ code: '' }) }
+                }
+            }),
+            process.features
+        );
+
+        const first = await loader.awaitResolvedConfig(
+            normalizePath('/workspace/src/deep/First.svelte')
+        );
+        const existsAfterFirstLookup = existsCalls;
+        const second = loader.getResolvedConfig(normalizePath('/workspace/src/deep/Second.svelte'));
+
+        assert.strictEqual(first?.configPath, configPath);
+        assert.strictEqual(second?.configPath, configPath);
+        assert.strictEqual(first?.transformIdentity, second?.transformIdentity);
+        assert.deepStrictEqual(first?.transformIdentity.configFile, {
+            path: configPath,
+            stamp: '57:2460512063'
+        });
+        assert.strictEqual(first?.transformIdentity.namespace, 'svg');
+        assert.strictEqual(first?.transformIdentity.preprocessors.length, 1);
+        assert.strictEqual(readCalls, 1);
+        assert.strictEqual(existsCalls, existsAfterFirstLookup);
+    });
+
+    it('shares an exact-directory project config with later document resolution', async () => {
+        const configPath = normalizePath('/workspace/app/svelte.config.js');
+        let loads = 0;
+        const loader = createConfigLoader(
+            mockFdir([]),
+            {
+                existsSync: (candidate) => candidate === configPath,
+                readFileSync: (() =>
+                    'export default { kit: { files: { params: "params" } } };') as unknown as typeof fs.readFileSync
+            },
+            async () => {
+                loads++;
+                return { default: { kit: { files: { params: 'params' } } } };
+            },
+            process.features
+        );
+
+        const projectConfig = await loader.awaitResolvedConfigForDirectory(
+            normalizePath('/workspace/app')
+        );
+        const documentConfig = await loader.awaitResolvedConfig(
+            normalizePath('/workspace/app/src/Component.svelte')
+        );
+
+        assert.strictEqual(projectConfig?.configPath, configPath);
+        assert.strictEqual(projectConfig?.config.kit?.files.params, 'params');
+        assert.strictEqual(documentConfig?.config, projectConfig?.config);
+        assert.strictEqual(documentConfig?.transformIdentity, projectConfig?.transformIdentity);
+        assert.strictEqual(loads, 1);
+    });
+
+    it('keeps exact-directory misses separate from document ancestor traversal', async () => {
+        const configPath = normalizePath('/workspace/svelte.config.js');
+        let loads = 0;
+        const loader = createConfigLoader(
+            mockFdir([]),
+            {
+                existsSync: (candidate) => candidate === configPath,
+                readFileSync: (() =>
+                    'export default { compilerOptions: { accessors: true } };') as unknown as typeof fs.readFileSync
+            },
+            async () => {
+                loads++;
+                return { default: { compilerOptions: { accessors: true } } };
+            },
+            process.features
+        );
+
+        assert.strictEqual(
+            await loader.awaitResolvedConfigForDirectory(normalizePath('/workspace/app')),
+            undefined
+        );
+        const documentConfig = await loader.awaitResolvedConfig(
+            normalizePath('/workspace/app/src/Component.svelte')
+        );
+
+        assert.strictEqual(documentConfig?.configPath, configPath);
+        assert.strictEqual(documentConfig?.config.compilerOptions?.accessors, true);
+        assert.strictEqual(loads, 1);
+    });
+
+    it('loads an explicit project config once through the exact-directory path', async () => {
+        const projectRoot = normalizePath('/workspace/app');
+        const explicitConfigPath = normalizePath('/workspace/config/custom.config.cjs');
+        let loads = 0;
+        const loader = createConfigLoader(
+            mockFdir([]),
+            {
+                existsSync: (candidate) => candidate === explicitConfigPath,
+                readFileSync: (() =>
+                    'module.exports = { kit: { files: { params: "custom" } } };') as unknown as typeof fs.readFileSync
+            },
+            async () => {
+                loads++;
+                return { default: { kit: { files: { params: 'custom' } } } };
+            },
+            process.features
+        );
+        loader.setExplicitConfigScope({
+            configPath: explicitConfigPath,
+            rootDirectory: projectRoot
+        });
+
+        const projectConfig = await loader.awaitResolvedConfigForDirectory(projectRoot);
+        const documentConfig = await loader.awaitResolvedConfig(
+            path.join(projectRoot, 'src/Component.svelte')
+        );
+
+        assert.strictEqual(projectConfig?.configPath, explicitConfigPath);
+        assert.strictEqual(projectConfig?.config.kit?.files.params, 'custom');
+        assert.strictEqual(documentConfig?.config, projectConfig?.config);
+        assert.strictEqual(loads, 1);
+    });
+
+    it('does not publish an invalidated exact-directory load', async () => {
+        const directory = normalizePath('/workspace/app');
+        const configPath = path.join(directory, 'svelte.config.js');
+        let load = 0;
+        let releaseOld!: () => void;
+        let oldLoadStarted!: () => void;
+        const oldGate = new Promise<void>((resolve) => (releaseOld = resolve));
+        const oldStarted = new Promise<void>((resolve) => (oldLoadStarted = resolve));
+        const loader = createConfigLoader(
+            mockFdir([]),
+            {
+                existsSync: (candidate) => candidate === configPath,
+                readFileSync: (() => 'export default {};') as unknown as typeof fs.readFileSync
+            },
+            async () => {
+                load++;
+                if (load === 1) {
+                    oldLoadStarted();
+                    await oldGate;
+                    return { default: { compilerOptions: { accessors: false } } };
+                }
+                return { default: { compilerOptions: { accessors: true } } };
+            },
+            process.features
+        );
+
+        const staleLoad = loader.awaitResolvedConfigForDirectory(directory);
+        await oldStarted;
+        loader.invalidateConfigs();
+        const current = await loader.awaitResolvedConfigForDirectory(directory);
+        releaseOld();
+        const stale = await staleLoad;
+
+        assert.strictEqual(stale, undefined);
+        assert.strictEqual(current?.config.compilerOptions?.accessors, true);
+        assert.strictEqual(
+            loader.getResolvedConfig(path.join(directory, 'Component.svelte'))?.config,
+            current?.config
+        );
+        assert.strictEqual(load, 2);
+    });
+
+    it('invalidates cached negative config discovery when a config is created', async () => {
+        const configPath = normalizePath('/workspace/svelte.config.js');
+        let hasConfig = false;
+        let existsCalls = 0;
+        const loader = createConfigLoader(
+            mockFdir([]),
+            {
+                existsSync: (candidate) => {
+                    existsCalls++;
+                    return hasConfig && candidate === configPath;
+                },
+                readFileSync: ((candidate: fs.PathOrFileDescriptor) => {
+                    if (!hasConfig || candidate !== configPath) {
+                        throw new Error('ENOENT');
+                    }
+                    return 'export default {};';
+                }) as typeof fs.readFileSync
+            },
+            async () => ({ default: {} }),
+            process.features
+        );
+        const component = normalizePath('/workspace/src/Component.svelte');
+
+        const fallback = await loader.awaitResolvedConfig(component);
+        const callsAfterNegativeLookup = existsCalls;
+        assert.strictEqual(fallback?.transformIdentity.fallback, true);
+        assert.strictEqual(fallback?.transformIdentity.configFile, undefined);
+
+        const cachedFallback = loader.getResolvedConfig(component);
+        assert.strictEqual(cachedFallback?.config, fallback?.config);
+        assert.strictEqual(cachedFallback?.transformIdentity, fallback?.transformIdentity);
+        assert.strictEqual(existsCalls, callsAfterNegativeLookup);
+
+        hasConfig = true;
+        loader.invalidateConfigs();
+        const authored = await loader.awaitResolvedConfig(component);
+
+        assert.strictEqual(authored?.configPath, configPath);
+        assert.ok(authored?.transformIdentity.configFile?.stamp);
+        assert.ok((authored?.revision ?? 0) > (fallback?.revision ?? 0));
+        assert.ok(existsCalls > callsAfterNegativeLookup);
+    });
+
+    it('invalidates positive directory associations on nearer config creation and deletion', async () => {
+        const rootConfig = normalizePath('/workspace/svelte.config.js');
+        const nearConfig = normalizePath('/workspace/packages/app/svelte.config.js');
+        const configs = new Map([
+            [rootConfig, 'export default { compilerOptions: { accessors: false } };']
+        ]);
+        const loader = createConfigLoader(
+            mockFdir([]),
+            {
+                existsSync: (candidate) => typeof candidate === 'string' && configs.has(candidate),
+                readFileSync: ((candidate: fs.PathOrFileDescriptor) =>
+                    configs.get(String(candidate))!) as typeof fs.readFileSync
+            },
+            async (module) => ({
+                default: {
+                    compilerOptions: {
+                        accessors: module.pathname.includes('/packages/app/')
+                    }
+                }
+            }),
+            process.features
+        );
+        const component = normalizePath('/workspace/packages/app/src/Component.svelte');
+
+        const initial = await loader.awaitResolvedConfig(component);
+        assert.strictEqual(initial?.configPath, rootConfig);
+        assert.strictEqual(initial?.transformIdentity.accessors, false);
+
+        configs.set(nearConfig, 'export default { compilerOptions: { accessors: true } };');
+        loader.invalidateConfigs();
+        const nearer = await loader.awaitResolvedConfig(component);
+        assert.strictEqual(nearer?.configPath, nearConfig);
+        assert.strictEqual(nearer?.transformIdentity.accessors, true);
+        assert.notStrictEqual(
+            nearer?.transformIdentity.configFile?.stamp,
+            initial?.transformIdentity.configFile?.stamp
+        );
+
+        configs.delete(nearConfig);
+        loader.invalidateConfigs();
+        const restored = await loader.awaitResolvedConfig(component);
+        assert.strictEqual(restored?.configPath, rootConfig);
+        assert.strictEqual(restored?.transformIdentity.accessors, false);
+        assert.deepStrictEqual(
+            restored?.transformIdentity.configFile,
+            initial?.transformIdentity.configFile
+        );
     });
 
     it('does not let an invalidated in-flight config overwrite the replacement', async () => {

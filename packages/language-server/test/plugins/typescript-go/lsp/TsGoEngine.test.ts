@@ -13,7 +13,11 @@ afterEach(() => {
     }
 });
 
-function packageFixture(name: string, binContents: string | number[]) {
+function packageFixture(
+    name: string,
+    binContents: string | number[],
+    manifestOverrides: Record<string, unknown> = {}
+) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'svelte-lsp-tsgo-engine-'));
     tempRoots.push(root);
     const packageRoot = path.join(root, 'node_modules', ...name.split('/'));
@@ -25,7 +29,8 @@ function packageFixture(name: string, binContents: string | number[]) {
             name,
             version: '7.0.0-test.1',
             exports: { '.': './dist/index.js' },
-            bin: { tsgo: './bin/tsgo' }
+            bin: { tsgo: './bin/tsgo' },
+            ...manifestOverrides
         })
     );
     fs.writeFileSync(
@@ -59,5 +64,32 @@ describe('typescript-go engine resolution', () => {
         assert.ok(engine);
         assert.strictEqual(engine.command, path.join(packageRoot, 'bin/tsgo'));
         assert.deepStrictEqual(engine.argsPrefix, []);
+    });
+
+    it('rejects packages without an exact non-empty string version', () => {
+        const name = 'invalid-version-tsgo-fixture';
+        for (const [label, version] of [
+            ['missing', undefined],
+            ['blank', '   '],
+            ['non-string', 7]
+        ] as const) {
+            const { root } = packageFixture(name, '#!/usr/bin/env node\n', { version });
+
+            assert.strictEqual(
+                resolveTsGoEngine(root, { packageName: name }),
+                undefined,
+                `${label} version unexpectedly resolved`
+            );
+        }
+    });
+
+    it('rejects a package.json export owned by a different package', () => {
+        const requestedName = 'mismatched-name-tsgo-fixture';
+        const { root } = packageFixture(requestedName, '#!/usr/bin/env node\n', {
+            name: 'different-package',
+            exports: { './package.json': './package.json' }
+        });
+
+        assert.strictEqual(resolveTsGoEngine(root, { packageName: requestedName }), undefined);
     });
 });

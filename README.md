@@ -22,8 +22,8 @@
 > which upstream does not do at all, and in **`svelte-check`**, replacing the two experimental tsgo
 > modes that were there.
 >
-> One recorded comparison against upstream's classic engine, on the Reintersect ~800-component
-> SvelteKit app in its pnpm monorepo:
+> Historical snapshot only: one earlier build was compared with upstream's classic engine on the
+> Reintersect ~800-component SvelteKit app in its pnpm monorepo:
 >
 > |                                       | upstream | this fork |
 > | ------------------------------------- | -------- | --------- |
@@ -31,6 +31,13 @@
 > | `svelte-check` on a SvelteKit app     | 15.5s    | **3.9s**  |
 > | editor: cold project load             | 7.7s     | **3.6s**  |
 > | editor: keystroke → diagnostics       | 948ms    | **420ms** |
+>
+> These figures predate the current correctness and lifecycle hardening and are historical context,
+> not current performance claims. The 1 August 2026 paired acceptance run on the same corpus found
+> fresh-process p50 of 5.65s for classic versus 16.31s for stock tsgo (Effect: 16.32s versus 5.71s).
+> Dependency discovery consumed roughly 13s of the native path; warm shadow materialisation itself
+> reused all 663 candidates in about 168ms with zero transforms or writes. That cold-start regression
+> is measured and not hidden behind the older table.
 >
 > The repository runs the strict `pnpm test:tsgo-oracle` editor-feature oracle and the whole-project
 > `pnpm test:tsgo-checker-oracle -- --project <project>` checker oracle. Exact parity is an invariant
@@ -69,17 +76,23 @@
 > Reload the window; **Output → Svelte** should log `[tsgo] enabled`. Monorepos work opened at the
 > root — projects resolve per file from the nearest tsconfig. Full instructions, tunables and the
 > experimental Rust-transform flag: [`packages/language-server`](packages/language-server/README.md).
+> In an untrusted workspace the server does not resolve, import or spawn workspace-provided native
+> code; it logs the reason and uses the classic engine. Commit the lockfile so the selected engine
+> stays reproducible; this repository separately asserts its exact test pin in CI.
 >
 > **CLI / CI:**
 >
 > ```bash
-> pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.2 @reintersect/effect-tsgo
+> pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.5 @reintersect/effect-tsgo
 > svelte-check --tsgo --tsconfig ./tsconfig.json
 > ```
 >
 > Details: [`packages/svelte-check`](packages/svelte-check/README.md). For pull requests,
 > [`reintersect/svelte-check-action`](https://github.com/reintersect/svelte-check-action) runs this
 > fork with `tsgo: true` and comments the diagnostics.
+>
+> Both published packages use **`@reintersect/svelte-load-config`** as their scoped Svelte/Vite
+> configuration runtime. The older `@reintersect/load-config` name is not the active runtime.
 
 ## What is Svelte Language Tools?
 

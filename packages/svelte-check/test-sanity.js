@@ -57,11 +57,16 @@ let failed = 0;
  * @property {boolean} [expectCompleted]
  * @property {boolean} [requireRelatedInformation]
  * @property {boolean} [requireDiagnostic]
+ * @property {number} [expectedDiagnosticCount]
+ * @property {string} [requiredDiagnosticSubstring]
+ * @property {number} [maxDurationMs]
+ * @property {'machine' | 'machine-verbose'} [output]
  * @property {NodeJS.ProcessEnv} [env]
  */
 
 /** @param {RunOptions} opts */
 function runCli(opts) {
+    const started = Date.now();
     const args = [
         CLI,
         '--workspace',
@@ -69,7 +74,7 @@ function runCli(opts) {
         '--tsconfig',
         opts.tsconfig,
         '--output',
-        'machine-verbose'
+        opts.output ?? 'machine-verbose'
     ];
     if (opts.config) args.push('--config', opts.config);
     if (opts.diagnosticSources) args.push('--diagnostic-sources', opts.diagnosticSources);
@@ -89,6 +94,7 @@ function runCli(opts) {
     });
     return {
         ...result,
+        durationMs: Date.now() - started,
         records: parseMachineOutput(result.stdout || '')
     };
 }
@@ -209,6 +215,9 @@ function protocolIssues(run, opts) {
 
     if (run.error) issues.push(`process error: ${run.error.message}`);
     if (run.signal) issues.push(`terminated by ${run.signal}`);
+    if (opts.maxDurationMs !== undefined && run.durationMs > opts.maxDurationMs) {
+        issues.push(`expected completion within ${opts.maxDurationMs}ms, took ${run.durationMs}ms`);
+    }
     if (run.status !== expectedStatus) {
         issues.push(`expected exit ${expectedStatus}, got ${run.status}`);
     }
@@ -434,6 +443,24 @@ function parity(name, opts) {
         issues.push('classic oracle did not produce the required diagnostic');
     }
     if (
+        opts.expectedDiagnosticCount !== undefined &&
+        expected.length !== opts.expectedDiagnosticCount
+    ) {
+        issues.push(
+            `classic oracle produced ${expected.length} diagnostics, expected ${opts.expectedDiagnosticCount}`
+        );
+    }
+    if (
+        opts.requiredDiagnosticSubstring &&
+        !expected.some((diagnostic) =>
+            diagnostic.message.includes(opts.requiredDiagnosticSubstring)
+        )
+    ) {
+        issues.push(
+            `classic oracle did not include diagnostic text ${JSON.stringify(opts.requiredDiagnosticSubstring)}`
+        );
+    }
+    if (
         opts.requireRelatedInformation &&
         !expected.some((diagnostic) => diagnostic.relatedInformation.length > 0)
     ) {
@@ -474,25 +501,26 @@ function createProject(name, files, tsconfig) {
     return root;
 }
 
-/** @param {string} suite */
-function createSvelte5FixtureProject(suite) {
+/** @param {string} suite @param {string} sveltePackage */
+function createTemplateFixtureProject(suite, sveltePackage) {
     const sourceRoot = path.join(__dirname, 'test-template-diagnostics', suite);
     const expectations = JSON.parse(
         fs.readFileSync(path.join(sourceRoot, 'expectations.json'), 'utf8')
     );
-    if (expectations.schemaVersion !== 1 || expectations.svelteVersion !== '5.55.5') {
+    if (
+        expectations.schemaVersion !== 1 ||
+        typeof expectations.svelteVersion !== 'string' ||
+        !expectations.svelteVersion
+    ) {
         throw new Error(`${suite}: unsupported template expectation schema/compiler version`);
     }
 
-    const svelte5ManifestPath = require.resolve('svelte5/package.json');
-    const svelte5Manifest = JSON.parse(fs.readFileSync(svelte5ManifestPath, 'utf8'));
-    if (
-        svelte5Manifest.name !== 'svelte' ||
-        svelte5Manifest.version !== expectations.svelteVersion
-    ) {
+    const svelteManifestPath = require.resolve(`${sveltePackage}/package.json`);
+    const svelteManifest = JSON.parse(fs.readFileSync(svelteManifestPath, 'utf8'));
+    if (svelteManifest.name !== 'svelte' || svelteManifest.version !== expectations.svelteVersion) {
         throw new Error(
             `${suite}: expected svelte@${expectations.svelteVersion}, resolved ` +
-                `${svelte5Manifest.name}@${svelte5Manifest.version}`
+                `${svelteManifest.name}@${svelteManifest.version}`
         );
     }
     const fixtureManifest = JSON.parse(
@@ -507,12 +535,15 @@ function createSvelte5FixtureProject(suite) {
     const nodeModules = path.join(root, 'node_modules');
     fs.mkdirSync(nodeModules, { recursive: true });
     fs.symlinkSync(
-        fs.realpathSync(path.dirname(svelte5ManifestPath)),
+        fs.realpathSync(path.dirname(svelteManifestPath)),
         path.join(nodeModules, 'svelte'),
         process.platform === 'win32' ? 'junction' : 'dir'
     );
 
     const expectedFiles = expectations.cases.map((entry) => normalizeFilename(entry.file)).sort();
+    if (expectedFiles.length === 0) {
+        throw new Error(`${suite}: template fixture oracle must contain at least one source file`);
+    }
     if (new Set(expectedFiles).size !== expectedFiles.length) {
         throw new Error(`${suite}: expectation manifest contains duplicate case files`);
     }
@@ -528,6 +559,16 @@ function createSvelte5FixtureProject(suite) {
     }
     validateExpectedRanges(root, expectations);
     return { root, expectations, expectedFiles };
+}
+
+/** @param {string} suite */
+function createSvelte5FixtureProject(suite) {
+    return createTemplateFixtureProject(suite, 'svelte5');
+}
+
+/** @param {string} suite */
+function createSvelte4FixtureProject(suite) {
+    return createTemplateFixtureProject(suite, 'svelte');
 }
 
 /** @param {string} root */
@@ -683,7 +724,7 @@ function sortCorpusDiagnostics(diagnostics) {
     );
 }
 
-/** @param {string} name @param {ReturnType<typeof createSvelte5FixtureProject>} fixture */
+/** @param {string} name @param {ReturnType<typeof createTemplateFixtureProject>} fixture */
 function templateCorpus(name, fixture) {
     const statsPath = path.join(
         parityRoot,
@@ -708,6 +749,10 @@ function templateCorpus(name, fixture) {
         ...classicProtocol.issues.map((issue) => `classic: ${issue}`),
         ...nativeProtocol.issues.map((issue) => `tsgo: ${issue}`)
     ];
+    const pinnedDiagnostics = expectedCorpusDiagnosticSignature(fixture.expectations, 'classic');
+    if (pinnedDiagnostics.length === 0) {
+        issues.push('template fixture diagnostic oracle is empty');
+    }
     try {
         const stats = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
         if (
@@ -833,6 +878,16 @@ console.log('Svelte 5 in-template diagnostic corpus\n');
 templateCorpus('valid-but-wrong template syntax', createSvelte5FixtureProject('semantic'));
 templateCorpus('malformed template syntax', createSvelte5FixtureProject('parser'));
 templateCorpus('mixed compiler and template type errors', createSvelte5FixtureProject('mixed'));
+
+console.log('\nSvelte 4 in-template diagnostic corpus\n');
+templateCorpus('Svelte 4 niche template type syntax', createSvelte4FixtureProject('svelte4'));
+templateCorpus('Svelte 4 malformed template syntax', createSvelte4FixtureProject('svelte4-parser'));
+
+console.log('\nSvelte config transform corpus\n');
+templateCorpus(
+    'Svelte config namespace, custom-element and default-language behavior',
+    createSvelte4FixtureProject('config-transform')
+);
 
 console.log('\nclassic ↔ tsgo focused parity fixtures\n');
 
@@ -1321,6 +1376,58 @@ parity('invalid user TypeScript config', {
     requireDiagnostic: true
 });
 
+const invalidSvelteConfigProject = createProject(
+    'invalid-svelte-config',
+    {
+        'src/Comp.svelte': '<p>config failure</p>',
+        'svelte.config.cjs': 'throw new Error("intentional Svelte config load failure");'
+    },
+    {
+        compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+        include: ['src/**/*']
+    }
+);
+for (const [label, diagnosticSources] of [
+    ['all/default', undefined],
+    ['JS-only', 'js'],
+    ['CSS-only', 'css'],
+    ['Svelte-only', 'svelte'],
+    ['JS+CSS', 'js,css'],
+    ['JS+Svelte', 'js,svelte'],
+    ['CSS+Svelte', 'css,svelte']
+]) {
+    parity(`Svelte config errors with ${label} diagnostics`, {
+        workspace: invalidSvelteConfigProject,
+        tsconfig: './tsconfig.json',
+        diagnosticSources,
+        requireDiagnostic: true,
+        expectedDiagnosticCount: 1,
+        requiredDiagnosticSubstring: 'intentional Svelte config load failure'
+    });
+    inspect(
+        `incremental Svelte config errors with ${label} diagnostics`,
+        {
+            workspace: invalidSvelteConfigProject,
+            tsconfig: './tsconfig.json',
+            diagnosticSources,
+            incremental: true,
+            status: 1
+        },
+        (records, issues) => {
+            const matchingErrors = records.filter(
+                (record) =>
+                    record.type === 'ERROR' &&
+                    record.message.includes('intentional Svelte config load failure')
+            );
+            if (matchingErrors.length !== 1) {
+                issues.push(
+                    `expected exactly one config-load diagnostic, got ${matchingErrors.length}`
+                );
+            }
+        }
+    );
+}
+
 console.log('\nsubprocess failure protocol\n');
 
 test('missing tsgo package is a machine FAILURE', {
@@ -1337,7 +1444,8 @@ const brokenEngineProject = createProject(
     'broken-engine',
     {
         'src/Comp.svelte': '<script lang="ts">const value = 1;</script>',
-        'src/plain.ts': 'const target = 1;\n'
+        'src/plain.ts': 'const target = 1;\n',
+        'src/multiline.ts': 'let x = <number>{\n a:1\n};\n'
     },
     {
         compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
@@ -1412,6 +1520,7 @@ fs.writeFileSync(
         'console.log("1 const target = 1;");',
         'console.log("      ~~~~~");',
         'console.log(file);',
+        'console.log("Found 1 error.");',
         'process.exitCode = 1;'
     ].join('\n')
 );
@@ -1460,6 +1569,73 @@ fs.writeFileSync(
     path.join(fakePackage, 'bin.js'),
     [
         'const path = require("path");',
+        'const file = path.join(process.cwd(), "src", "multiline.ts");',
+        'console.log(`${file}:1:9 - error TS2352: Conversion may be a mistake.`);',
+        'console.log();',
+        'console.log("1 let x = <number>{");',
+        'console.log("          ~~~~~~~~~");',
+        'console.log("2  a:1");',
+        'console.log("  ~~~~");',
+        'console.log("3 };");',
+        'console.log("  ~");',
+        'console.log(file);',
+        'console.log("Found 1 error.");',
+        'process.exitCode = 1;'
+    ].join('\n')
+);
+inspect(
+    'machine output preserves a multiline native source range',
+    {
+        workspace: brokenEngineProject,
+        tsconfig: './tsconfig.json',
+        tsgo: true,
+        env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo' },
+        status: 1
+    },
+    (records, issues) => {
+        const errors = records.filter((record) => record.type === 'ERROR');
+        if (errors.length !== 1) {
+            issues.push(`expected one multiline diagnostic, got ${errors.length}`);
+            return;
+        }
+        const [error] = errors;
+        if (
+            error.start.line !== 0 ||
+            error.start.character !== 8 ||
+            error.end.line !== 2 ||
+            error.end.character !== 1
+        ) {
+            issues.push(
+                `expected range 0:8-2:1, got ${JSON.stringify({ start: error.start, end: error.end })}`
+            );
+        }
+    }
+);
+
+fs.writeFileSync(
+    path.join(fakePackage, 'bin.js'),
+    [
+        'const path = require("path");',
+        'const file = path.join(process.cwd(), "src", "plain.ts");',
+        'console.log(`${file}:1:1 - error TS9999: truncated after file list`);',
+        'console.log(file);',
+        'process.exitCode = 1;'
+    ].join('\n')
+);
+test('expected diagnostic status without a terminal summary is a machine FAILURE', {
+    workspace: brokenEngineProject,
+    tsconfig: './tsconfig.json',
+    tsgo: true,
+    env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo' },
+    status: 1,
+    expectFailure: true,
+    expectCompleted: false
+});
+
+fs.writeFileSync(
+    path.join(fakePackage, 'bin.js'),
+    [
+        'const path = require("path");',
         'const file = path.join(process.cwd(), "src", "plain.ts");',
         'console.log(`${file}:1:1 - error TS9999: fatal-looking diagnostic`);',
         'console.log(file);',
@@ -1503,6 +1679,7 @@ fs.writeFileSync(
         'const config = JSON.parse(fs.readFileSync(overlay, "utf8"));',
         'console.log(`${overlay}:1:1 - error TS5023: Unknown compiler option.`);',
         'console.log(config.files.find((file) => file.endsWith(".svelte.tsx")));',
+        'console.log("Found 1 error.");',
         'process.exitCode = 1;'
     ].join('\n')
 );
@@ -1525,15 +1702,19 @@ test('killed native child is a machine FAILURE', {
     expectCompleted: false
 });
 
-fs.writeFileSync(path.join(fakePackage, 'bin.js'), 'setInterval(() => {}, 1000);');
-test('native child timeout is a machine FAILURE', {
+fs.writeFileSync(
+    path.join(fakePackage, 'bin.js'),
+    'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'
+);
+test('SIGTERM-ignoring native child timeout is a bounded machine FAILURE', {
     workspace: brokenEngineProject,
     tsconfig: './tsconfig.json',
     tsgo: true,
     env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo', SVELTE_LS_TSGO_TIMEOUT_MS: '50' },
     status: 1,
     expectFailure: true,
-    expectCompleted: false
+    expectCompleted: false,
+    maxDurationMs: 3_000
 });
 
 fs.writeFileSync(path.join(fakePackage, 'bin.js'), 'console.log("not compiler output");');
@@ -1541,6 +1722,28 @@ test('successful child with malformed output is a machine FAILURE', {
     workspace: brokenEngineProject,
     tsconfig: './tsconfig.json',
     tsgo: true,
+    env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo' },
+    status: 1,
+    expectFailure: true,
+    expectCompleted: false
+});
+
+fs.writeFileSync(
+    path.join(fakePackage, 'bin.js'),
+    [
+        'const path = require("path");',
+        'const file = path.join(process.cwd(), "src", "plain.ts");',
+        'console.log("garbage before otherwise valid output");',
+        'console.log(`${file}:1:1 - error TS9999: valid-looking diagnostic`);',
+        'console.log(file);',
+        'process.exitCode = 1;'
+    ].join('\n')
+);
+test('non-verbose machine output rejects mixed valid and malformed native output', {
+    workspace: brokenEngineProject,
+    tsconfig: './tsconfig.json',
+    tsgo: true,
+    output: 'machine',
     env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo' },
     status: 1,
     expectFailure: true,

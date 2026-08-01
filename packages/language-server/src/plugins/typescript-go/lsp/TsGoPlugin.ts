@@ -38,6 +38,7 @@ import {
     WorkspaceEdit,
     WorkspaceSymbol
 } from 'vscode-languageserver';
+import { createHash } from 'crypto';
 import fs from 'fs';
 import { basename } from 'path';
 import { internalHelpers } from 'svelte2tsx';
@@ -79,7 +80,7 @@ import {
     mapTokenRangeBack,
     mapWorkspaceEditBack
 } from './mapping';
-import { ShadowManager } from './ShadowManager';
+import { computeBatchGraphSourceSignature, ShadowManager } from './ShadowManager';
 import { ProjectRegistry } from './ProjectRegistry';
 import { TsGoComponentInfo } from './TsGoComponentInfo';
 import { TsGoServer } from './TsGoServer';
@@ -95,6 +96,10 @@ export interface TsGoStats {
     reusedShadows: number;
     projectChecks: number;
     cancellations: number;
+    diagnosticCoalesced: number;
+    diagnosticSuperseded: number;
+    materialisationCleanupRuns: number;
+    materialisationCleanupSkips: number;
     phaseTimings: Map<string, { count: number; totalMs: number }>;
 }
 
@@ -106,10 +111,13 @@ interface SyncedDocument {
 }
 
 interface DiagnosticFlight {
+    projectKey: string;
+    generation: number;
     promise: Promise<Diagnostic[] | null>;
     cancellation: CancellationTokenSource;
     waiters: number;
     finished: boolean;
+    cancelled: boolean;
 }
 
 interface TsGoPluginOptions {
@@ -148,17 +156,41 @@ export class TsGoPlugin implements Plugin {
     /** Materialisation is per project: opening a second app must not skip its own shadows. */
     private readonly opened = new Map<ShadowManager, Promise<void>>();
     /** Manager-dependent shadow paths already materialised for each source. */
-    private readonly materializedShadowsBySource = new Map<string, Set<string>>();
+    private readonly materializedShadowsBySource = new Map<
+        string,
+        Map<ShadowManager, Set<string>>
+    >();
+    /**
+     * Managers below one source root share package-local mirror directories. Keep their complete
+     * materialisation transactions ordered so one manager cannot prune or fingerprint files
+     * while another is still publishing them. A newer structural epoch deliberately starts a
+     * fresh queue: the obsolete transaction checks the epoch after every yield/await and cannot
+     * publish again, so a stuck config load must not block the replacement graph.
+     */
+    private readonly materialisationTails = new Map<
+        string | ShadowManager,
+        {
+            epoch: number;
+            /** Always settles and sequences the next transaction for this source root. */
+            settled: Promise<void>;
+            /** Every transaction not yet known to have published or failed. */
+            pending: Set<Promise<void>>;
+            /** Failed managers poison startup until that same manager retries successfully. */
+            failures: Map<ShadowManager, unknown>;
+        }
+    >();
+    /** Avoid a recursive mirror walk when a child restart reuses the exact same project graph. */
+    private readonly materialisationCleanupIdentity = new WeakMap<ShadowManager, string>();
     /** The exact generated overlay opened for each client-open Svelte source. */
     private readonly svelteOverlayBySource = new Map<string, string>();
-    /** Coalesce duplicate checks for the same document and tsgo generation. */
+    /**
+     * Coalesce duplicate checks for the same document and tsgo generation. The pinned native
+     * server advertises `workspaceDiagnostics: false`, so different documents still need their
+     * own request even though tsgo checks the whole project to answer each one.
+     */
     private readonly diagnosticsInFlight = new Map<string, DiagnosticFlight>();
     /** At most one native diagnostic check executes per project at a time. */
     private readonly diagnosticProjectTails = new Map<string, Promise<void>>();
-    private readonly activeDiagnosticChecks = new Map<
-        string,
-        { generation: number; cancellation: CancellationTokenSource }
-    >();
     /** Complete Svelte-buffer lifecycle, serialized per source URI. */
     private readonly svelteLifecycle = new Map<string, Promise<void>>();
     /** Client intent, updated synchronously so a close wins over a slow first materialisation. */
@@ -169,8 +201,16 @@ export class TsGoPlugin implements Plugin {
     private readonly lastWatchIdentity = new Map<string, string>();
     /** Import/re-export graph last observed for each saved source file. */
     private readonly sourceGraphSignatures = new Map<string, string>();
+    /** Semantic/content identity for config and manifest inputs which force project replacement. */
+    private readonly structuralFileSignatures = new Map<string, string>();
+    /** Serializes and supersedes native restarts caused by runtime TypeScript preferences. */
+    private configurationWork: Promise<void> = Promise.resolve();
+    private configurationGeneration = 0;
+    private tsGoConfigurationSignature: string | undefined;
     /** Invalidates transforms which began against an older project/config graph. */
     private structuralEpoch = 0;
+    /** Lets startup abandon a stalled publication as soon as a replacement epoch takes over. */
+    private readonly structuralEpochWaiters = new Set<() => void>();
     /** null once we've looked and found no legend to translate through. */
     private legendMap: number[] | null | undefined;
     private legendModifierMap: number[] | null | undefined;
@@ -192,6 +232,10 @@ export class TsGoPlugin implements Plugin {
             reusedShadows: 0,
             projectChecks: 0,
             cancellations: 0,
+            diagnosticCoalesced: 0,
+            diagnosticSuperseded: 0,
+            materialisationCleanupRuns: 0,
+            materialisationCleanupSkips: 0,
             phaseTimings: new Map()
         };
         Object.defineProperty(this.stats, 'openOverlays', {
@@ -202,6 +246,7 @@ export class TsGoPlugin implements Plugin {
             enumerable: true,
             get: () => this.server.childOpenDocumentCount
         });
+        this.tsGoConfigurationSignature = this.currentTsGoConfigurationSignature();
 
         // Warm the project as soon as a file is opened, instead of making the first completion
         // pay for materialising it. `ensureProjectOpened` memoises its promise, so the request
@@ -259,9 +304,41 @@ export class TsGoPlugin implements Plugin {
 
         this.configManager?.onChange(() => {
             this.componentInfo?.clearCache();
-            void this.server
-                .updateConfiguration()
-                .catch((e) => Logger.debug('[tsgo] could not update configuration', e));
+            const signature = this.currentTsGoConfigurationSignature();
+            if (signature === this.tsGoConfigurationSignature) {
+                return;
+            }
+            this.tsGoConfigurationSignature = signature;
+            const generation = ++this.configurationGeneration;
+            this.configurationWork = this.configurationWork
+                .catch(() => undefined)
+                .then(async () => {
+                    if (generation !== this.configurationGeneration) {
+                        return;
+                    }
+                    // The pinned native preview accepts didChangeConfiguration but does not
+                    // reliably re-enable inlay/preferences after they were disabled. Until a
+                    // version demonstrates live round-trip parity, restart only for an actual
+                    // change to the TS/JS configuration the child consumes. A child which has
+                    // not started yet will request the current values during initialize.
+                    if (this.server.processId === undefined) {
+                        return;
+                    }
+                    await this.server.restart();
+                });
+            void this.configurationWork.catch((e) =>
+                Logger.debug('[tsgo] could not apply runtime TypeScript configuration', e)
+            );
+        });
+    }
+
+    private currentTsGoConfigurationSignature(): string | undefined {
+        if (!this.configManager) {
+            return undefined;
+        }
+        return stableJsonStringify({
+            typescript: this.configManager.getClientTsUserConfig('typescript') ?? {},
+            javascript: this.configManager.getClientTsUserConfig('javascript') ?? {}
         });
     }
 
@@ -386,14 +463,48 @@ export class TsGoPlugin implements Plugin {
             reusedShadows: this.stats.reusedShadows,
             projectChecks: this.stats.projectChecks,
             cancellations: this.stats.cancellations,
+            diagnosticCoalesced: this.stats.diagnosticCoalesced,
+            diagnosticSuperseded: this.stats.diagnosticSuperseded,
+            materialisationCleanupRuns: this.stats.materialisationCleanupRuns,
+            materialisationCleanupSkips: this.stats.materialisationCleanupSkips,
             phaseTimings: Object.fromEntries(this.stats.phaseTimings)
         };
     }
 
-    private markShadowMaterialized(sourcePath: string, shadowPath: string) {
-        const paths = this.materializedShadowsBySource.get(sourcePath) ?? new Set<string>();
+    private markShadowMaterialized(sourcePath: string, shadowPath: string, manager: ShadowManager) {
+        const managers =
+            this.materializedShadowsBySource.get(sourcePath) ??
+            new Map<ShadowManager, Set<string>>();
+        const paths = managers.get(manager) ?? new Set<string>();
         paths.add(shadowPath);
-        this.materializedShadowsBySource.set(sourcePath, paths);
+        managers.set(manager, paths);
+        this.materializedShadowsBySource.set(sourcePath, managers);
+    }
+
+    /** Clone the manager ownership map so a watcher pass can rebuild it atomically. */
+    private materializedManagersForSource(sourcePath: string): Map<ShadowManager, Set<string>> {
+        return new Map(
+            [...(this.materializedShadowsBySource.get(sourcePath) ?? [])].map(
+                ([manager, paths]) => [manager, new Set(paths)]
+            )
+        );
+    }
+
+    private isShadowMaterialized(sourcePath: string, shadowPath: string): boolean {
+        return [...(this.materializedShadowsBySource.get(sourcePath)?.values() ?? [])].some(
+            (paths) => paths.has(shadowPath)
+        );
+    }
+
+    private forgetMaterializedProjects(projects: ReadonlySet<ShadowManager>): void {
+        for (const [sourcePath, managers] of this.materializedShadowsBySource) {
+            for (const project of projects) {
+                managers.delete(project);
+            }
+            if (!managers.size) {
+                this.materializedShadowsBySource.delete(sourcePath);
+            }
+        }
     }
 
     /**
@@ -413,7 +524,11 @@ export class TsGoPlugin implements Plugin {
                     throw MATERIALIZATION_INVALIDATED;
                 }
             };
-            const attempt = this.materializeProject(shadows, assertCurrent);
+            const attempt = this.runMaterialisationTransaction(
+                shadows,
+                expectedStructuralEpoch,
+                assertCurrent
+            );
             done = attempt.catch((error) => {
                 if (this.opened.get(shadows) === done) {
                     this.opened.delete(shadows);
@@ -428,6 +543,138 @@ export class TsGoPlugin implements Plugin {
         return done;
     }
 
+    private runMaterialisationTransaction(
+        shadows: ShadowManager,
+        epoch: number,
+        assertCurrent: () => void
+    ): Promise<void> {
+        const key = this.materialisationQueueKey(shadows);
+        let state = this.materialisationTails.get(key);
+        if (!state || state.epoch !== epoch) {
+            state = {
+                epoch,
+                settled: Promise.resolve(),
+                pending: new Set(),
+                failures: new Map()
+            };
+            this.materialisationTails.set(key, state);
+        }
+        const previous = state.settled;
+        const queuedAt = Date.now();
+        const result = previous
+            .catch(() => undefined)
+            .then(async () => {
+                assertCurrent();
+                this.recordPhase('materialiseQueue', Date.now() - queuedAt);
+                await this.materializeProject(shadows, assertCurrent);
+            });
+        state.settled = result.then(
+            () => undefined,
+            () => undefined
+        );
+        state.pending.add(result);
+        const transactionState = state;
+        const removeWhenHealthy = () => {
+            if (
+                this.materialisationTails.get(key) === transactionState &&
+                transactionState.pending.size === 0 &&
+                transactionState.failures.size === 0
+            ) {
+                this.materialisationTails.delete(key);
+            }
+        };
+        void result.then(
+            () => {
+                transactionState.pending.delete(result);
+                transactionState.failures.delete(shadows);
+                removeWhenHealthy();
+            },
+            (error) => {
+                transactionState.pending.delete(result);
+                transactionState.failures.set(shadows, error);
+            }
+        );
+        return result;
+    }
+
+    /**
+     * Drain project publication before a new native child snapshots the workspace.
+     *
+     * A source-root queue can gain another manager while an earlier snapshot is being awaited,
+     * so this deliberately re-reads the tails until the current structural epoch is stable. An
+     * obsolete epoch must not hold startup hostage: structural replacement wakes the barrier and
+     * the old transaction's own guards prevent it from publishing into the replacement graph.
+     */
+    async awaitProjectPublicationsBeforeStart(): Promise<void> {
+        for (;;) {
+            const epoch = this.structuralEpoch;
+            const states = [...this.materialisationTails.values()].filter(
+                (entry) => entry.epoch === epoch
+            );
+            const failedState = states.find((entry) => entry.failures.size > 0);
+            if (failedState) {
+                throw failedState.failures.values().next().value;
+            }
+            const tails = states.flatMap((entry) => [...entry.pending]);
+
+            if (tails.length) {
+                let wakeForReplacement!: () => void;
+                const replacement = new Promise<void>((resolve) => {
+                    wakeForReplacement = resolve;
+                    this.structuralEpochWaiters.add(resolve);
+                });
+                try {
+                    await Promise.race([Promise.all(tails), replacement]);
+                } catch (error) {
+                    if (this.structuralEpoch === epoch) {
+                        throw error;
+                    }
+                } finally {
+                    this.structuralEpochWaiters.delete(wakeForReplacement);
+                }
+                continue;
+            }
+
+            // Give already-dispatched didOpen handlers one microtask to register their manager.
+            // The second read is the actual stability check.
+            await Promise.resolve();
+            if (
+                this.structuralEpoch === epoch &&
+                ![...this.materialisationTails.values()].some((entry) => entry.epoch === epoch)
+            ) {
+                return;
+            }
+        }
+    }
+
+    private advanceStructuralEpoch(): number {
+        const epoch = ++this.structuralEpoch;
+        for (const [key, entry] of this.materialisationTails) {
+            if (entry.epoch !== epoch) {
+                this.materialisationTails.delete(key);
+            }
+        }
+        for (const wake of this.structuralEpochWaiters) {
+            wake();
+        }
+        this.structuralEpochWaiters.clear();
+        return epoch;
+    }
+
+    private materialisationQueueKey(shadows: ShadowManager): string | ShadowManager {
+        const sourceRoot = shadows.sourceRoot;
+        if (!sourceRoot) {
+            // Narrow test doubles and mapping-only implementations may not expose a filesystem
+            // root. Their object identity is still sufficient to prevent self-overlap.
+            return shadows;
+        }
+        try {
+            return normalizeWatchPath(fs.realpathSync.native(sourceRoot));
+        } catch {
+            return normalizeWatchPath(sourceRoot);
+        }
+    }
+
     private async materializeProject(
         shadows: ShadowManager,
         assertCurrent: () => void
@@ -438,13 +685,18 @@ export class TsGoPlugin implements Plugin {
         const requiredFiles = [
             ...new Set([
                 ...shadows.findProjectSvelteFiles(),
-                ...shadows.findDependencySvelteFiles()
+                ...shadows.findDependencySvelteFiles(),
+                ...(shadows.getBatchMaterializedSvelteFiles?.() ?? [])
             ])
         ];
         assertCurrent();
+        const requiredShadowPaths = new Map(
+            requiredFiles.map((file) => [file, shadows.getShadowPath(file)] as const)
+        );
+        const liveShadowPaths = new Set(requiredShadowPaths.values());
         const files = requiredFiles.filter((file) => {
-            const shadowPath = shadows.getShadowPath(file);
-            return !this.materializedShadowsBySource.get(file)?.has(shadowPath);
+            const shadowPath = requiredShadowPaths.get(file)!;
+            return !this.isShadowMaterialized(file, shadowPath);
         });
         Logger.log(`[tsgo] materialising ${files.length}/${requiredFiles.length} new shadows`);
         const started = Date.now();
@@ -462,7 +714,7 @@ export class TsGoPlugin implements Plugin {
             }
             assertCurrent();
             try {
-                const shadowPathIfFresh = shadows.getShadowPath(filePath);
+                const shadowPathIfFresh = requiredShadowPaths.get(filePath)!;
                 // A shadow newer than its source is already what the transform would produce, so
                 // re-deriving it is pure startup cost. Correctness comes from the fingerprint: a
                 // Svelte or svelte2tsx upgrade invalidates all of them.
@@ -472,7 +724,7 @@ export class TsGoPlugin implements Plugin {
                 assertCurrent();
                 if (isFresh) {
                     written.add(shadowPathIfFresh);
-                    this.markShadowMaterialized(filePath, shadowPathIfFresh);
+                    this.markShadowMaterialized(filePath, shadowPathIfFresh, shadows);
                     reused++;
                     this.stats.reusedShadows++;
                     continue;
@@ -497,12 +749,14 @@ export class TsGoPlugin implements Plugin {
                 assertCurrent();
                 const snapshot = shadows.transform(document);
                 const shadowPath = shadows.getShadowPath(filePath);
-                const generatedText = snapshot.getFullText();
+                const generatedText = shadows.rewriteBatchModuleSpecifiers
+                    ? shadows.rewriteBatchModuleSpecifiers(snapshot.getFullText(), filePath)
+                    : snapshot.getFullText();
                 assertCurrent();
                 shadows.writeShadow(shadowPath, generatedText);
                 assertCurrent();
                 written.add(shadowPath);
-                this.markShadowMaterialized(filePath, shadowPath);
+                this.markShadowMaterialized(filePath, shadowPath, shadows);
                 this.stats.transformedShadows++;
             } catch (error) {
                 if (error === MATERIALIZATION_INVALIDATED) {
@@ -526,14 +780,96 @@ export class TsGoPlugin implements Plugin {
                 shadows.deleteSnapshot(filePath);
             }
         }
+
+        // A colliding `Foo.svelte.ts` makes ordinary source roots/barrels part of the same
+        // physical mirror as generated components. Publish them before tsgo sees the overlay;
+        // otherwise a package entry can resolve to the authored graph while one relative edge
+        // extension-substitutes into the mirror, creating two nominal type identities.
+        for (const { originalPath, mirrorPath, kind } of shadows.getBatchSourceMirrorEntries?.() ??
+            []) {
+            if (++sinceYield >= 50) {
+                sinceYield = 0;
+                await new Promise(setImmediate);
+            }
+            assertCurrent();
+            liveShadowPaths.add(mirrorPath);
+            try {
+                const sourceText = fs.readFileSync(originalPath, 'utf8');
+                const mirroredText =
+                    kind === 'script'
+                        ? shadows.rewriteBatchModuleSpecifiers(sourceText, originalPath)
+                        : sourceText;
+                let isCurrent = false;
+                try {
+                    isCurrent = fs.readFileSync(mirrorPath, 'utf8') === mirroredText;
+                } catch {
+                    // Missing output takes the write path below.
+                }
+                assertCurrent();
+                if (isCurrent) {
+                    reused++;
+                    this.stats.reusedShadows++;
+                } else {
+                    shadows.writeShadow(mirrorPath, mirroredText);
+                    this.stats.transformedShadows++;
+                }
+                written.add(mirrorPath);
+            } catch (error) {
+                if (error === MATERIALIZATION_INVALIDATED) {
+                    throw error;
+                }
+                assertCurrent();
+                failures++;
+                Logger.debug(
+                    `[tsgo] could not materialise source mirror for ${originalPath}`,
+                    error
+                );
+            }
+        }
         if (failures) {
             throw new Error(`failed to materialise ${failures} shadow(s)`);
         }
         assertCurrent();
-        shadows.pruneOrphanedShadows(written);
+        for (const supportPath of shadows.writeBatchMirrorPackageScopes?.() ?? []) {
+            liveShadowPaths.add(supportPath);
+            written.add(supportPath);
+        }
+        assertCurrent();
+        // Passing an empty previous set is intentional: reconciliation reads this manager's
+        // existing owner record first, then retires only paths no other valid owner protects.
+        shadows.reconcileBatchMirrorOwnership?.([], [...liveShadowPaths]);
+        assertCurrent();
+        const cleanupIdentity = JSON.stringify([...liveShadowPaths].sort());
+        const cleanupStarted = Date.now();
+        if (this.materialisationCleanupIdentity.get(shadows) === cleanupIdentity) {
+            this.stats.materialisationCleanupSkips++;
+        } else {
+            shadows.pruneOrphanedShadows(liveShadowPaths);
+            this.materialisationCleanupIdentity.set(shadows, cleanupIdentity);
+            this.stats.materialisationCleanupRuns++;
+        }
+        this.recordPhase('materialiseCleanup', Date.now() - cleanupStarted);
         assertCurrent();
         shadows.commitFingerprints();
         assertCurrent();
+        const graphPlan = shadows.exportBatchGraphPlan?.();
+        if (graphPlan) {
+            this.projects.recordProjectGraphInputs?.(shadows, graphPlan);
+        }
+        const sourceInputs =
+            graphPlan?.sourceInputs ?? shadows.getBatchGraphPlanSourceInputs?.() ?? [];
+        for (const input of sourceInputs) {
+            this.sourceGraphSignatures.set(normalizeWatchPath(input.path), input.signature);
+        }
+        for (const input of [
+            ...(graphPlan?.configInputs ?? []),
+            ...(graphPlan?.manifestInputs ?? []),
+            ...requiredFiles
+                .map((filePath) => configLoader.getResolvedConfig(filePath)?.configPath)
+                .filter(isNotNullOrUndefined)
+        ]) {
+            this.seedStructuralFileSignature(input);
+        }
         Logger.log(
             `[tsgo] materialised ${written.size} shadows in ${Date.now() - started}ms ` +
                 `(${reused} reused from disk)`
@@ -584,7 +920,9 @@ export class TsGoPlugin implements Plugin {
         // path rewrites it on save. Writing per request meant several syncs per keystroke.
         if (document.openedByClient && this.desiredOpenSvelte.has(filePath)) {
             this.svelteOverlayBySource.set(filePath, shadowPath);
-            const text = snapshot.getFullText();
+            const text = shadows.rewriteBatchModuleSpecifiers
+                ? shadows.rewriteBatchModuleSpecifiers(snapshot.getFullText(), filePath)
+                : snapshot.getFullText();
             const previous = this.server.getOpenText(shadowPath);
             if (previous !== text) {
                 this.componentInfo?.invalidateFile(shadowPath);
@@ -698,7 +1036,11 @@ export class TsGoPlugin implements Plugin {
                 ? { kind: 'unchanged', resultId: previousResultId }
                 : { kind: 'full', items: [] };
         }
-        return { kind: 'full', resultId, items };
+        // A different document can move the project generation in the narrow gap between the
+        // quiescence guard and joining its diagnostic flight. A usable flight is guaranteed to
+        // match the generation at delivery, so attach that generation rather than the earlier
+        // optimistic id (which would force an unnecessary repeat check on the next pull).
+        return { kind: 'full', resultId: `g${this.server.generation}`, items };
     }
 
     private collectDiagnosticsSingleFlight(
@@ -707,44 +1049,45 @@ export class TsGoPlugin implements Plugin {
         tStart: number
     ): Promise<Diagnostic[] | null> {
         const generation = this.server.generation;
-        const key = `${generation}:${synced.shadowPath}`;
+        const key = `${synced.projectKey}:${generation}:${synced.shadowPath}`;
         const existing = this.diagnosticsInFlight.get(key);
         if (existing) {
+            this.stats.diagnosticCoalesced++;
             return this.waitForDiagnosticFlight(key, existing, cancellationToken);
         }
 
-        const active = this.activeDiagnosticChecks.get(synced.projectKey);
-        if (active && active.generation !== generation) {
-            active.cancellation.cancel();
-            this.stats.cancellations++;
+        // A document change invalidates every diagnostic answer in the configured project, not
+        // only the changed shadow. Cancel both the native request and any older requests waiting
+        // behind it. Their callers settle immediately; their queue continuations remain only to
+        // preserve the invariant that tsgo sees at most one project check at a time.
+        for (const [flightKey, flight] of this.diagnosticsInFlight) {
+            if (flight.projectKey === synced.projectKey && flight.generation !== generation) {
+                this.cancelDiagnosticFlight(flightKey, flight, true);
+            }
         }
         const previous = this.diagnosticProjectTails.get(synced.projectKey);
         const internalCancellation = new CancellationTokenSource();
         const entry: DiagnosticFlight = {
+            projectKey: synced.projectKey,
+            generation,
             promise: undefined as unknown as Promise<Diagnostic[] | null>,
             cancellation: internalCancellation,
             waiters: 0,
-            finished: false
+            finished: false,
+            cancelled: false
         };
         const promise = (async () => {
             await previous?.catch(() => undefined);
-            if (this.server.generation !== generation) {
+            if (
+                internalCancellation.token.isCancellationRequested ||
+                this.server.generation !== generation
+            ) {
                 return null;
             }
-            this.activeDiagnosticChecks.set(synced.projectKey, {
-                generation,
-                cancellation: internalCancellation
-            });
             return this.collectDiagnostics(synced, internalCancellation.token, tStart, generation);
         })().finally(() => {
             entry.finished = true;
             internalCancellation.dispose();
-            if (
-                this.activeDiagnosticChecks.get(synced.projectKey)?.cancellation ===
-                internalCancellation
-            ) {
-                this.activeDiagnosticChecks.delete(synced.projectKey);
-            }
             if (this.diagnosticsInFlight.get(key) === entry && entry.waiters === 0) {
                 this.diagnosticsInFlight.delete(key);
             }
@@ -764,6 +1107,25 @@ export class TsGoPlugin implements Plugin {
         return this.waitForDiagnosticFlight(key, entry, cancellationToken);
     }
 
+    private cancelDiagnosticFlight(
+        key: string,
+        flight: DiagnosticFlight,
+        superseded: boolean
+    ): void {
+        if (flight.finished || flight.cancelled) {
+            return;
+        }
+        flight.cancelled = true;
+        flight.cancellation.cancel();
+        this.stats.cancellations++;
+        if (superseded) {
+            this.stats.diagnosticSuperseded++;
+        }
+        if (this.diagnosticsInFlight.get(key) === flight) {
+            this.diagnosticsInFlight.delete(key);
+        }
+    }
+
     private waitForDiagnosticFlight(
         key: string,
         flight: DiagnosticFlight,
@@ -775,20 +1137,18 @@ export class TsGoPlugin implements Plugin {
         flight.waiters++;
         return new Promise<Diagnostic[] | null>((resolve, reject) => {
             let settled = false;
-            let disposable: { dispose(): void } | undefined;
+            let callerCancellation: { dispose(): void } | undefined;
+            let flightCancellation: { dispose(): void } | undefined;
             const release = () => {
                 if (settled) {
                     return;
                 }
                 settled = true;
-                disposable?.dispose();
+                callerCancellation?.dispose();
+                flightCancellation?.dispose();
                 flight.waiters--;
                 if (!flight.finished && flight.waiters === 0) {
-                    flight.cancellation.cancel();
-                    this.stats.cancellations++;
-                    if (this.diagnosticsInFlight.get(key) === flight) {
-                        this.diagnosticsInFlight.delete(key);
-                    }
+                    this.cancelDiagnosticFlight(key, flight, false);
                 } else if (
                     flight.finished &&
                     flight.waiters === 0 &&
@@ -797,7 +1157,11 @@ export class TsGoPlugin implements Plugin {
                     this.diagnosticsInFlight.delete(key);
                 }
             };
-            disposable = cancellationToken?.onCancellationRequested(() => {
+            callerCancellation = cancellationToken?.onCancellationRequested(() => {
+                release();
+                resolve(null);
+            });
+            flightCancellation = flight.cancellation.token.onCancellationRequested(() => {
                 release();
                 resolve(null);
             });
@@ -805,7 +1169,13 @@ export class TsGoPlugin implements Plugin {
                 (result) => {
                     if (!settled) {
                         release();
-                        resolve(cancellationToken?.isCancellationRequested ? null : result);
+                        resolve(
+                            cancellationToken?.isCancellationRequested ||
+                                flight.cancellation.token.isCancellationRequested ||
+                                this.server.generation !== flight.generation
+                                ? null
+                                : result
+                        );
                     }
                 },
                 (error) => {
@@ -851,6 +1221,12 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (e) {
+            // Superseded generations are an expected control-flow path. Counting an acknowledged
+            // `$/cancelRequest` as a native failure makes cancellation-heavy typing look like a
+            // transport regression and pollutes the fallback telemetry.
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             Logger.debug('[tsgo] diagnostic request failed', e);
             this.fallback('diagnostic-request-failed');
             return null;
@@ -957,7 +1333,7 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
         const synced = await this.syncDocument(document);
-        if (!synced) {
+        if (!synced || cancellationToken?.isCancellationRequested) {
             return null;
         }
         const { snapshot, shadowPath } = synced;
@@ -991,18 +1367,29 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
 
-        const hover: any = await this.server.sendRequest(
-            'textDocument/hover',
-            {
-                textDocument: { uri: pathToUrl(shadowPath) },
-                position: generated
-            },
-            cancellationToken
-        );
-        if (!hover) {
+        let hover: any;
+        try {
+            hover = await this.server.sendRequest(
+                'textDocument/hover',
+                {
+                    textDocument: { uri: pathToUrl(shadowPath) },
+                    position: generated
+                },
+                cancellationToken
+            );
+        } catch (error) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            throw error;
+        }
+        if (!hover || cancellationToken?.isCancellationRequested) {
             return null;
         }
         const hoverRange = hover.range ? mapRangeToOriginal(snapshot, hover.range) : undefined;
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         this.stats.served++;
         return {
             contents: hover.contents,
@@ -1052,7 +1439,7 @@ export class TsGoPlugin implements Plugin {
         }
 
         const synced = await this.syncDocument(document);
-        if (!synced) {
+        if (!synced || cancellationToken?.isCancellationRequested) {
             return null;
         }
         const { snapshot, shadowPath } = synced;
@@ -1091,6 +1478,9 @@ export class TsGoPlugin implements Plugin {
                 componentOffset.offset,
                 componentOffset.tag
             );
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             if (props.length) {
                 this.stats.served++;
                 return {
@@ -1111,16 +1501,24 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
 
-        const result: any = await this.server.sendRequest(
-            'textDocument/completion',
-            {
-                textDocument: { uri: pathToUrl(shadowPath) },
-                position: generated,
-                context: completionContext
-            },
-            cancellationToken
-        );
-        if (!result) {
+        let result: any;
+        try {
+            result = await this.server.sendRequest(
+                'textDocument/completion',
+                {
+                    textDocument: { uri: pathToUrl(shadowPath) },
+                    position: generated,
+                    context: completionContext
+                },
+                cancellationToken
+            );
+        } catch (error) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            throw error;
+        }
+        if (!result || cancellationToken?.isCancellationRequested) {
             return null;
         }
         this.stats.served++;
@@ -1130,6 +1528,9 @@ export class TsGoPlugin implements Plugin {
         // Mutated in place: a global completion is thousands of items, and cloning each one
         // just to attach `data` dominated the post-request time.
         for (const item of items) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             // `connection.onCompletionResolve` reads `item.data` as a TextDocumentIdentifier to
             // find the document the item belongs to, so an item whose data is tsgo's own payload
             // resolves against `undefined` and throws "Cannot call methods on an unopened
@@ -1157,6 +1558,9 @@ export class TsGoPlugin implements Plugin {
                 }
                 item.textEdit = mappedEdit;
             }
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
         }
 
         return {
@@ -1179,13 +1583,16 @@ export class TsGoPlugin implements Plugin {
         token?: CancellationToken,
         generatedPosition?: (synced: SyncedDocument) => Position | undefined
     ): Promise<{ result: T; snapshot: SvelteDocumentSnapshot } | null> {
+        if (token?.isCancellationRequested) {
+            return null;
+        }
         const synced = await this.syncDocument(document);
-        if (!synced) {
+        if (!synced || token?.isCancellationRequested) {
             return null;
         }
         const generated =
             generatedPosition?.(synced) ?? synced.snapshot.getGeneratedPosition(position);
-        if (generated.line < 0) {
+        if (generated.line < 0 || token?.isCancellationRequested) {
             return null;
         }
         try {
@@ -1198,9 +1605,15 @@ export class TsGoPlugin implements Plugin {
                 },
                 token
             );
+            if (token?.isCancellationRequested) {
+                return null;
+            }
             this.stats.served++;
             return { result, snapshot: synced.snapshot };
         } catch (e) {
+            if (token?.isCancellationRequested) {
+                return null;
+            }
             Logger.debug(`[tsgo] ${method} failed`, e);
             this.fallback(method);
             return null;
@@ -1208,21 +1621,30 @@ export class TsGoPlugin implements Plugin {
     }
 
     /** Normalise the several shapes tsgo may return for a goto-style request into Locations. */
-    private toLocations(result: any): Location[] {
-        if (!result) {
+    private toLocations(result: any, cancellationToken?: CancellationToken): Location[] {
+        if (!result || cancellationToken?.isCancellationRequested) {
             return [];
         }
         const raw: any[] = Array.isArray(result) ? result : [result];
-        return raw
-            .map((entry) => {
-                const uri: string = entry.targetUri ?? entry.uri;
-                const range: Range = entry.targetSelectionRange ?? entry.targetRange ?? entry.range;
-                if (!uri || !range) {
-                    return undefined;
-                }
-                return mapLocationBack(this.projects, uri, range);
-            })
-            .filter(isNotNullOrUndefined);
+        const locations: Location[] = [];
+        for (const entry of raw) {
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            const uri: string = entry.targetUri ?? entry.uri;
+            const range: Range = entry.targetSelectionRange ?? entry.targetRange ?? entry.range;
+            if (!uri || !range) {
+                continue;
+            }
+            const mapped = mapLocationBack(this.projects, uri, range);
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            if (mapped) {
+                locations.push(mapped);
+            }
+        }
+        return locations;
     }
 
     async getDefinitions(
@@ -1249,31 +1671,46 @@ export class TsGoPlugin implements Plugin {
             : response.result
               ? [response.result]
               : [];
-        return entries
-            .map((entry) => {
-                const targetUri = entry.targetUri ?? entry.uri;
-                const targetSelectionRange = entry.targetSelectionRange ?? entry.range;
-                if (!targetUri || !targetSelectionRange) {
-                    return undefined;
-                }
-                const selection = this.mapDefinitionTarget(targetUri, targetSelectionRange);
-                if (!selection) {
-                    return undefined;
-                }
-                const full = entry.targetRange
-                    ? this.mapDefinitionTarget(targetUri, entry.targetRange)
-                    : selection;
-                const origin = entry.originSelectionRange
-                    ? mapRangeToOriginal(response.snapshot, entry.originSelectionRange)
-                    : undefined;
-                return LocationLink.create(
+        const definitions: DefinitionLink[] = [];
+        for (const entry of entries) {
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            const targetUri = entry.targetUri ?? entry.uri;
+            const targetSelectionRange = entry.targetSelectionRange ?? entry.range;
+            if (!targetUri || !targetSelectionRange) {
+                continue;
+            }
+            const selection = this.mapDefinitionTarget(
+                targetUri,
+                targetSelectionRange,
+                cancellationToken
+            );
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            if (!selection) {
+                continue;
+            }
+            const origin = entry.originSelectionRange
+                ? mapRangeToOriginal(response.snapshot, entry.originSelectionRange)
+                : undefined;
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            definitions.push(
+                LocationLink.create(
                     selection.uri,
-                    full?.range ?? selection.range,
+                    // The classic provider reports DefinitionInfo.textSpan as both the target
+                    // and selection range. Native tsgo widens targetRange to a declaration body;
+                    // normalize it so editor navigation has the same source-level contract.
+                    selection.range,
                     selection.range,
                     isMapped(origin) ? origin : undefined
-                );
-            })
-            .filter(isNotNullOrUndefined);
+                )
+            );
+        }
+        return definitions;
     }
 
     /**
@@ -1283,8 +1720,18 @@ export class TsGoPlugin implements Plugin {
      * source-file anchor as the classic TypeScript provider; all other generated-only ranges
      * remain filtered out.
      */
-    private mapDefinitionTarget(uri: string, range: Range): Location | undefined {
+    private mapDefinitionTarget(
+        uri: string,
+        range: Range,
+        cancellationToken?: CancellationToken
+    ): Location | undefined {
+        if (cancellationToken?.isCancellationRequested) {
+            return undefined;
+        }
         const mapped = mapLocationBack(this.projects, uri, range);
+        if (cancellationToken?.isCancellationRequested) {
+            return undefined;
+        }
         if (mapped) {
             return mapped;
         }
@@ -1330,7 +1777,7 @@ export class TsGoPlugin implements Plugin {
             {},
             cancellationToken
         );
-        return response ? this.toLocations(response.result) : null;
+        return response ? this.toLocations(response.result, cancellationToken) : null;
     }
 
     async getImplementation(
@@ -1345,7 +1792,7 @@ export class TsGoPlugin implements Plugin {
             {},
             cancellationToken
         );
-        return response ? this.toLocations(response.result) : null;
+        return response ? this.toLocations(response.result, cancellationToken) : null;
     }
 
     async findReferences(
@@ -1361,7 +1808,7 @@ export class TsGoPlugin implements Plugin {
             { context: { includeDeclaration: context?.includeDeclaration ?? true } },
             cancellationToken
         );
-        return response ? this.toLocations(response.result) : null;
+        return response ? this.toLocations(response.result, cancellationToken) : null;
     }
 
     async findDocumentHighlight(
@@ -1380,12 +1827,20 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
         const highlights: any[] = response.result ?? [];
-        return highlights
-            .map((highlight) => {
-                const range = mapRangeToOriginal(response.snapshot, highlight.range);
-                return isMapped(range) ? { ...highlight, range } : undefined;
-            })
-            .filter(isNotNullOrUndefined);
+        const mappedHighlights: DocumentHighlight[] = [];
+        for (const highlight of highlights) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            const range = mapRangeToOriginal(response.snapshot, highlight.range);
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            if (isMapped(range)) {
+                mappedHighlights.push({ ...highlight, range });
+            }
+        }
+        return mappedHighlights;
     }
 
     async getSignatureHelp(
@@ -1412,25 +1867,36 @@ export class TsGoPlugin implements Plugin {
         position: Position,
         cancellationToken?: CancellationToken
     ): Promise<SelectionRange | null> {
-        if (!this.featureEnabled('selectionRange')) {
+        if (!this.featureEnabled('selectionRange') || cancellationToken?.isCancellationRequested) {
             return null;
         }
         const synced = await this.syncDocument(document);
-        if (!synced) {
+        if (!synced || cancellationToken?.isCancellationRequested) {
             return null;
         }
         const generated = synced.snapshot.getGeneratedPosition(position);
         if (generated.line < 0) {
             return null;
         }
-        const result: any = await this.server.sendRequest(
-            'textDocument/selectionRange',
-            {
-                textDocument: { uri: pathToUrl(synced.shadowPath) },
-                positions: [generated]
-            },
-            cancellationToken
-        );
+        let result: any;
+        try {
+            result = await this.server.sendRequest(
+                'textDocument/selectionRange',
+                {
+                    textDocument: { uri: pathToUrl(synced.shadowPath) },
+                    positions: [generated]
+                },
+                cancellationToken
+            );
+        } catch (error) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            throw error;
+        }
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         const first = Array.isArray(result) ? result[0] : result;
         if (!first) {
             return null;
@@ -1440,7 +1906,13 @@ export class TsGoPlugin implements Plugin {
         // Walk the parent chain, keeping only the levels that survive mapping.
         const levels: Range[] = [];
         for (let node = first; node; node = node.parent) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             const range = mapRangeToOriginal(synced.snapshot, node.range);
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             if (isMapped(range)) {
                 levels.push(range);
             }
@@ -1463,11 +1935,14 @@ export class TsGoPlugin implements Plugin {
         range?: Range,
         cancellationToken?: CancellationToken
     ): Promise<SemanticTokens | null> {
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         if (!this.featureEnabled('semanticTokens')) {
             return { data: [] };
         }
         const synced = await this.syncDocument(document);
-        if (!synced) {
+        if (!synced || cancellationToken?.isCancellationRequested) {
             return null;
         }
         const { snapshot, shadowPath } = synced;
@@ -1503,8 +1978,14 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (e) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             Logger.debug('[tsgo] semanticTokens failed', e);
             this.fallback('semanticTokens');
+            return null;
+        }
+        if (cancellationToken?.isCancellationRequested) {
             return null;
         }
         if (!result?.data?.length) {
@@ -1516,12 +1997,21 @@ export class TsGoPlugin implements Plugin {
         const builder = new SemanticTokensBuilder();
         const mapped: Array<[number, number, number, number, number]> = [];
 
-        for (const [line, char, length, type, modifiers] of decodeSemanticTokens(result.data)) {
+        for (const [line, char, length, type, modifiers] of decodeSemanticTokens(
+            result.data,
+            () => !!cancellationToken?.isCancellationRequested
+        )) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             const tokenType = legendMap ? legendMap[type] : type;
             if (tokenType === undefined || tokenType < 0) {
                 continue;
             }
             const target = mapTokenRangeBack(snapshot, line, char, length);
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             if (!target) {
                 continue;
             }
@@ -1562,9 +2052,15 @@ export class TsGoPlugin implements Plugin {
             ]);
         }
 
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         // The builder requires ascending order, and mapping can reorder tokens.
         mapped.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
         for (const token of mapped) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             builder.push(...token);
         }
         return builder.build();
@@ -1574,32 +2070,46 @@ export class TsGoPlugin implements Plugin {
         document: Document,
         cancellationToken?: CancellationToken
     ): Promise<SymbolInformation[]> {
-        if (!this.featureEnabled('documentSymbols')) {
+        if (!this.featureEnabled('documentSymbols') || cancellationToken?.isCancellationRequested) {
             return [];
         }
         const synced = await this.syncDocument(document);
-        if (!synced) {
+        if (!synced || cancellationToken?.isCancellationRequested) {
             return [];
         }
-        const result: any = await this.server.sendRequest(
-            'textDocument/documentSymbol',
-            {
-                textDocument: { uri: pathToUrl(synced.shadowPath) }
-            },
-            cancellationToken
-        );
-        if (!Array.isArray(result)) {
+        let result: any;
+        try {
+            result = await this.server.sendRequest(
+                'textDocument/documentSymbol',
+                {
+                    textDocument: { uri: pathToUrl(synced.shadowPath) }
+                },
+                cancellationToken
+            );
+        } catch (error) {
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            throw error;
+        }
+        if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
             return [];
         }
         this.stats.served++;
 
         const out: SymbolInformation[] = [];
-        const visit = (node: any, container?: string) => {
+        const visit = (node: any, container?: string): boolean => {
+            if (cancellationToken?.isCancellationRequested) {
+                return false;
+            }
             const selection = node.selectionRange ?? node.range ?? node.location?.range;
             if (!selection) {
-                return;
+                return true;
             }
             const mapped = mapRangeToOriginal(synced.snapshot, selection);
+            if (cancellationToken?.isCancellationRequested) {
+                return false;
+            }
             // The shadow is .tsx, so every element in the generated template shows up as a JSX
             // symbol (`div.flex.items-center`, `X.size-5`, ...). Markup already has an outline
             // from the HTML plugin, so TypeScript should only contribute symbols that actually
@@ -1611,6 +2121,9 @@ export class TsGoPlugin implements Plugin {
                 isZeroLengthRange(mapped) ||
                 !isInScript(mapped.start, synced.snapshot) ||
                 inGeneratedRegion(synced.snapshot, synced.snapshot.offsetAt(selection.start));
+            if (cancellationToken?.isCancellationRequested) {
+                return false;
+            }
             if (!isSynthetic && isMapped(mapped)) {
                 out.push({
                     name: node.name,
@@ -1620,11 +2133,16 @@ export class TsGoPlugin implements Plugin {
                 });
             }
             for (const child of node.children ?? []) {
-                visit(child, isSynthetic ? container : node.name);
+                if (!visit(child, isSynthetic ? container : node.name)) {
+                    return false;
+                }
             }
+            return true;
         };
         for (const node of result) {
-            visit(node);
+            if (!visit(node)) {
+                return [];
+            }
         }
         return out;
     }
@@ -1634,11 +2152,14 @@ export class TsGoPlugin implements Plugin {
         range: Range,
         cancellationToken?: CancellationToken
     ): Promise<InlayHint[] | null> {
-        if (this.configManager && !this.configManager.enabled('typescript.enable')) {
+        if (
+            cancellationToken?.isCancellationRequested ||
+            (this.configManager && !this.configManager.enabled('typescript.enable'))
+        ) {
             return null;
         }
         const synced = await this.syncDocument(document);
-        if (!synced) {
+        if (!synced || cancellationToken?.isCancellationRequested) {
             return null;
         }
         const mappedStart = synced.snapshot.getGeneratedPosition(range.start);
@@ -1651,15 +2172,23 @@ export class TsGoPlugin implements Plugin {
             mappedEnd.line < 0
                 ? synced.snapshot.positionAt(synced.snapshot.getLength())
                 : mappedEnd;
-        const result: any = await this.server.sendRequest(
-            'textDocument/inlayHint',
-            {
-                textDocument: { uri: pathToUrl(synced.shadowPath) },
-                range: { start, end }
-            },
-            cancellationToken
-        );
-        if (!Array.isArray(result)) {
+        let result: any;
+        try {
+            result = await this.server.sendRequest(
+                'textDocument/inlayHint',
+                {
+                    textDocument: { uri: pathToUrl(synced.shadowPath) },
+                    range: { start, end }
+                },
+                cancellationToken
+            );
+        } catch (error) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            throw error;
+        }
+        if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
             return null;
         }
         this.stats.served++;
@@ -1670,80 +2199,120 @@ export class TsGoPlugin implements Plugin {
             true,
             ts.ScriptKind.TSX
         );
-        return result
-            .map((hint) => {
-                if (
-                    !hint?.position ||
-                    inGeneratedRegion(synced.snapshot, synced.snapshot.offsetAt(hint.position)) ||
-                    isGeneratedParameterInlayHint(generatedSourceFile, synced.snapshot, hint)
-                ) {
-                    return undefined;
+        const mappedHints: InlayHint[] = [];
+        for (const hint of result) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            const generatedOnly =
+                !hint?.position ||
+                inGeneratedRegion(synced.snapshot, synced.snapshot.offsetAt(hint.position)) ||
+                isGeneratedParameterInlayHint(generatedSourceFile, synced.snapshot, hint);
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            if (generatedOnly) {
+                continue;
+            }
+            const position = synced.snapshot.getOriginalPosition(hint.position);
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            if (position.line < 0) {
+                continue;
+            }
+            let label = hint.label;
+            if (Array.isArray(hint.label)) {
+                const parts: any[] = [];
+                for (const part of hint.label) {
+                    if (cancellationToken?.isCancellationRequested) {
+                        return null;
+                    }
+                    if (!part.location) {
+                        parts.push(part);
+                        continue;
+                    }
+                    const location = mapLocationBack(
+                        this.projects,
+                        part.location.uri,
+                        part.location.range
+                    );
+                    if (cancellationToken?.isCancellationRequested) {
+                        return null;
+                    }
+                    // Keep the visible label even when its optional navigation target is
+                    // generated-only; never leak the generated URI/range to the client.
+                    const { location: _generatedLocation, ...withoutLocation } = part;
+                    parts.push(location ? { ...withoutLocation, location } : withoutLocation);
                 }
-                const position = synced.snapshot.getOriginalPosition(hint.position);
-                if (position.line < 0) {
-                    return undefined;
-                }
-                const label = Array.isArray(hint.label)
-                    ? hint.label.map((part: any) => {
-                          if (!part.location) {
-                              return part;
-                          }
-                          const location = mapLocationBack(
-                              this.projects,
-                              part.location.uri,
-                              part.location.range
-                          );
-                          // Keep the visible label even when its optional navigation target is
-                          // generated-only; never leak the generated URI/range to the client.
-                          const { location: _generatedLocation, ...withoutLocation } = part;
-                          return location ? { ...withoutLocation, location } : withoutLocation;
-                      })
-                    : hint.label;
-                const textEdits = hint.textEdits
-                    ? this.mapEditsForDocument(document, hint.textEdits)
-                    : undefined;
-                return { ...hint, position, textEdits, label };
-            })
-            .filter(isNotNullOrUndefined);
+                label = parts;
+            }
+            const textEdits = hint.textEdits
+                ? this.mapEditsForDocument(document, hint.textEdits, cancellationToken)
+                : undefined;
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            mappedHints.push({ ...hint, position, textEdits, label });
+        }
+        return mappedHints;
     }
 
     async getFoldingRanges(
         document: Document,
         cancellationToken?: CancellationToken
     ): Promise<FoldingRange[]> {
-        const synced = await this.syncDocument(document);
-        if (!synced) {
+        if (cancellationToken?.isCancellationRequested) {
             return [];
         }
-        const result: any = await this.server.sendRequest(
-            'textDocument/foldingRange',
-            {
-                textDocument: { uri: pathToUrl(synced.shadowPath) }
-            },
-            cancellationToken
-        );
-        if (!Array.isArray(result)) {
+        const synced = await this.syncDocument(document);
+        if (!synced || cancellationToken?.isCancellationRequested) {
+            return [];
+        }
+        let result: any;
+        try {
+            result = await this.server.sendRequest(
+                'textDocument/foldingRange',
+                {
+                    textDocument: { uri: pathToUrl(synced.shadowPath) }
+                },
+                cancellationToken
+            );
+        } catch (error) {
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            throw error;
+        }
+        if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
             return [];
         }
         this.stats.served++;
-        return result
-            .map((folding) => {
-                const mapped = mapRangeToOriginal(synced.snapshot, {
-                    start: { line: folding.startLine, character: folding.startCharacter ?? 0 },
-                    end: { line: folding.endLine, character: folding.endCharacter ?? 0 }
-                });
-                if (!isMapped(mapped) || mapped.end.line <= mapped.start.line) {
-                    return undefined;
-                }
-                return FoldingRange.create(
-                    mapped.start.line,
-                    mapped.end.line,
-                    undefined,
-                    undefined,
-                    folding.kind
+        const ranges: FoldingRange[] = [];
+        for (const folding of result) {
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            const mapped = mapRangeToOriginal(synced.snapshot, {
+                start: { line: folding.startLine, character: folding.startCharacter ?? 0 },
+                end: { line: folding.endLine, character: folding.endCharacter ?? 0 }
+            });
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            if (isMapped(mapped) && mapped.end.line > mapped.start.line) {
+                ranges.push(
+                    FoldingRange.create(
+                        mapped.start.line,
+                        mapped.end.line,
+                        undefined,
+                        undefined,
+                        folding.kind
+                    )
                 );
-            })
-            .filter(isNotNullOrUndefined);
+            }
+        }
+        return ranges;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1765,8 +2334,14 @@ export class TsGoPlugin implements Plugin {
         if (!response?.result) {
             return null;
         }
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         const raw = response.result.range ?? response.result;
         const mapped = mapRangeToOriginal(response.snapshot, raw);
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         return isMapped(mapped) ? mapped : null;
     }
 
@@ -1783,7 +2358,13 @@ export class TsGoPlugin implements Plugin {
             { newName },
             cancellationToken
         );
-        return response ? mapWorkspaceEditBack(this.projects, response.result) : null;
+        return response
+            ? mapWorkspaceEditBack(
+                  this.projects,
+                  response.result,
+                  () => !!cancellationToken?.isCancellationRequested
+              )
+            : null;
     }
 
     async getCodeActions(
@@ -1792,11 +2373,11 @@ export class TsGoPlugin implements Plugin {
         context: CodeActionContext,
         cancellationToken?: CancellationToken
     ): Promise<CodeAction[]> {
-        if (!this.featureEnabled('codeActions')) {
+        if (!this.featureEnabled('codeActions') || cancellationToken?.isCancellationRequested) {
             return [];
         }
         const synced = await this.syncDocument(document);
-        if (!synced) {
+        if (!synced || cancellationToken?.isCancellationRequested) {
             return [];
         }
         const start = synced.snapshot.getGeneratedPosition(range.start);
@@ -1807,12 +2388,19 @@ export class TsGoPlugin implements Plugin {
 
         // Diagnostics have to travel in generated coordinates too, or tsgo won't match them to
         // the quick fixes it knows about.
-        const diagnostics = (context?.diagnostics ?? [])
-            .map((diagnostic) => {
-                const generated = mapRangeToGenerated(synced.snapshot, diagnostic.range);
-                return isMapped(generated) ? { ...diagnostic, range: generated } : undefined;
-            })
-            .filter(isNotNullOrUndefined);
+        const diagnostics: Diagnostic[] = [];
+        for (const diagnostic of context?.diagnostics ?? []) {
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            const generated = mapRangeToGenerated(synced.snapshot, diagnostic.range);
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            if (isMapped(generated)) {
+                diagnostics.push({ ...diagnostic, range: generated });
+            }
+        }
 
         let result: any;
         try {
@@ -1826,30 +2414,46 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (e) {
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
             Logger.debug('[tsgo] codeAction failed', e);
             this.fallback('codeAction');
             return [];
         }
-        if (!Array.isArray(result)) {
+        if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
             return [];
         }
         this.stats.served++;
 
-        return result
-            .map((action) => {
-                const data =
-                    action.data === undefined
-                        ? undefined
-                        : { uri: document.uri, [TSGO_DATA]: action.data };
-                if (!action.edit) {
-                    // The outer resolve callback uses `data.uri` to recover the document. Keep
-                    // tsgo's opaque payload nested alongside it, exactly as for completions.
-                    return { ...action, ...(data ? { data } : {}) } as CodeAction;
-                }
-                const edit = mapWorkspaceEditBack(this.projects, action.edit);
-                return edit ? { ...action, ...(data ? { data } : {}), edit } : undefined;
-            })
-            .filter(isNotNullOrUndefined);
+        const actions: CodeAction[] = [];
+        for (const action of result) {
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            const data =
+                action.data === undefined
+                    ? undefined
+                    : { uri: document.uri, [TSGO_DATA]: action.data };
+            if (!action.edit) {
+                // The outer resolve callback uses `data.uri` to recover the document. Keep
+                // tsgo's opaque payload nested alongside it, exactly as for completions.
+                actions.push({ ...action, ...(data ? { data } : {}) } as CodeAction);
+                continue;
+            }
+            const edit = mapWorkspaceEditBack(
+                this.projects,
+                action.edit,
+                () => !!cancellationToken?.isCancellationRequested
+            );
+            if (cancellationToken?.isCancellationRequested) {
+                return [];
+            }
+            if (edit) {
+                actions.push({ ...action, ...(data ? { data } : {}), edit });
+            }
+        }
+        return actions;
     }
 
     async resolveCodeAction(
@@ -1857,7 +2461,7 @@ export class TsGoPlugin implements Plugin {
         codeAction: CodeAction,
         cancellationToken?: CancellationToken
     ): Promise<CodeAction> {
-        if (!this.featureEnabled('codeActions')) {
+        if (!this.featureEnabled('codeActions') || cancellationToken?.isCancellationRequested) {
             return codeAction;
         }
         try {
@@ -1871,10 +2475,17 @@ export class TsGoPlugin implements Plugin {
                 forwarded,
                 cancellationToken
             );
-            if (!resolved) {
+            if (!resolved || cancellationToken?.isCancellationRequested) {
                 return codeAction;
             }
-            const edit = mapWorkspaceEditBack(this.projects, resolved?.edit);
+            const edit = mapWorkspaceEditBack(
+                this.projects,
+                resolved?.edit,
+                () => !!cancellationToken?.isCancellationRequested
+            );
+            if (cancellationToken?.isCancellationRequested) {
+                return codeAction;
+            }
             const { edit: _generatedEdit, ...resolvedWithoutEdit } = resolved;
             return {
                 ...codeAction,
@@ -1883,6 +2494,9 @@ export class TsGoPlugin implements Plugin {
                 ...(edit ? { edit } : {})
             };
         } catch (e) {
+            if (cancellationToken?.isCancellationRequested) {
+                return codeAction;
+            }
             Logger.debug('[tsgo] codeAction/resolve failed', e);
             return codeAction;
         }
@@ -1893,6 +2507,9 @@ export class TsGoPlugin implements Plugin {
         completionItem: AppCompletionItem,
         cancellationToken?: CancellationToken
     ): Promise<AppCompletionItem> {
+        if (cancellationToken?.isCancellationRequested) {
+            return completionItem;
+        }
         try {
             const data: any = completionItem.data;
             const forwarded =
@@ -1904,14 +2521,21 @@ export class TsGoPlugin implements Plugin {
                 forwarded,
                 cancellationToken
             );
-            if (!resolved) {
+            if (!resolved || cancellationToken?.isCancellationRequested) {
                 return completionItem;
             }
             // additionalTextEdits are auto-imports written into the generated file; they have to
             // come back to the original or they would be applied at the wrong offset.
             const additionalTextEdits = resolved.additionalTextEdits
-                ? this.mapEditsForDocument(_document, resolved.additionalTextEdits)
+                ? this.mapEditsForDocument(
+                      _document,
+                      resolved.additionalTextEdits,
+                      cancellationToken
+                  )
                 : undefined;
+            if (cancellationToken?.isCancellationRequested) {
+                return completionItem;
+            }
             // Keep our own `data` so a second resolve of the same item still finds the document.
             return {
                 ...completionItem,
@@ -1920,23 +2544,40 @@ export class TsGoPlugin implements Plugin {
                 additionalTextEdits
             };
         } catch (e) {
+            if (cancellationToken?.isCancellationRequested) {
+                return completionItem;
+            }
             Logger.debug('[tsgo] completionItem/resolve failed', e);
             return completionItem;
         }
     }
 
-    private mapEditsForDocument(document: Document, edits: TextEdit[]): TextEdit[] | undefined {
-        const filePath = document.getFilePath();
-        const snapshot = filePath ? this.projects.ensureSnapshot(filePath) : undefined;
-        if (!snapshot) {
+    private mapEditsForDocument(
+        document: Document,
+        edits: TextEdit[],
+        cancellationToken?: CancellationToken
+    ): TextEdit[] | undefined {
+        if (cancellationToken?.isCancellationRequested) {
             return undefined;
         }
-        const mapped = edits
-            .map((textEdit) => {
-                const range = mapRangeToOriginal(snapshot, textEdit.range);
-                return isMapped(range) ? { ...textEdit, range } : undefined;
-            })
-            .filter(isNotNullOrUndefined);
+        const filePath = document.getFilePath();
+        const snapshot = filePath ? this.projects.ensureSnapshot(filePath) : undefined;
+        if (!snapshot || cancellationToken?.isCancellationRequested) {
+            return undefined;
+        }
+        const mapped: TextEdit[] = [];
+        for (const textEdit of edits) {
+            if (cancellationToken?.isCancellationRequested) {
+                return undefined;
+            }
+            const range = mapRangeToOriginal(snapshot, textEdit.range);
+            if (cancellationToken?.isCancellationRequested) {
+                return undefined;
+            }
+            if (isMapped(range)) {
+                mapped.push({ ...textEdit, range });
+            }
+        }
         return mapped.length ? mapped : undefined;
     }
 
@@ -1987,37 +2628,50 @@ export class TsGoPlugin implements Plugin {
         query: string,
         cancellationToken?: CancellationToken
     ): Promise<WorkspaceSymbol[] | null> {
-        if (!this.featureEnabled('workspaceSymbols')) {
+        if (
+            !this.featureEnabled('workspaceSymbols') ||
+            cancellationToken?.isCancellationRequested
+        ) {
             return null;
         }
         // Workspace-wide, so every project opened so far has to have been materialised. Projects
         // nobody has touched are not searched, which matches what the JS engine does.
         await Promise.all(this.projects.all().map((s) => this.ensureProjectOpened(s)));
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         try {
             const result: any = await this.server.sendRequest(
                 'workspace/symbol',
                 { query },
                 cancellationToken
             );
-            if (!Array.isArray(result)) {
+            if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
                 return null;
             }
             this.stats.served++;
-            return result
-                .map((symbol) => {
-                    const location = symbol.location;
-                    if (!location?.range) {
-                        return undefined;
-                    }
-                    const mappedLocation = mapLocationBack(
-                        this.projects,
-                        location.uri,
-                        location.range
-                    );
-                    return mappedLocation ? { ...symbol, location: mappedLocation } : undefined;
-                })
-                .filter(isNotNullOrUndefined);
+            const symbols: WorkspaceSymbol[] = [];
+            for (const symbol of result) {
+                if (cancellationToken?.isCancellationRequested) {
+                    return null;
+                }
+                const location = symbol.location;
+                if (!location?.range) {
+                    continue;
+                }
+                const mappedLocation = mapLocationBack(this.projects, location.uri, location.range);
+                if (cancellationToken?.isCancellationRequested) {
+                    return null;
+                }
+                if (mappedLocation) {
+                    symbols.push({ ...symbol, location: mappedLocation });
+                }
+            }
+            return symbols;
         } catch (e) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             Logger.debug('[tsgo] workspace/symbol failed', e);
             return null;
         }
@@ -2036,11 +2690,17 @@ export class TsGoPlugin implements Plugin {
         uri: string,
         cancellationToken?: CancellationToken
     ): Promise<Location[] | null> {
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         const filePath = urlToPath(uri);
         if (!filePath) {
             return null;
         }
         await this.watchWork;
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         const managedDocument = this.docManager.get(uri);
         let snapshot: SvelteDocumentSnapshot | undefined;
         let shadowPath: string;
@@ -2050,8 +2710,11 @@ export class TsGoPlugin implements Plugin {
             // work, then explicitly synchronize the current buffer so a request made in the
             // same turn as an edit cannot observe the previous disk-backed component export.
             await this.svelteLifecycle.get(filePath)?.catch(() => undefined);
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             const synced = await this.syncDocument(managedDocument);
-            if (!synced) {
+            if (!synced || cancellationToken?.isCancellationRequested) {
                 return null;
             }
             snapshot = synced.snapshot;
@@ -2059,10 +2722,13 @@ export class TsGoPlugin implements Plugin {
         } else {
             const shadows = this.projects.forFile(filePath);
             await this.ensureProjectOpened(shadows);
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             snapshot = this.projects.ensureSnapshot(filePath);
             shadowPath = shadows.getShadowPath(filePath);
         }
-        if (!snapshot) {
+        if (!snapshot || cancellationToken?.isCancellationRequested) {
             return null;
         }
         // Svelte 4 emits `export default class Name`; Svelte 5 emits
@@ -2073,6 +2739,9 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
         const position = snapshot.positionAt(offset);
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         try {
             const result: any = await this.server.sendRequest(
                 'textDocument/references',
@@ -2085,8 +2754,14 @@ export class TsGoPlugin implements Plugin {
                 },
                 cancellationToken
             );
-            return this.toLocations(result);
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            return this.toLocations(result, cancellationToken);
         } catch (e) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             Logger.debug('[tsgo] component references failed', e);
             return null;
         }
@@ -2107,18 +2782,38 @@ export class TsGoPlugin implements Plugin {
         if (!Array.isArray(response?.result)) {
             return null;
         }
-        return response!.result
-            .map((item: any) => this.mapCallHierarchyItem(item))
-            .filter(isNotNullOrUndefined);
+        const items: CallHierarchyItem[] = [];
+        for (const item of response!.result) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            const mapped = this.mapCallHierarchyItem(item, cancellationToken);
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
+            if (mapped) {
+                items.push(mapped);
+            }
+        }
+        return items;
     }
 
-    private mapCallHierarchyItem(item: any): CallHierarchyItem | undefined {
+    private mapCallHierarchyItem(
+        item: any,
+        cancellationToken?: CancellationToken
+    ): CallHierarchyItem | undefined {
+        if (cancellationToken?.isCancellationRequested) {
+            return undefined;
+        }
         const filePath = urlToPath(item.uri);
         const originalPath = filePath ? this.projects.getOriginalPath(filePath) : undefined;
         if (
             originalPath &&
             (item.name === internalHelpers.renderName || isGeneratedSvelteComponentName(item.name))
         ) {
+            if (cancellationToken?.isCancellationRequested) {
+                return undefined;
+            }
             const snapshot = this.projects.ensureSnapshot(originalPath);
             if (!snapshot) {
                 return undefined;
@@ -2141,6 +2836,9 @@ export class TsGoPlugin implements Plugin {
             item.uri,
             item.selectionRange ?? item.range
         );
+        if (cancellationToken?.isCancellationRequested) {
+            return undefined;
+        }
         if (!location) {
             return undefined;
         }
@@ -2178,6 +2876,9 @@ export class TsGoPlugin implements Plugin {
         key: 'from' | 'to',
         cancellationToken?: CancellationToken
     ) {
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
         // Send the item back in generated coordinates, which is where tsgo left it.
         const filePath = urlToPath(item.uri);
         // Ordinary TS/JS items are already in the coordinates tsgo expects. Calling
@@ -2195,42 +2896,63 @@ export class TsGoPlugin implements Plugin {
               }
             : item;
 
+        if (cancellationToken?.isCancellationRequested) {
+            return null;
+        }
+
         try {
             const result: any = await this.server.sendRequest(
                 method,
                 { item: generatedItem },
                 cancellationToken
             );
-            if (!Array.isArray(result)) {
+            if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
                 return null;
             }
-            return result
-                .map((call: any) => {
-                    const mappedItem = this.mapCallHierarchyItem(call[key]);
-                    if (!mappedItem) {
-                        return undefined;
+            const calls: any[] = [];
+            for (const call of result) {
+                if (cancellationToken?.isCancellationRequested) {
+                    return null;
+                }
+                const mappedItem = this.mapCallHierarchyItem(call[key], cancellationToken);
+                if (cancellationToken?.isCancellationRequested) {
+                    return null;
+                }
+                if (!mappedItem) {
+                    continue;
+                }
+                let rangeSnapshot = key === 'to' ? snapshot : undefined;
+                if (key !== 'to') {
+                    const target = urlToPath(call[key].uri);
+                    const targetOriginal = target
+                        ? this.projects.getOriginalPath(target)
+                        : undefined;
+                    if (cancellationToken?.isCancellationRequested) {
+                        return null;
                     }
-                    const rangeSnapshot =
-                        key === 'to'
-                            ? snapshot
-                            : (() => {
-                                  const target = urlToPath(call[key].uri);
-                                  const targetOriginal = target
-                                      ? this.projects.getOriginalPath(target)
-                                      : undefined;
-                                  return targetOriginal
-                                      ? this.projects.ensureSnapshot(targetOriginal)
-                                      : undefined;
-                              })();
-                    const fromRanges = (call.fromRanges ?? [])
-                        .map((r: Range) =>
-                            rangeSnapshot ? mapRangeToOriginal(rangeSnapshot, r) : r
-                        )
-                        .filter(isMapped);
-                    return { [key]: mappedItem, fromRanges } as any;
-                })
-                .filter(isNotNullOrUndefined);
+                    rangeSnapshot = targetOriginal
+                        ? this.projects.ensureSnapshot(targetOriginal)
+                        : undefined;
+                }
+                const fromRanges: Range[] = [];
+                for (const range of call.fromRanges ?? []) {
+                    if (cancellationToken?.isCancellationRequested) {
+                        return null;
+                    }
+                    const mappedRange = rangeSnapshot
+                        ? mapRangeToOriginal(rangeSnapshot, range)
+                        : range;
+                    if (isMapped(mappedRange)) {
+                        fromRanges.push(mappedRange);
+                    }
+                }
+                calls.push({ [key]: mappedItem, fromRanges });
+            }
+            return calls;
         } catch (e) {
+            if (cancellationToken?.isCancellationRequested) {
+                return null;
+            }
             Logger.debug(`[tsgo] ${method} failed`, e);
             return null;
         }
@@ -2256,6 +2978,7 @@ export class TsGoPlugin implements Plugin {
     openTsOrJsFile(fileName: string, text: string, languageId: string, _version?: number): void {
         this.recordSavedSourceGraphBaseline(fileName, text);
         this.componentInfo?.invalidateFile(fileName);
+        this.componentInfo?.invalidateResolutionGraph();
         void this.server
             .openDocument(fileName, text, languageId || languageIdForFile(fileName))
             .catch((e) => Logger.debug(`[tsgo] could not open ${fileName}`, e));
@@ -2286,6 +3009,7 @@ export class TsGoPlugin implements Plugin {
         }
 
         this.componentInfo?.invalidateFile(fileName);
+        this.componentInfo?.invalidateResolutionGraph();
         const update = this.server.isOpen(fileName)
             ? this.server.updateDocument(fileName, changes, nextText, languageId)
             : this.server.openDocument(
@@ -2298,6 +3022,7 @@ export class TsGoPlugin implements Plugin {
 
     closeTsOrJsFile(fileName: string): void {
         this.componentInfo?.invalidateFile(fileName);
+        this.componentInfo?.invalidateResolutionGraph();
         void this.server
             .closeDocument(fileName)
             .catch((e) => Logger.debug(`[tsgo] could not close ${fileName}`, e));
@@ -2327,7 +3052,9 @@ export class TsGoPlugin implements Plugin {
         // that rebuild into a false negative. Filtering also evaluates every coalesced event;
         // `some()` would stop after the first structural one and leave later baselines stale.
         const structuralChanges = changes.filter((change) => this.isStructuralWatchChange(change));
-        const epoch = structuralChanges.length ? ++this.structuralEpoch : this.structuralEpoch;
+        const epoch = structuralChanges.length
+            ? this.advanceStructuralEpoch()
+            : this.structuralEpoch;
         const task = this.watchWork
             .catch(() => undefined)
             .then(() => this.processWatchFileChanges(changes, structuralChanges, epoch));
@@ -2346,31 +3073,68 @@ export class TsGoPlugin implements Plugin {
         const previousOverlays = new Map(this.svelteOverlayBySource);
 
         if (structural) {
+            const openSvelteDocuments = this.docManager
+                .getAllOpenedByClient()
+                .map(([, document]) => document)
+                .filter(
+                    (document) =>
+                        !!document.getFilePath()?.endsWith('.svelte') &&
+                        this.desiredOpenSvelte.has(document.getFilePath()!)
+                );
+            const previousProjectByDocument = new Map<Document, ShadowManager>();
+            for (const document of openSvelteDocuments) {
+                try {
+                    previousProjectByDocument.set(
+                        document,
+                        this.projects.forFile(document.getFilePath()!)
+                    );
+                } catch {
+                    // A direct test double or a concurrently deleted path may not be resolvable.
+                }
+            }
             if (changes.some((change) => /(?:^|[/\\])package\.json$/.test(change.fileName))) {
                 this.invalidateEngineCaches?.();
             }
-            this.materializedShadowsBySource.clear();
             const invalidated = new Set<ShadowManager>();
-            for (const change of structuralChanges) {
-                for (const project of this.projects.invalidateForStructuralChange(
-                    change.fileName
-                )) {
-                    invalidated.add(project);
-                }
+            const invalidatedProjects = this.projects.invalidateForStructuralChanges
+                ? this.projects.invalidateForStructuralChanges(
+                      structuralChanges.map((change) => change.fileName)
+                  )
+                : structuralChanges.flatMap((change) =>
+                      this.projects.invalidateForStructuralChange(change.fileName)
+                  );
+            for (const project of invalidatedProjects) {
+                invalidated.add(project);
             }
             for (const project of invalidated) {
                 project.invalidateStructuralCaches();
                 this.opened.delete(project);
             }
+            this.forgetMaterializedProjects(invalidated);
+            const affectedOpenDocuments = openSvelteDocuments.filter((document) => {
+                const previousProject = previousProjectByDocument.get(document);
+                // Missing ownership is rare and cannot prove the old overlay is still valid.
+                return !previousProject || invalidated.has(previousProject);
+            });
+            const affectedOpenSources = new Set(
+                affectedOpenDocuments.map((document) => document.getFilePath()!)
+            );
 
             // Remove obsolete shadow intent before restarting. Real TS/JS overlays remain in
-            // TsGoServer.desiredDocuments and are replayed into the replacement child.
+            // TsGoServer.desiredDocuments and are replayed into the replacement child. Svelte
+            // overlays owned by unaffected managers remain open and replay byte-for-byte.
             await Promise.all(
-                [...new Set(previousOverlays.values())].map((shadowPath) =>
-                    this.server.closeDocument(shadowPath)
-                )
+                [
+                    ...new Set(
+                        [...affectedOpenSources]
+                            .map((sourcePath) => previousOverlays.get(sourcePath))
+                            .filter((shadowPath): shadowPath is string => !!shadowPath)
+                    )
+                ].map((shadowPath) => this.server.closeDocument(shadowPath))
             );
-            this.svelteOverlayBySource.clear();
+            for (const sourcePath of affectedOpenSources) {
+                this.svelteOverlayBySource.delete(sourcePath);
+            }
 
             if (
                 changes.some(
@@ -2380,31 +3144,20 @@ export class TsGoPlugin implements Plugin {
                 )
             ) {
                 configLoader.invalidateConfigs();
-                await Promise.all(
-                    this.docManager
-                        .getAllOpenedByClient()
-                        .map(([, document]) => document.reloadConfig())
-                );
+                await Promise.all(affectedOpenDocuments.map((document) => document.reloadConfig()));
             }
 
-            // Rebuild every open document's saved project baseline before the replacement child
-            // starts. A nearer tsconfig may assign each document to a different new manager.
-            const openSvelteDocuments = this.docManager
-                .getAllOpenedByClient()
-                .map(([, document]) => document)
-                .filter(
-                    (document) =>
-                        !!document.getFilePath()?.endsWith('.svelte') &&
-                        this.desiredOpenSvelte.has(document.getFilePath()!)
-                );
+            // Rebuild only affected open documents' saved project baselines before the
+            // replacement child starts. A nearer tsconfig can assign them to new managers;
+            // unrelated packages keep their manager-local graph and caches.
             await Promise.all(
-                [...new Set(openSvelteDocuments.map((document) => document.getFilePath()!))].map(
+                [...new Set(affectedOpenDocuments.map((document) => document.getFilePath()!))].map(
                     (filePath) => this.ensureProjectOpened(this.projects.forFile(filePath))
                 )
             );
             await this.server.restart();
             await Promise.all(
-                openSvelteDocuments.map((document) => this.syncDocumentNow(document, epoch))
+                affectedOpenDocuments.map((document) => this.syncDocumentNow(document, epoch))
             );
         }
 
@@ -2423,18 +3176,23 @@ export class TsGoPlugin implements Plugin {
                       shadows.getShadowPath(change.fileName))
                     : shadows.getShadowPath(change.fileName);
             const managedDocument = this.docManager.get(pathToUrl(change.fileName));
+            const materializedManagers = this.materializedManagersForSource(change.fileName);
+            const owningManagerPaths = materializedManagers.get(shadows) ?? new Set<string>();
+            owningManagerPaths.add(shadowPath);
+            materializedManagers.set(shadows, owningManagerPaths);
             const materializedPaths = new Set(
-                this.materializedShadowsBySource.get(change.fileName) ?? []
+                [...materializedManagers.values()].flatMap((paths) => [...paths])
             );
-            materializedPaths.add(shadowPath);
             if (change.changeType === FileChangeType.Deleted) {
                 this.materializedShadowsBySource.delete(change.fileName);
-                for (const materializedPath of materializedPaths) {
-                    shadows.removeShadow(materializedPath);
-                    forwarded.push({
-                        uri: pathToUrl(materializedPath),
-                        type: change.changeType
-                    });
+                for (const [manager, managerPaths] of materializedManagers) {
+                    for (const materializedPath of managerPaths) {
+                        manager.removeShadow(materializedPath);
+                        forwarded.push({
+                            uri: pathToUrl(materializedPath),
+                            type: change.changeType
+                        });
+                    }
                 }
                 // Keep an editor-open buffer alive even when its backing file is deleted. It is
                 // still a valid LSP overlay until didClose, matching TypeScript's behavior.
@@ -2468,15 +3226,23 @@ export class TsGoPlugin implements Plugin {
                 );
                 await document.configPromise;
                 const snapshot = shadows.transform(document);
+                // One source can be materialised into several projects whose collision maps
+                // differ. Keep the mapping snapshot based on the unmodified generated text, but
+                // publish each manager's same-length module rewrite to the paths it owns.
                 const generatedText = snapshot.getFullText();
-                for (const materializedPath of materializedPaths) {
-                    shadows.writeShadow(materializedPath, generatedText);
-                    this.markShadowMaterialized(change.fileName, materializedPath);
-                    this.componentInfo?.invalidateFile(materializedPath);
-                    forwarded.push({
-                        uri: pathToUrl(materializedPath),
-                        type: change.changeType
-                    });
+                for (const [manager, managerPaths] of materializedManagers) {
+                    const rewrittenText = manager.rewriteBatchModuleSpecifiers
+                        ? manager.rewriteBatchModuleSpecifiers(generatedText, change.fileName)
+                        : generatedText;
+                    for (const materializedPath of managerPaths) {
+                        manager.writeShadow(materializedPath, rewrittenText);
+                        this.markShadowMaterialized(change.fileName, materializedPath, manager);
+                        this.componentInfo?.invalidateFile(materializedPath);
+                        forwarded.push({
+                            uri: pathToUrl(materializedPath),
+                            type: change.changeType
+                        });
+                    }
                 }
                 if (!managedDocument?.openedByClient) {
                     shadows.deleteSnapshot(change.fileName);
@@ -2496,12 +3262,29 @@ export class TsGoPlugin implements Plugin {
     /** Whether a watched save changes project/config membership or source reachability. */
     private isStructuralWatchChange(change: OnWatchFileChangesPara): boolean {
         const fileName = change.fileName;
+        const trackedStructuralInput = this.projects.isTrackedStructuralInput?.(fileName) ?? false;
         if (
             /(?:^|[/\\])(?:tsconfig|jsconfig)\.json$/.test(fileName) ||
             /(?:^|[/\\])package\.json$/.test(fileName) ||
-            isSvelteConfigFile(fileName)
+            isSvelteConfigFile(fileName) ||
+            trackedStructuralInput
         ) {
-            return true;
+            const key = normalizeWatchPath(fileName);
+            if (change.changeType === FileChangeType.Deleted) {
+                this.structuralFileSignatures.delete(key);
+                return true;
+            }
+            const signature = structuralFileSignatureFromFile(fileName);
+            const previous = this.structuralFileSignatures.get(key);
+            this.structuralFileSignatures.set(key, signature);
+            // Creation always changes membership. A missing baseline is intentionally
+            // conservative; normal materialisation seeds every graph/config/manifest input so
+            // no-op saves and touches take the incremental path in real editor sessions.
+            return (
+                change.changeType === FileChangeType.Created ||
+                previous === undefined ||
+                previous !== signature
+            );
         }
         if (!/\.(?:svelte|[cm]?[jt]sx?)$/i.test(fileName)) {
             return false;
@@ -2526,6 +3309,13 @@ export class TsGoPlugin implements Plugin {
             change.changeType === FileChangeType.Created ||
             (previous !== undefined && previous !== signature)
         );
+    }
+
+    private seedStructuralFileSignature(fileName: string): void {
+        const key = normalizeWatchPath(fileName);
+        if (!this.structuralFileSignatures.has(key)) {
+            this.structuralFileSignatures.set(key, structuralFileSignatureFromFile(fileName));
+        }
     }
 
     /** Seed normal editor saves without rereading every project source during warm startup. */
@@ -2555,16 +3345,10 @@ export class TsGoPlugin implements Plugin {
         this.opened.clear();
         // A child restart does not invalidate the canonical on-disk shadows. Keep the shared
         // materialisation set so replaying a new child does not re-stat the monorepo.
-        const cancellations = new Set([
-            ...[...this.diagnosticsInFlight.values()].map((flight) => flight.cancellation),
-            ...[...this.activeDiagnosticChecks.values()].map((check) => check.cancellation)
-        ]);
-        this.diagnosticsInFlight.clear();
-        for (const cancellation of cancellations) {
-            cancellation.cancel();
-            this.stats.cancellations++;
+        for (const [key, flight] of this.diagnosticsInFlight) {
+            this.cancelDiagnosticFlight(key, flight, false);
         }
-        this.activeDiagnosticChecks.clear();
+        this.diagnosticsInFlight.clear();
         this.diagnosticProjectTails.clear();
         this.legendMap = undefined;
         this.legendModifierMap = undefined;
@@ -2589,15 +3373,11 @@ export class TsGoPlugin implements Plugin {
     dispose() {
         this.desiredOpenSvelte.clear();
         this.svelteLifecycle.clear();
-        const cancellations = new Set([
-            ...[...this.diagnosticsInFlight.values()].map((flight) => flight.cancellation),
-            ...[...this.activeDiagnosticChecks.values()].map((check) => check.cancellation)
-        ]);
-        for (const cancellation of cancellations) {
-            cancellation.cancel();
+        for (const flight of this.diagnosticsInFlight.values()) {
+            flight.cancellation.cancel();
         }
         this.diagnosticsInFlight.clear();
-        this.activeDiagnosticChecks.clear();
+        this.diagnosticProjectTails.clear();
         void this.componentInfo?.dispose();
         this.server.dispose();
     }
@@ -2884,19 +3664,7 @@ function isSvelteConfigFile(fileName: string): boolean {
  * though TypeScript's preprocessor reports no new literal import.
  */
 export function sourceModuleGraphSignature(text: string): string {
-    const info = ts.preProcessFile(text, true, true);
-    const names = (entries: readonly ts.FileReference[]) =>
-        entries.map((entry) => entry.fileName).sort();
-    return JSON.stringify({
-        imports: names(info.importedFiles),
-        references: names(info.referencedFiles),
-        types: names(info.typeReferenceDirectives),
-        libs: names(info.libReferenceDirectives),
-        ambiguous:
-            /\b(?:import|require)\s*\(\s*(?!['"`])\S/.test(text) ||
-            /\b(?:import|require)\s*\(\s*`[^`]*\$\{/.test(text) ||
-            /\bimport\.meta\.glob(?:Eager)?\s*\(/.test(text)
-    });
+    return computeBatchGraphSourceSignature(text);
 }
 
 function sourceModuleGraphSignatureFromFile(fileName: string): string {
@@ -2905,6 +3673,53 @@ function sourceModuleGraphSignatureFromFile(fileName: string): string {
     } catch {
         return '<unreadable>';
     }
+}
+
+/**
+ * Stable identity for structural files. TypeScript config JSON is compared semantically so a
+ * formatter or comment-only save does not replace every project manager. Package manifests use
+ * the same canonical JSON representation; executable Svelte/Vite configs are content-addressed
+ * because evaluating them merely to classify a watcher event would run arbitrary workspace code.
+ */
+function structuralFileSignatureFromFile(fileName: string): string {
+    let text: string;
+    try {
+        text = fs.readFileSync(fileName, 'utf8');
+    } catch {
+        return '<unreadable>';
+    }
+
+    let semanticValue: unknown;
+    if (/(?:^|[/\\])package\.json$/.test(fileName)) {
+        try {
+            semanticValue = JSON.parse(text);
+        } catch {
+            // Malformed manifests remain content-addressed so fixing the parse error rebuilds.
+        }
+    } else if (/\.json$/i.test(fileName)) {
+        // TypeScript accepts JSONC in every root/extended config, including arbitrarily named
+        // and package-provided bases. Canonicalize all non-manifest JSON inputs the same way.
+        const parsed = ts.parseConfigFileTextToJson(fileName, text);
+        if (!parsed.error) {
+            semanticValue = parsed.config;
+        }
+    }
+
+    const value = semanticValue === undefined ? text : stableJsonStringify(semanticValue);
+    return createHash('sha256').update(value, 'utf8').digest('base64url');
+}
+
+function stableJsonStringify(value: unknown): string {
+    if (Array.isArray(value)) {
+        return `[${value.map(stableJsonStringify).join(',')}]`;
+    }
+    if (value && typeof value === 'object') {
+        return `{${Object.entries(value as Record<string, unknown>)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, item]) => `${JSON.stringify(key)}:${stableJsonStringify(item)}`)
+            .join(',')}}`;
+    }
+    return JSON.stringify(value) ?? String(value);
 }
 
 function normalizeWatchPath(fileName: string): string {

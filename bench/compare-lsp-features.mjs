@@ -4,6 +4,7 @@
 // BMP and astral characters before every queried token. A test passes only when both engines
 // return a meaningful result and agree on the source-level operation after normalization.
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -26,6 +27,46 @@ const DIRTY_MATH_TEXT = `// unsaved Ж😀\n${MATH_TEXT}`;
 const TIMEOUT = Number(process.env.SVELTE_LS_LSP_ORACLE_TIMEOUT_MS ?? 120_000);
 const GENERATED_OVERLAY = path.join(PROJECT, 'node_modules/.cache/svelte-lsp');
 const CLEAN_GENERATED_FIXTURE = !process.env.SVELTE_LS_LSP_ORACLE_PROJECT;
+const EFFECT_MODE = process.argv.includes('--effect');
+const NATIVE_PACKAGE = EFFECT_MODE ? '@reintersect/effect-tsgo' : '@typescript/native-preview';
+const EFFECT_DIAGNOSTIC_ALLOWLIST = new Set([377021]);
+const require = createRequire(import.meta.url);
+const { resolveTsGoEngine } = require(
+    path.join(REPO, 'packages/language-server/dist/src/plugins/typescript-go/lsp/TsGoEngine.js')
+);
+
+if (process.argv.includes('--help')) {
+    console.log(`Usage: node bench/compare-lsp-features.mjs [--effect]
+
+Without arguments the native row is pinned to @typescript/native-preview. --effect runs the
+same oracle explicitly against @reintersect/effect-tsgo and allows only diagnostic code 377021
+in addition to the stock/classic result.`);
+    process.exit(0);
+}
+const unknownArguments = process.argv.slice(2).filter((argument) => argument !== '--effect');
+if (unknownArguments.length) {
+    throw new Error(`unknown argument(s): ${unknownArguments.join(', ')}`);
+}
+const EXPECTED_ENGINE = resolveTsGoEngine(PROJECT, { packageName: NATIVE_PACKAGE });
+if (!EXPECTED_ENGINE) {
+    throw new Error(`could not resolve the explicitly selected engine ${NATIVE_PACKAGE}`);
+}
+if (!EFFECT_MODE) {
+    const pinnedVersion = require(path.join(REPO, 'package.json')).devDependencies?.[
+        NATIVE_PACKAGE
+    ];
+    assert.equal(
+        EXPECTED_ENGINE.version,
+        pinnedVersion,
+        `resolved ${NATIVE_PACKAGE}@${EXPECTED_ENGINE.version}, expected the repository pin ${pinnedVersion}`
+    );
+} else if (process.env.EXPECTED_TSGO_VERSION) {
+    assert.equal(
+        EXPECTED_ENGINE.version,
+        process.env.EXPECTED_TSGO_VERSION,
+        `resolved ${NATIVE_PACKAGE}@${EXPECTED_ENGINE.version}, expected updater candidate ${process.env.EXPECTED_TSGO_VERSION}`
+    );
+}
 
 if (CLEAN_GENERATED_FIXTURE) {
     fs.rmSync(GENERATED_OVERLAY, { recursive: true, force: true });
@@ -92,6 +133,28 @@ function diagnosticSignature(items) {
         .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
 }
 
+function compareDiagnostics(classicItems, nativeItems) {
+    const classic = diagnosticSignature(classicItems);
+    const native = diagnosticSignature(nativeItems);
+    if (!EFFECT_MODE) {
+        compare('pull diagnostics (full fields, multiplicity and UTF-16 ranges)', classic, native);
+        return;
+    }
+
+    const allowed = native.filter((diagnostic) =>
+        EFFECT_DIAGNOSTIC_ALLOWLIST.has(Number(diagnostic.code))
+    );
+    const stockCompatible = native.filter(
+        (diagnostic) => !EFFECT_DIAGNOSTIC_ALLOWLIST.has(Number(diagnostic.code))
+    );
+    compare('pull diagnostics (Effect intentional diagnostics removed)', classic, stockCompatible);
+    assert.ok(
+        allowed.every((diagnostic) => Number(diagnostic.code) === 377021),
+        'Effect diagnostic allowlist admitted a code other than 377021'
+    );
+    console.log(`  PASS Effect diagnostic allowlist (${allowed.length} code 377021 item(s))`);
+}
+
 function completionItems(result) {
     if (Array.isArray(result)) return result;
     assert.ok(result && Array.isArray(result.items), 'completion response was malformed');
@@ -114,12 +177,27 @@ function hoverText(result) {
 function normalizeLocations(result) {
     const locations = result ? (Array.isArray(result) ? result : [result]) : [];
     return locations
-        .map((location) => ({
-            uri: normalizeUri(location.uri ?? location.targetUri),
-            range: location.range ?? location.targetSelectionRange ?? location.targetRange
-        }))
+        .map((location) =>
+            location.targetUri
+                ? {
+                      kind: 'link',
+                      targetUri: normalizeUri(location.targetUri),
+                      targetRange: location.targetRange,
+                      targetSelectionRange: location.targetSelectionRange,
+                      originSelectionRange: location.originSelectionRange ?? null
+                  }
+                : {
+                      kind: 'location',
+                      uri: normalizeUri(location.uri),
+                      range: location.range
+                  }
+        )
         .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
 }
+
+const normalizedLocationUri = (location) => location.uri ?? location.targetUri;
+const normalizedLocationRange = (location) =>
+    location.range ?? location.targetSelectionRange ?? location.targetRange;
 
 function normalizeWorkspaceEdit(edit) {
     const edits = [];
@@ -128,8 +206,10 @@ function normalizeWorkspaceEdit(edit) {
         for (const textEdit of textEdits) {
             edits.push({
                 uri: normalizeUri(editUri),
+                version: null,
                 range: textEdit.range,
-                newText: textEdit.newText
+                newText: textEdit.newText,
+                annotationId: textEdit.annotationId ?? null
             });
         }
     }
@@ -138,8 +218,10 @@ function normalizeWorkspaceEdit(edit) {
             for (const textEdit of change.edits ?? []) {
                 edits.push({
                     uri: normalizeUri(change.textDocument.uri),
+                    version: change.textDocument.version ?? null,
                     range: textEdit.range,
-                    newText: textEdit.newText
+                    newText: textEdit.newText,
+                    annotationId: textEdit.annotationId ?? null
                 });
             }
         } else {
@@ -149,14 +231,19 @@ function normalizeWorkspaceEdit(edit) {
                     uri: normalizeUri(change.uri),
                     oldUri: normalizeUri(change.oldUri),
                     newUri: normalizeUri(change.newUri),
-                    options: change.options
+                    options: change.options,
+                    annotationId: change.annotationId ?? null
                 })
             );
         }
     }
     edits.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
     resources.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-    return { edits, resources };
+    return {
+        edits,
+        resources,
+        changeAnnotations: stable(edit?.changeAnnotations ?? {})
+    };
 }
 
 function labelText(label) {
@@ -165,14 +252,169 @@ function labelText(label) {
         : (label ?? []).map((part) => (typeof part === 'string' ? part : part.value)).join('');
 }
 
+function normalizeInlayLabel(label) {
+    if (typeof label === 'string') return label;
+    return (label ?? []).map((part) => ({
+        value: part.value,
+        tooltip: stable(part.tooltip ?? null),
+        location: part.location
+            ? {
+                  uri: normalizeUri(part.location.uri),
+                  range: part.location.range
+              }
+            : null,
+        command: stable(part.command ?? null)
+    }));
+}
+
 function normalizeInlayHints(result) {
     return (result ?? [])
         .map((hint) => ({
             position: hint.position,
             kind: hint.kind ?? null,
-            label: labelText(hint.label)
+            labelText: labelText(hint.label),
+            label: normalizeInlayLabel(hint.label),
+            textEdits: stable(hint.textEdits ?? []),
+            tooltip: stable(hint.tooltip ?? null),
+            paddingLeft: hint.paddingLeft ?? false,
+            paddingRight: hint.paddingRight ?? false
         }))
         .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+}
+
+const OUTER_WATCHER_SUPPLEMENT = new Set([
+    '**/*.svelte',
+    '**/{svelte,vite}.config.{js,cjs,mjs,ts,cts,mts}'
+]);
+
+function watcherPattern(watcher) {
+    return typeof watcher.globPattern === 'string'
+        ? watcher.globPattern
+        : watcher.globPattern?.pattern;
+}
+
+function childDerivedWatchers(server) {
+    return server.registrations
+        .filter((registration) => registration.method === 'workspace/didChangeWatchedFiles')
+        .flatMap((registration) => registration.registerOptions?.watchers ?? [])
+        .filter((watcher) => !OUTER_WATCHER_SUPPLEMENT.has(watcherPattern(watcher)));
+}
+
+async function assertDynamicCapabilities(server, { tsFamilySync, childWatcherBridge = false }) {
+    const deadline = Date.now() + TIMEOUT;
+    const expectedSync = [
+        'textDocument/didOpen',
+        'textDocument/didChange',
+        'textDocument/didClose'
+    ];
+    for (;;) {
+        const methods = new Set(server.registrations.map((registration) => registration.method));
+        const hasWatcher = methods.has('workspace/didChangeWatchedFiles');
+        const hasSync = !tsFamilySync || expectedSync.every((method) => methods.has(method));
+        const hasChildWatcher = !childWatcherBridge || childDerivedWatchers(server).length > 0;
+        if (hasWatcher && hasSync && hasChildWatcher) break;
+        assert.ok(
+            Date.now() < deadline,
+            `${server.name} omitted dynamic registrations: ${[...methods]}`
+        );
+        await sleep(25);
+    }
+
+    const watcherRegistrations = server.registrations.filter(
+        (registration) => registration.method === 'workspace/didChangeWatchedFiles'
+    );
+    assert.ok(
+        watcherRegistrations.some(
+            (registration) => registration.registerOptions?.watchers?.length > 0
+        ),
+        `${server.name} registered an empty watched-file capability`
+    );
+    if (childWatcherBridge) {
+        assert.ok(
+            childDerivedWatchers(server).length > 0,
+            `${server.name} exposed only the outer Svelte/config watcher supplement`
+        );
+    }
+
+    if (tsFamilySync) {
+        assert.equal(server.initialize.capabilities.experimental?.tsOrJsTextSync, true);
+        for (const method of expectedSync) {
+            const registration = server.registrations.find((entry) => entry.method === method);
+            const languages = new Set(
+                (registration?.registerOptions?.documentSelector ?? []).map(
+                    (selector) => selector.language
+                )
+            );
+            assert.deepEqual(
+                [...languages].sort(),
+                ['javascript', 'javascriptreact', 'typescript', 'typescriptreact'],
+                `${server.name} ${method} selector omitted a TS-family language`
+            );
+        }
+    }
+}
+
+async function getTsGoStats(server) {
+    const stats = await server.client.request('$/getTsGoStats', null, TIMEOUT);
+    assert.ok(stats && typeof stats === 'object', `${server.name} returned no tsgo stats`);
+    assert.deepEqual(
+        stats.engine,
+        {
+            packageName: EXPECTED_ENGINE.packageName,
+            version: EXPECTED_ENGINE.version
+        },
+        `${server.name} ran a different native engine than the oracle selected`
+    );
+    assert.ok(Number.isSafeInteger(stats.generation), `${server.name} omitted its generation`);
+    return stats;
+}
+
+async function waitForGenerationAfter(server, previous, context) {
+    const deadline = Date.now() + TIMEOUT;
+    let stats;
+    do {
+        stats = await getTsGoStats(server);
+        if (stats.generation > previous) return stats;
+        await sleep(25);
+    } while (Date.now() < deadline);
+    throw new Error(
+        `${server.name} did not observe ${context}; generation remained ${stats?.generation}`
+    );
+}
+
+async function assertWatchedTypeScriptBridge(classic, native) {
+    const marker = '\n// live watcher bridge probe Ж😀\n';
+    const original = fs.readFileSync(MATH, 'utf8');
+    assert.equal(original, MATH_TEXT, 'math fixture changed before the watcher probe');
+    const before = await getTsGoStats(native);
+    let changedOnDisk = false;
+    try {
+        fs.writeFileSync(MATH, original + marker, 'utf8');
+        changedOnDisk = true;
+        for (const server of [classic, native]) {
+            server.client.notify('workspace/didChangeWatchedFiles', {
+                changes: [{ uri: MATH_URI, type: 2 }]
+            });
+        }
+        await waitForGenerationAfter(native, before.generation, 'the watched TypeScript change');
+    } finally {
+        if (changedOnDisk) {
+            const beforeRestore = await getTsGoStats(native);
+            fs.writeFileSync(MATH, original, 'utf8');
+            for (const server of [classic, native]) {
+                server.client.notify('workspace/didChangeWatchedFiles', {
+                    changes: [{ uri: MATH_URI, type: 2 }]
+                });
+            }
+            await waitForGenerationAfter(
+                native,
+                beforeRestore.generation,
+                'the watched TypeScript restore'
+            );
+        }
+    }
+    assert.equal(fs.readFileSync(MATH, 'utf8'), original, 'watcher probe did not restore math.ts');
+    console.log('  PASS child watcher bridge forwards real TypeScript changes');
 }
 
 function normalizeHierarchyItems(result) {
@@ -218,9 +460,13 @@ function decodeSemanticTokens(result) {
 
 async function startServer(name, useTsGo) {
     const registrations = [];
+    const env = { ...process.env, SVELTE_LS_TSGO: useTsGo ? '1' : '' };
+    // The live stock oracle must not inherit a caller's Effect override (or vice versa).
+    delete env.SVELTE_LS_TSGO_PACKAGE;
+    if (useTsGo) env.SVELTE_LS_TSGO_PACKAGE = NATIVE_PACKAGE;
     const client = new LspClient(process.execPath, [SERVER, '--stdio'], {
         cwd: PROJECT,
-        env: { ...process.env, SVELTE_LS_TSGO: useTsGo ? '1' : '' }
+        env
     });
     client.onRequest('workspace/configuration', (params) => (params.items ?? []).map(() => ({})));
     client.onRequest('client/registerCapability', (params) => {
@@ -367,6 +613,7 @@ async function startServer(name, useTsGo) {
             await sleep(25);
         }
         assert.match(client.stderr, /\[tsgo\] enabled/, `tsgo was not enabled:\n${client.stderr}`);
+        await getTsGoStats({ name, client });
     }
     assert.equal(client.exited, null, `${name} exited during initialization`);
     client.notify('textDocument/didOpen', {
@@ -433,11 +680,13 @@ try {
             `${engine} returned an empty/partial diagnostic corpus`
         );
     }
-    compare(
-        'pull diagnostics (full fields, multiplicity and UTF-16 ranges)',
-        diagnosticSignature(diagnostics.classic.items),
-        diagnosticSignature(diagnostics.tsgo.items)
-    );
+    await Promise.all([
+        assertDynamicCapabilities(classic, { tsFamilySync: false }),
+        assertDynamicCapabilities(native, { tsFamilySync: true, childWatcherBridge: true })
+    ]);
+    console.log('  PASS dynamic watcher and TS-family synchronization capabilities');
+    compareDiagnostics(diagnostics.classic.items, diagnostics.tsgo.items);
+    await assertWatchedTypeScriptBridge(classic, native);
     completed++;
 
     // Warm project creation precedes the edit so the classic service and tsgo both exercise
@@ -493,11 +742,14 @@ try {
     };
     for (const [engine, locations] of Object.entries(normalizedDefinitions)) {
         assert.ok(locations.length, `${engine} returned no definition`);
-        assert.ok(locations.some((location) => location.uri.endsWith('/src/math.ts')));
+        assert.ok(
+            locations.some((location) => normalizedLocationUri(location).endsWith('/src/math.ts'))
+        );
         assert.ok(
             locations.some(
                 (location) =>
-                    location.uri.endsWith('/src/math.ts') && location.range.start.line === 1
+                    normalizedLocationUri(location).endsWith('/src/math.ts') &&
+                    normalizedLocationRange(location).start.line === 1
             ),
             `${engine} did not use the unsaved TypeScript buffer`
         );
@@ -517,7 +769,9 @@ try {
     for (const [engine, locations] of Object.entries(normalizedComponentDefinitions)) {
         assert.ok(locations.length, `${engine} returned no component-tag definition`);
         assert.ok(
-            locations.some((location) => location.uri.endsWith('/src/Child.svelte')),
+            locations.some((location) =>
+                normalizedLocationUri(location).endsWith('/src/Child.svelte')
+            ),
             `${engine} component-tag definition did not resolve to Child.svelte`
         );
     }
@@ -649,6 +903,66 @@ try {
     compare('inlay hints', normalizedHints.classic, normalizedHints.tsgo);
     completed++;
 
+    for (const server of [classic, native]) {
+        server.client.notify('workspace/didChangeConfiguration', {
+            settings: {
+                svelte: { plugin: {} },
+                typescript: {
+                    inlayHints: {
+                        parameterNames: {
+                            enabled: 'none',
+                            suppressWhenArgumentMatchesName: true
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let disabledHints;
+    const disabledHintDeadline = Date.now() + TIMEOUT;
+    do {
+        disabledHints = await requestBoth(classic, native, 'textDocument/inlayHint', {
+            textDocument: { uri: APP_URI },
+            range: fullRange(TEXT)
+        });
+        if (Object.values(disabledHints).every((result) => !(result ?? []).length)) break;
+        await sleep(25);
+    } while (Date.now() < disabledHintDeadline);
+    assert.deepEqual(disabledHints.classic ?? [], [], 'classic ignored the runtime inlay setting');
+    assert.deepEqual(disabledHints.tsgo ?? [], [], 'tsgo ignored the runtime inlay setting');
+
+    for (const server of [classic, native]) {
+        server.client.notify('workspace/didChangeConfiguration', {
+            settings: {
+                svelte: { plugin: {} },
+                typescript: {
+                    inlayHints: {
+                        parameterNames: {
+                            enabled: 'all',
+                            suppressWhenArgumentMatchesName: false
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let restoredHints;
+    const restoredHintDeadline = Date.now() + TIMEOUT;
+    do {
+        restoredHints = await requestBoth(classic, native, 'textDocument/inlayHint', {
+            textDocument: { uri: APP_URI },
+            range: fullRange(TEXT)
+        });
+        if (Object.values(restoredHints).every((result) => (result ?? []).length >= 2)) break;
+        await sleep(25);
+    } while (Date.now() < restoredHintDeadline);
+    compare(
+        'runtime inlay preference toggle',
+        normalizeInlayHints(restoredHints.classic),
+        normalizeInlayHints(restoredHints.tsgo)
+    );
+    completed++;
+
     const hierarchyPosition = positionOf('function localCall', 'function '.length + 1);
     const prepared = await requestBoth(classic, native, 'textDocument/prepareCallHierarchy', {
         textDocument: { uri: APP_URI },
@@ -745,7 +1059,8 @@ try {
         const reverted = Object.values(revertedDefinitions).every((result) =>
             normalizeLocations(result).some(
                 (location) =>
-                    location.uri.endsWith('/src/math.ts') && location.range.start.line === 0
+                    normalizedLocationUri(location).endsWith('/src/math.ts') &&
+                    normalizedLocationRange(location).start.line === 0
             )
         );
         if (reverted) break;
@@ -759,7 +1074,8 @@ try {
         assert.ok(
             locations.some(
                 (location) =>
-                    location.uri.endsWith('/src/math.ts') && location.range.start.line === 0
+                    normalizedLocationUri(location).endsWith('/src/math.ts') &&
+                    normalizedLocationRange(location).start.line === 0
             ),
             `${engine} kept the closed dirty TypeScript overlay`
         );
@@ -781,5 +1097,9 @@ try {
     }
 }
 
-assert.equal(completed, 11, `oracle completed only ${completed}/11 feature groups`);
+assert.equal(completed, 12, `oracle completed only ${completed}/12 feature groups`);
 console.log(`\nCOMPLETED ${completed} LIVE LSP FEATURE GROUPS`);
+console.log(
+    `ENGINE ${EXPECTED_ENGINE.packageName}@${EXPECTED_ENGINE.version}` +
+        (EFFECT_MODE ? ' (Effect code 377021 allowlisted)' : ' (stock, exact repository pin)')
+);

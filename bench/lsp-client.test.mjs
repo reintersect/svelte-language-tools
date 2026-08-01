@@ -38,3 +38,22 @@ test('an incomplete final frame is fatal instead of timing out', async () => {
     const client = new LspClient(process.execPath, ['-e', source]);
     await assert.rejects(client.request('initialize', {}, 10_000), /incomplete LSP output/);
 });
+
+test('dispose force-kills a server which ignores SIGTERM', async () => {
+    const source = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)';
+    const client = new LspClient(process.execPath, ['-e', source]);
+    // Give Node time to install the signal handler before requesting shutdown.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const started = Date.now();
+    const exited = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('dispose did not reap child')), 3_000);
+        client.onExit((exit) => {
+            clearTimeout(timeout);
+            resolve(exit);
+        });
+    });
+    client.dispose();
+    const exit = await exited;
+    assert.equal(exit.sig, 'SIGKILL');
+    assert.ok(Date.now() - started < 2_500, 'dispose teardown was not bounded');
+});

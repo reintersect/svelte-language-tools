@@ -1,12 +1,11 @@
 import fs from 'fs';
 import { createHash } from 'crypto';
-import { dirname, join } from 'path';
+import { dirname, join, relative, resolve } from 'path';
 import ts from 'typescript';
 import { internalHelpers, InternalHelpers } from 'svelte2tsx';
-import { loadConfig } from '@reintersect/svelte-load-config';
-import { Diagnostic, DiagnosticSeverity, Range } from 'vscode-languageserver';
+import { Diagnostic, DiagnosticSeverity, Position, Range } from 'vscode-languageserver';
 import { Document, getLineOffsets, offsetAt, positionAt } from '../../../lib/documents';
-import { configLoader } from '../../../lib/documents/configLoader';
+import { configLoader, ResolvedSvelteConfig } from '../../../lib/documents/configLoader';
 import { getPackageInfo, importSvelte } from '../../../importPackage';
 import { Logger } from '../../../logger';
 import { normalizePath, pathToUrl } from '../../../utils';
@@ -14,6 +13,8 @@ import { SvelteDocumentSnapshot, SvelteSnapshotOptions } from '../../typescript/
 import { mapAndFilterDiagnostics } from '../../typescript/features/DiagnosticsProvider';
 import { isRsvelteEnabled, preloadRsvelte } from '../rsvelte';
 import {
+    BatchGraphPlan,
+    computeBatchGraphSourceSignature,
     findProjectTsconfig,
     findWorkspaceRoot,
     invalidateTsGoWorkspaceIndex,
@@ -21,6 +22,14 @@ import {
     ShadowManager
 } from './ShadowManager';
 import { ResolvedTsGoEngine, resolveTsGoEngine } from './TsGoEngine';
+import {
+    DirectoryMembershipProof,
+    MaterialisationPlanCache,
+    MaterialisationPlanCacheCounters,
+    MaterialisationPlanFileInput,
+    MaterialisationPlanMissReason,
+    MaterialisationPlanWriteFailureReason
+} from './MaterialisationPlanCache';
 
 /**
  * A diagnostic as it comes off a batch compiler run, positioned in the *generated* file.
@@ -30,7 +39,10 @@ export interface GeneratedDiagnostic {
     filePath: string | null;
     line: number;
     character: number;
+    /** Same-line span length, or a fallback when an explicit multiline end is present. */
     length: number;
+    endLine?: number;
+    endCharacter?: number;
     severity: DiagnosticSeverity;
     code: number;
     message: string;
@@ -42,6 +54,8 @@ export interface GeneratedDiagnosticRelatedInformation {
     line: number;
     character: number;
     length: number;
+    endLine?: number;
+    endCharacter?: number;
     message: string;
 }
 
@@ -62,6 +76,106 @@ export interface TsGoBatchOverlayOptions {
     quiet?: boolean;
 }
 
+export interface BatchMaterialisePhaseTimings {
+    projectGraphMs: number;
+    dependencyIndexMs: number;
+    prepareMirrorsMs: number;
+    writeOverlayConfigMs: number;
+    collectRootsMs: number;
+    readStateMs: number;
+    svelteFreshnessMs: number;
+    svelteReadMs: number;
+    svelteTransformMs: number;
+    svelteWriteMs: number;
+    sourceMirrorFreshnessMs: number;
+    sourceMirrorReadMs: number;
+    sourceMirrorRewriteMs: number;
+    sourceMirrorWriteMs: number;
+    supportFilesMs: number;
+    cleanupMs: number;
+    writeStateMs: number;
+    commitFingerprintsMs: number;
+    clearSnapshotsMs: number;
+    writePlanMs: number;
+}
+
+export interface BatchOverlayCreationTimings {
+    resolveEngineAndProjectMs: number;
+    loadExplicitConfigMs: number;
+    resolveCompilerMs: number;
+    resolveShimsMs: number;
+    loadKitSettingsMs: number;
+    constructManagerMs: number;
+    lookupPlanMs: number;
+    restorePlanMs: number;
+    discoverProjectGraphMs: number;
+    discoverDependenciesMs: number;
+    primeConfigsMs: number;
+    totalMs: number;
+}
+
+export interface BatchMaterialisationPlanTelemetry {
+    hit: boolean;
+    missReason?: MaterialisationPlanMissReason | 'restore-rejected';
+    missDetail?: string;
+    eligible: boolean;
+    writeStatus: 'pending' | 'written' | 'unchanged' | 'skipped' | 'failed';
+    writeFailureReason?: MaterialisationPlanWriteFailureReason;
+    counters: MaterialisationPlanCacheCounters;
+}
+
+export interface BatchMaterialiseResult {
+    shadowCount: number;
+    /** Compatibility total: Svelte transforms plus newly-copied/rewritten source mirrors. */
+    transformedCount: number;
+    /** Compatibility total: reusable Svelte shadows plus reusable source mirrors. */
+    reusedCount: number;
+    writtenCount: number;
+    durationMs: number;
+    phases: BatchMaterialisePhaseTimings;
+    svelte: {
+        candidateCount: number;
+        transformedCount: number;
+        reusedCount: number;
+        writtenCount: number;
+    };
+    sourceMirrors: {
+        candidateCount: number;
+        copiedCount: number;
+        rewrittenCount: number;
+        reusedCount: number;
+        writtenCount: number;
+    };
+    supportFiles: {
+        kitShadowCount: number;
+        packageScopeCount: number;
+    };
+    cleanup: {
+        skipped: boolean;
+        previousOwnedCount: number;
+        liveOwnedCount: number;
+    };
+    graph: {
+        reachabilityFallbackReasons: readonly string[];
+        dependencyScope: {
+            mode: 'reachable' | 'declared-fallback';
+            directImports: number;
+            dependencyRoots: number;
+            svelteFiles: number;
+            fallbackReasons: readonly string[];
+        };
+        collisionMirrors: {
+            reachableScripts: number;
+            reverseClosureNodes: number;
+            mirroredScripts: number;
+            mirroredJson: number;
+            collidingComponents: number;
+            fallbackReasons: readonly string[];
+        };
+        materialisationPlan: BatchMaterialisationPlanTelemetry;
+    };
+}
+
 /** Where SvelteKit puts route params and hooks when svelte.config.js doesn't say otherwise. */
 const defaultKitFiles: InternalHelpers.KitFilesSettings = {
     paramsPath: 'src/params',
@@ -70,7 +184,10 @@ const defaultKitFiles: InternalHelpers.KitFilesSettings = {
     universalHooksPath: 'src/hooks'
 };
 
-const BATCH_STATE_VERSION = 4;
+const BATCH_STATE_VERSION = 5;
+const BATCH_GRAPH_ALGORITHM_VERSION = `batch-graph-v3:typescript-${ts.version}`;
+const BATCH_GRAPH_DIRECTORY_VALIDATOR = 'tsgo:batch-graph-directory-membership:v1';
+const BATCH_GRAPH_PLAN_FILE = 'materialisation-plan.json';
 
 interface StoredParserError {
     range: Range;
@@ -92,6 +209,9 @@ interface StoredShadowState {
     sourceStat: StoredSourceStat;
     /** Content remains authoritative when a touch/copy changed only source metadata. */
     sourceContentStamp: string;
+    /** Output stat is the zero-read warm fast path; content is authoritative after a touch. */
+    outputStat: StoredSourceStat;
+    outputContentStamp: string;
 }
 
 interface StoredSourceStat {
@@ -107,26 +227,19 @@ interface BatchState {
     cleanupIdentity?: string;
 }
 
-async function loadKitFilesSettings(
-    projectPath: string,
-    configPath: string | undefined
-): Promise<InternalHelpers.KitFilesSettings> {
-    try {
-        const result = await loadConfig(configPath ?? projectPath, { traverse: false });
-        const files: any =
-            result && 'config' in result ? (result.config as any).kit?.files : undefined;
-        if (!files) {
-            return defaultKitFiles;
-        }
-        return {
-            paramsPath: files.params ?? defaultKitFiles.paramsPath,
-            serverHooksPath: files.hooks?.server ?? defaultKitFiles.serverHooksPath,
-            clientHooksPath: files.hooks?.client ?? defaultKitFiles.clientHooksPath,
-            universalHooksPath: files.hooks?.universal ?? defaultKitFiles.universalHooksPath
-        };
-    } catch {
+function kitFilesSettingsFromConfig(
+    config: ResolvedSvelteConfig | undefined
+): InternalHelpers.KitFilesSettings {
+    const files: any = config?.config.kit?.files;
+    if (!files) {
         return defaultKitFiles;
     }
+    return {
+        paramsPath: files.params ?? defaultKitFiles.paramsPath,
+        serverHooksPath: files.hooks?.server ?? defaultKitFiles.serverHooksPath,
+        clientHooksPath: files.hooks?.client ?? defaultKitFiles.clientHooksPath,
+        universalHooksPath: files.hooks?.universal ?? defaultKitFiles.universalHooksPath
+    };
 }
 
 /**
@@ -184,6 +297,9 @@ export class TsGoBatchOverlay {
     private readonly shadows: ShadowManager;
     private readonly shimFiles: string[];
     private readonly transformDiagnostics = new Map<string, Diagnostic>();
+    private planEligible = false;
+    private planWriteStatus: BatchMaterialisationPlanTelemetry['writeStatus'] = 'pending';
+    private planWriteFailureReason: MaterialisationPlanWriteFailureReason | undefined;
     private materialised = false;
 
     private constructor(
@@ -191,10 +307,36 @@ export class TsGoBatchOverlay {
         readonly projectPath: string,
         private readonly tsconfigPath: string | undefined,
         shadows: ShadowManager,
-        shimFiles: string[]
+        shimFiles: string[],
+        readonly creationTimings: BatchOverlayCreationTimings,
+        private readonly materialisationPlanCache: MaterialisationPlanCache<BatchGraphPlan>,
+        private readonly materialisationPlanHit: boolean,
+        private readonly materialisationPlanMissReason:
+            | MaterialisationPlanMissReason
+            | 'restore-rejected'
+            | undefined,
+        private readonly materialisationPlanMissDetail: string | undefined
     ) {
         this.shadows = shadows;
         this.shimFiles = shimFiles;
+    }
+
+    private materialisationPlanTelemetry(): BatchMaterialisationPlanTelemetry {
+        return {
+            hit: this.materialisationPlanHit,
+            ...(this.materialisationPlanMissReason
+                ? { missReason: this.materialisationPlanMissReason }
+                : {}),
+            ...(this.materialisationPlanMissDetail
+                ? { missDetail: this.materialisationPlanMissDetail }
+                : {}),
+            eligible: this.planEligible,
+            writeStatus: this.planWriteStatus,
+            ...(this.planWriteFailureReason
+                ? { writeFailureReason: this.planWriteFailureReason }
+                : {}),
+            counters: this.materialisationPlanCache.counters
+        };
     }
 
     /** Compatibility for callers which only need to display the resolved executable path. */
@@ -222,6 +364,23 @@ export class TsGoBatchOverlay {
      * in which case the caller should fall back to the JS engine rather than fail.
      */
     static async create(options: TsGoBatchOverlayOptions): Promise<TsGoBatchOverlay | undefined> {
+        const now = () => performance.now();
+        const creationStarted = now();
+        let phaseStarted = creationStarted;
+        const creationTimings: BatchOverlayCreationTimings = {
+            resolveEngineAndProjectMs: 0,
+            loadExplicitConfigMs: 0,
+            resolveCompilerMs: 0,
+            resolveShimsMs: 0,
+            loadKitSettingsMs: 0,
+            constructManagerMs: 0,
+            lookupPlanMs: 0,
+            restorePlanMs: 0,
+            discoverProjectGraphMs: 0,
+            discoverDependenciesMs: 0,
+            primeConfigsMs: 0,
+            totalMs: 0
+        };
         if (options.quiet) {
             Logger.setLogErrorsOnly(true);
         }
@@ -233,6 +392,7 @@ export class TsGoBatchOverlay {
         const tsconfigPath = options.tsconfigPath ?? findProjectTsconfig(options.workspacePath);
         const projectPath = tsconfigPath ? dirname(tsconfigPath) : options.workspacePath;
         const sourceRoot = findWorkspaceRoot(projectPath);
+        creationTimings.resolveEngineAndProjectMs = now() - phaseStarted;
 
         // DocumentSnapshot reads accessors, namespace, custom-element and default-language
         // settings synchronously from Document.config. Prime the shared loader before any batch
@@ -245,18 +405,20 @@ export class TsGoBatchOverlay {
                   }
                 : undefined
         );
+        let projectConfig: ResolvedSvelteConfig | undefined;
+        phaseStarted = now();
         if (options.configPath) {
-            await configLoader.loadConfigs(projectPath);
+            projectConfig = await configLoader.awaitResolvedConfigForDirectory(projectPath);
         }
-        if (!options.configPath || sourceRoot !== projectPath) {
-            await configLoader.loadConfigs(sourceRoot);
-        }
+        creationTimings.loadExplicitConfigMs = now() - phaseStarted;
 
         // The project's own Svelte compiler, so the transform matches what it builds with.
+        phaseStarted = now();
         const svelteCompiler = importSvelte(tsconfigPath || options.workspacePath);
         // Svelte 5 + `lang="ts"` only — the Rust JSDoc emission and version-4 mode produce
         // semantically different TSX (verified against this package's own sanity fixtures).
         const rsvelte = await preloadRsvelte(isRsvelteEnabled());
+        creationTimings.resolveCompilerMs = now() - phaseStarted;
         const createSnapshotOptions = (
             compiler: ReturnType<typeof importSvelte>
         ): SvelteSnapshotOptions => {
@@ -325,6 +487,7 @@ export class TsGoBatchOverlay {
         // for a package installation, copies the shims there, and every `import('svelte')` inside
         // them becomes TS2307. That made identical cold and warm checks disagree in projects
         // which rely on the language server's fallback compiler.
+        phaseStarted = now();
         let resolvedProjectSvelte = true;
         let sveltePackageInfo: ReturnType<typeof getPackageInfo>;
         try {
@@ -348,6 +511,7 @@ export class TsGoBatchOverlay {
             svelteTsPath,
             hasProjectSvelte ? projectPath : undefined
         );
+        creationTimings.resolveShimsMs = now() - phaseStarted;
 
         const shimsByPackage = new Map<string, string[]>();
         const resolveShims = (packageRoot: string): string[] => {
@@ -379,6 +543,11 @@ export class TsGoBatchOverlay {
             return resolved;
         };
 
+        phaseStarted = now();
+        projectConfig ??= await configLoader.awaitResolvedConfigForDirectory(projectPath);
+        const kitFiles = kitFilesSettingsFromConfig(projectConfig);
+        creationTimings.loadKitSettingsMs = now() - phaseStarted;
+        phaseStarted = now();
         const shadows = new ShadowManager({
             projectPath,
             sourceRoot,
@@ -386,17 +555,90 @@ export class TsGoBatchOverlay {
             snapshotOptions,
             resolveSnapshotOptions,
             resolveShims,
-            kitFiles: await loadKitFilesSettings(projectPath, options.configPath)
+            kitFiles
         });
-        // Fingerprints are computed synchronously when the overlay config is written. Prime the
-        // effective config for external raw-component dependencies now; otherwise their first
-        // fingerprint records "no config", materialisation asynchronously installs a fallback,
-        // and every second run needlessly retransforms them once more.
-        await Promise.all(
-            shadows.findDependencySvelteFiles().map((file) => configLoader.awaitConfig(file))
+        creationTimings.constructManagerMs = now() - phaseStarted;
+        const materialisationPlanCache = new MaterialisationPlanCache<BatchGraphPlan>(
+            join(shadows.overlayPath, BATCH_GRAPH_PLAN_FILE),
+            {
+                engine: {
+                    packageName: engine.packageName,
+                    version: engine.version,
+                    command: engine.command,
+                    argsPrefix: engine.argsPrefix,
+                    apiEntry: engine.apiEntry ?? null
+                },
+                algorithm: BATCH_GRAPH_ALGORITHM_VERSION,
+                project: batchGraphProjectIdentity({
+                    projectPath,
+                    sourceRoot,
+                    tsconfigPath,
+                    configPath: options.configPath
+                })
+            }
         );
+        phaseStarted = now();
+        const planLookup = materialisationPlanCache.lookup({
+            sourceSignature: (filePath) =>
+                computeBatchGraphSourceSignature(fs.readFileSync(filePath, 'utf8')),
+            directoryMembership: batchGraphDirectoryMembership
+        });
+        creationTimings.lookupPlanMs = now() - phaseStarted;
+        let materialisationPlanHit = false;
+        let materialisationPlanMissReason:
+            | MaterialisationPlanMissReason
+            | 'restore-rejected'
+            | undefined;
+        let materialisationPlanMissDetail: string | undefined;
+        phaseStarted = now();
+        if (planLookup.hit) {
+            materialisationPlanHit = shadows.restoreBatchGraphPlan(planLookup.payload);
+            if (!materialisationPlanHit) {
+                materialisationPlanMissReason = 'restore-rejected';
+            }
+        } else {
+            materialisationPlanMissReason = planLookup.reason;
+            materialisationPlanMissDetail = planLookup.detail;
+        }
+        creationTimings.restorePlanMs = now() - phaseStarted;
+        // Load only configs which own a component in the proven project/dependency graph. The
+        // previous source-root crawl imported every Svelte/Vite config in a monorepo before the
+        // graph was known (including unrelated applications); on an ambiguous graph,
+        // findProjectSvelteFiles deliberately returns the broad fallback and preserves that
+        // conservative behavior. Fingerprints are synchronous later, so prime every relevant
+        // association now rather than recording a transient "no config" identity.
+        phaseStarted = now();
+        const projectFiles = [
+            ...new Set([
+                ...shadows.getProjectSvelteFileNames(),
+                ...shadows.findProjectSvelteFiles()
+            ])
+        ];
+        creationTimings.discoverProjectGraphMs = now() - phaseStarted;
+        phaseStarted = now();
+        const dependencyFiles = shadows.findDependencySvelteFiles();
+        creationTimings.discoverDependenciesMs = now() - phaseStarted;
+        phaseStarted = now();
+        await Promise.all(
+            [...new Set([...projectFiles, ...dependencyFiles])].map((file) =>
+                configLoader.awaitConfig(file)
+            )
+        );
+        creationTimings.primeConfigsMs = now() - phaseStarted;
+        creationTimings.totalMs = now() - creationStarted;
 
-        return new TsGoBatchOverlay(engine, projectPath, tsconfigPath, shadows, shimFiles);
+        return new TsGoBatchOverlay(
+            engine,
+            projectPath,
+            tsconfigPath,
+            shadows,
+            shimFiles,
+            creationTimings,
+            materialisationPlanCache,
+            materialisationPlanHit,
+            materialisationPlanMissReason,
+            materialisationPlanMissDetail
+        );
     }
 
     /**
@@ -409,44 +651,123 @@ export class TsGoBatchOverlay {
      * {@link mapDiagnostics} re-transforms those on demand; svelte2tsx costs about a millisecond
      * a file, and the input is byte-identical, so the mapping is the same one that was written.
      */
-    async materialise(): Promise<{
-        shadowCount: number;
-        transformedCount: number;
-        reusedCount: number;
-        writtenCount: number;
-        durationMs: number;
-    }> {
-        const started = Date.now();
+    async materialise(): Promise<BatchMaterialiseResult> {
+        const now = () => performance.now();
+        const started = now();
+        const phases: BatchMaterialisePhaseTimings = {
+            projectGraphMs: 0,
+            dependencyIndexMs: 0,
+            prepareMirrorsMs: 0,
+            writeOverlayConfigMs: 0,
+            collectRootsMs: 0,
+            readStateMs: 0,
+            svelteFreshnessMs: 0,
+            svelteReadMs: 0,
+            svelteTransformMs: 0,
+            svelteWriteMs: 0,
+            sourceMirrorFreshnessMs: 0,
+            sourceMirrorReadMs: 0,
+            sourceMirrorRewriteMs: 0,
+            sourceMirrorWriteMs: 0,
+            supportFilesMs: 0,
+            cleanupMs: 0,
+            writeStateMs: 0,
+            commitFingerprintsMs: 0,
+            clearSnapshotsMs: 0,
+            writePlanMs: 0
+        };
+        let phaseStarted = now();
+        const configuredProjectFiles = this.shadows.getProjectSvelteFileNames();
+        const discoveredProjectFiles = this.shadows.findProjectSvelteFiles();
+        phases.projectGraphMs = now() - phaseStarted;
+        phaseStarted = now();
+        const dependencyFiles = this.shadows.findDependencySvelteFiles();
+        phases.dependencyIndexMs = now() - phaseStarted;
+        phaseStarted = now();
         this.shadows.prepareBatchModuleMirrors();
+        phases.prepareMirrorsMs = now() - phaseStarted;
+        const graph = {
+            reachabilityFallbackReasons: [...this.shadows.reachabilityFallbackReasons],
+            dependencyScope: this.shadows.getDependencyScopeStats(),
+            collisionMirrors: this.shadows.getBatchMirrorStats(),
+            materialisationPlan: this.materialisationPlanTelemetry()
+        };
+        phaseStarted = now();
         this.shadows.writeOverlayTsconfig(this.shimFiles);
+        phases.writeOverlayConfigMs = now() - phaseStarted;
+        // Freeze the payload and directory membership proof before the first asynchronous
+        // transform. Publication later recomputes every source signature and directory proof;
+        // an edit racing materialisation therefore rejects this plan instead of pairing the old
+        // graph with new input identities.
+        const discoveredPlan = this.shadows.exportBatchGraphPlan();
+        const safeDirectoryRoots = safeBatchGraphDirectoryRoots(discoveredPlan);
+        this.planEligible =
+            discoveredPlan.project.tsconfigPath !== null &&
+            discoveredPlan.configInputs.includes(discoveredPlan.project.tsconfigPath) &&
+            discoveredPlan.projectReachabilityFallbackReasons.length === 0 &&
+            discoveredPlan.dependencyScope?.mode === 'reachable' &&
+            discoveredPlan.dependencyScope.fallbackReasons.length === 0 &&
+            graph.collisionMirrors.fallbackReasons.length === 0 &&
+            discoveredPlan.baseConfigDiagnostics.length === 0 &&
+            safeDirectoryRoots !== undefined &&
+            safeDirectoryRoots.length > 0;
+        let discoveredDirectories:
+            | ReturnType<MaterialisationPlanCache<BatchGraphPlan>['snapshotDirectory']>[]
+            | undefined;
+        if (this.planEligible && safeDirectoryRoots) {
+            try {
+                discoveredDirectories = safeDirectoryRoots.map((path) =>
+                    this.materialisationPlanCache.snapshotDirectory(
+                        {
+                            path,
+                            validator: BATCH_GRAPH_DIRECTORY_VALIDATOR,
+                            allowMissing: true
+                        },
+                        batchGraphDirectoryMembership
+                    )
+                );
+            } catch {
+                // A directory disappearing during discovery makes the graph uncacheable. The
+                // current run still materialises from its in-memory graph and a later run retries.
+                this.planEligible = false;
+            }
+        }
 
         // parseBaseConfig is authoritative. The broad workspace scan is still needed for
         // components reached through package boundaries, but it must never be allowed to drop an
         // explicit root merely because it lives in build/, a hidden directory or very deep path.
+        phaseStarted = now();
         const declarationBackedRoots = new Set(
             this.shadows.getDeclarationBackedProjectSvelteFileNames().map(normalizePath)
         );
         const files = Array.from(
             new Set(
                 [
-                    ...this.shadows.getProjectSvelteFileNames(),
-                    ...this.shadows.findProjectSvelteFiles(),
-                    ...this.shadows.findDependencySvelteFiles(),
+                    ...configuredProjectFiles,
+                    ...discoveredProjectFiles,
+                    ...dependencyFiles,
                     ...this.shadows.getBatchMaterializedSvelteFiles()
                 ]
                     .filter((file) => !declarationBackedRoots.has(normalizePath(file)))
                     .map(normalizePath)
             )
         );
+        phases.collectRootsMs = now() - phaseStarted;
 
         const written = new Set<string>();
+        phaseStarted = now();
         const previousState = this.readBatchState();
+        phases.readStateMs = now() - phaseStarted;
         const nextState: BatchState = { version: BATCH_STATE_VERSION, entries: {} };
         const failures: Error[] = [];
         let transformedCount = 0;
         let reusedCount = 0;
         let writtenCount = 0;
+        let svelteTransformedCount = 0;
+        let svelteReusedCount = 0;
+        let svelteWrittenCount = 0;
         for (const filePath of files) {
+            phaseStarted = now();
             const shadowPath = normalizePath(this.shadows.getShadowPath(filePath));
             const previous = previousState.entries[filePath];
             let currentStat: StoredSourceStat | undefined;
@@ -462,37 +783,49 @@ export class TsGoBatchOverlay {
                     this.transformDiagnostics.set(filePath, state.parserError);
                 }
                 reusedCount++;
+                svelteReusedCount++;
             };
+            const previousOutput =
+                previous?.shadowPath === shadowPath &&
+                previous.rewriteIdentity === this.shadows.batchRewriteIdentity &&
+                this.shadows.isTransformFingerprintCurrent(filePath)
+                    ? validateStoredOutput(previous, shadowPath)
+                    : undefined;
 
             // The overwhelmingly common warm path: compare nanosecond stat identity and the
             // package transform fingerprint before reading even one source byte.
             if (
-                previous?.shadowPath === shadowPath &&
-                previous.rewriteIdentity === this.shadows.batchRewriteIdentity &&
+                previous &&
                 currentStat &&
                 sameSourceStat(previous.sourceStat, currentStat) &&
-                this.shadows.isTransformFingerprintCurrent(filePath) &&
-                fs.statSync(shadowPath, { throwIfNoEntry: false })?.isFile()
+                previousOutput?.valid
             ) {
-                reuse(previous);
+                reuse({ ...previous, outputStat: previousOutput.stat });
+                phases.svelteFreshnessMs += now() - phaseStarted;
                 continue;
             }
+            phases.svelteFreshnessMs += now() - phaseStarted;
 
             try {
+                phaseStarted = now();
                 const source = readSourceWithIdentity(filePath, currentStat);
+                phases.svelteReadMs += now() - phaseStarted;
                 // A touch, checkout or copy can change metadata without changing content. The
                 // content stamp proves the existing output is still authoritative, while the
                 // package fingerprint prevents reuse across compiler/config/transform changes.
                 if (
-                    previous?.shadowPath === shadowPath &&
-                    previous.rewriteIdentity === this.shadows.batchRewriteIdentity &&
+                    previous &&
                     previous.sourceContentStamp === source.contentStamp &&
-                    this.shadows.isTransformFingerprintCurrent(filePath) &&
-                    fs.statSync(shadowPath, { throwIfNoEntry: false })?.isFile()
+                    previousOutput?.valid
                 ) {
-                    reuse({ ...previous, sourceStat: source.stat });
+                    reuse({
+                        ...previous,
+                        sourceStat: source.stat,
+                        outputStat: previousOutput.stat
+                    });
                     continue;
                 }
+                phaseStarted = now();
                 const document = new Document(pathToUrl(filePath), source.text);
                 await document.configPromise;
                 const snapshot = this.shadows.transform(document);
@@ -500,20 +833,22 @@ export class TsGoBatchOverlay {
                     snapshot.getFullText(),
                     filePath
                 );
-                const changed = this.shadows.writeShadow(shadowPath, generatedText);
-                if (changed) {
+                phases.svelteTransformMs += now() - phaseStarted;
+                phaseStarted = now();
+                const output = writeCurrentBatchOutput(
+                    this.shadows,
+                    shadowPath,
+                    generatedText,
+                    previousOutput?.valid === false
+                );
+                if (output.changed) {
                     writtenCount++;
-                }
-                if (
-                    !changed &&
-                    (!fs.existsSync(shadowPath) ||
-                        fs.readFileSync(shadowPath, 'utf-8') !== generatedText)
-                ) {
-                    throw new Error(`could not write current shadow ${shadowPath}`);
+                    svelteWrittenCount++;
                 }
                 if (fs.existsSync(shadowPath)) {
                     written.add(shadowPath);
                 }
+                phases.svelteWriteMs += now() - phaseStarted;
 
                 const parserError: StoredParserError | null = snapshot.parserError
                     ? {
@@ -529,12 +864,15 @@ export class TsGoBatchOverlay {
                     rewriteIdentity: this.shadows.batchRewriteIdentity,
                     parserError,
                     sourceStat: source.stat,
-                    sourceContentStamp: source.contentStamp
+                    sourceContentStamp: source.contentStamp,
+                    outputStat: output.stat,
+                    outputContentStamp: output.contentStamp
                 };
                 if (parserError) {
                     this.transformDiagnostics.set(filePath, parserError);
                 }
                 transformedCount++;
+                svelteTransformedCount++;
             } catch (e) {
                 this.shadows.removeShadow(shadowPath);
                 failures.push(
@@ -550,11 +888,13 @@ export class TsGoBatchOverlay {
         // When a component has an adjacent rune module, ordinary source roots and barrels must
         // enter the same mirror as the component. Otherwise native extension substitution finds
         // the real `Foo.svelte.ts` before rootDirs can route `Foo.svelte` to generated TSX.
-        for (const {
-            originalPath,
-            mirrorPath,
-            kind
-        } of this.shadows.getBatchSourceMirrorEntries()) {
+        const sourceMirrorEntries = this.shadows.getBatchSourceMirrorEntries();
+        let sourceMirrorCopiedCount = 0;
+        let sourceMirrorRewrittenCount = 0;
+        let sourceMirrorReusedCount = 0;
+        let sourceMirrorWrittenCount = 0;
+        for (const { originalPath, mirrorPath, kind } of sourceMirrorEntries) {
+            phaseStarted = now();
             const previous = previousState.entries[originalPath];
             const rewriteIdentity =
                 kind === 'script' ? this.shadows.batchRewriteIdentity : undefined;
@@ -568,56 +908,77 @@ export class TsGoBatchOverlay {
                 written.add(mirrorPath);
                 nextState.entries[originalPath] = state;
                 reusedCount++;
+                sourceMirrorReusedCount++;
             };
-            if (
+            const previousOutput =
                 previous?.shadowPath === mirrorPath &&
                 previous.rewriteIdentity === rewriteIdentity &&
-                previous.mirrorKind === kind &&
+                previous.mirrorKind === kind
+                    ? validateStoredOutput(previous, mirrorPath)
+                    : undefined;
+            if (
+                previous &&
                 currentStat &&
                 sameSourceStat(previous.sourceStat, currentStat) &&
-                fs.statSync(mirrorPath, { throwIfNoEntry: false })?.isFile()
+                previousOutput?.valid
             ) {
-                reuse(previous);
+                reuse({ ...previous, outputStat: previousOutput.stat });
+                phases.sourceMirrorFreshnessMs += now() - phaseStarted;
                 continue;
             }
+            phases.sourceMirrorFreshnessMs += now() - phaseStarted;
 
             try {
+                phaseStarted = now();
                 const source = readSourceWithIdentity(originalPath, currentStat);
+                phases.sourceMirrorReadMs += now() - phaseStarted;
                 if (
-                    previous?.shadowPath === mirrorPath &&
-                    previous.rewriteIdentity === rewriteIdentity &&
-                    previous.mirrorKind === kind &&
+                    previous &&
                     previous.sourceContentStamp === source.contentStamp &&
-                    fs.statSync(mirrorPath, { throwIfNoEntry: false })?.isFile()
+                    previousOutput?.valid
                 ) {
-                    reuse({ ...previous, sourceStat: source.stat });
+                    reuse({
+                        ...previous,
+                        sourceStat: source.stat,
+                        outputStat: previousOutput.stat
+                    });
                     continue;
                 }
+                phaseStarted = now();
                 const mirroredText =
                     kind === 'script'
                         ? this.shadows.rewriteBatchModuleSpecifiers(source.text, originalPath)
                         : source.text;
-                const changed = this.shadows.writeShadow(mirrorPath, mirroredText);
-                if (changed) {
+                phases.sourceMirrorRewriteMs += now() - phaseStarted;
+                phaseStarted = now();
+                const output = writeCurrentBatchOutput(
+                    this.shadows,
+                    mirrorPath,
+                    mirroredText,
+                    previousOutput?.valid === false
+                );
+                if (output.changed) {
                     writtenCount++;
-                }
-                if (
-                    !changed &&
-                    (!fs.existsSync(mirrorPath) ||
-                        fs.readFileSync(mirrorPath, 'utf8') !== mirroredText)
-                ) {
-                    throw new Error(`could not write current source mirror ${mirrorPath}`);
+                    sourceMirrorWrittenCount++;
                 }
                 written.add(mirrorPath);
+                phases.sourceMirrorWriteMs += now() - phaseStarted;
                 nextState.entries[originalPath] = {
                     shadowPath: mirrorPath,
                     rewriteIdentity,
                     mirrorKind: kind,
                     parserError: null,
                     sourceStat: source.stat,
-                    sourceContentStamp: source.contentStamp
+                    sourceContentStamp: source.contentStamp,
+                    outputStat: output.stat,
+                    outputContentStamp: output.contentStamp
                 };
                 transformedCount++;
+                if (kind === 'script') {
+                    sourceMirrorRewrittenCount++;
+                } else {
+                    sourceMirrorCopiedCount++;
+                }
             } catch (e) {
                 this.shadows.removeShadow(mirrorPath);
                 failures.push(
@@ -642,19 +1003,26 @@ export class TsGoBatchOverlay {
         // Stale shadows are still roots of the project, so a component that was deleted since
         // the last run would keep reporting errors from a file that no longer exists. Kit
         // shadows were written during `writeOverlayTsconfig` and are live too.
-        for (const kitShadowPath of this.shadows.getKitShadowPaths()) {
+        phaseStarted = now();
+        const kitShadowPaths = this.shadows.getKitShadowPaths();
+        for (const kitShadowPath of kitShadowPaths) {
             written.add(kitShadowPath);
         }
         const supportPaths = this.shadows.writeBatchMirrorPackageScopes();
         for (const supportPath of supportPaths) {
             written.add(supportPath);
         }
+        phases.supportFilesMs = now() - phaseStarted;
         nextState.cleanupIdentity = batchCleanupIdentity(written);
-        const previousOwnedPaths = Object.values(previousState.entries)
-            .filter((entry) => !!entry.mirrorKind || entry.rewriteIdentity !== undefined)
-            .map((entry) => entry.shadowPath);
+        // The editor owns every materialised component shadow, not only collision mirrors. Keep
+        // the checker on the same contract: `batchRewriteIdentity` is intentionally undefined in
+        // projects without a collision, so using it as an ownership discriminator makes all
+        // ordinary Svelte shadows disappear from this set and an editor-created owner record can
+        // never become current on checker warm runs.
+        const previousOwnedPaths = Object.values(previousState.entries).map(
+            (entry) => entry.shadowPath
+        );
         const liveOwnedPaths = Object.values(nextState.entries)
-            .filter((entry) => !!entry.mirrorKind || entry.rewriteIdentity !== undefined)
             .map((entry) => entry.shadowPath)
             .concat(supportPaths);
         // A normal warm check used to recursively readdir/stat the complete shared mirror even
@@ -668,13 +1036,50 @@ export class TsGoBatchOverlay {
             previousState.cleanupIdentity === nextState.cleanupIdentity &&
             sameBatchOutputIdentities(previousState.entries, nextState.entries) &&
             this.shadows.isBatchMirrorOwnershipCurrent(liveOwnedPaths);
+        phaseStarted = now();
         if (!cleanupIsCurrent) {
             this.shadows.reconcileBatchMirrorOwnership(previousOwnedPaths, liveOwnedPaths);
             this.shadows.pruneOrphanedShadows(written);
         }
+        phases.cleanupMs = now() - phaseStarted;
+        phaseStarted = now();
         this.writeBatchState(nextState);
+        phases.writeStateMs = now() - phaseStarted;
+        phaseStarted = now();
         this.shadows.commitFingerprints();
+        phases.commitFingerprintsMs = now() - phaseStarted;
+        phaseStarted = now();
+        if (!this.planEligible || !safeDirectoryRoots || !discoveredDirectories) {
+            this.planWriteStatus = 'skipped';
+        } else {
+            const counters = this.materialisationPlanCache.counters;
+            const refreshInputStats =
+                counters.sourceSignatureFallbacks > 0 || counters.exactContentFallbacks > 0;
+            if (this.materialisationPlanHit && !refreshInputStats) {
+                this.planWriteStatus = 'unchanged';
+            } else {
+                const write = this.materialisationPlanCache.write({
+                    complete: true,
+                    payload: discoveredPlan,
+                    files: batchGraphPlanFileInputs(discoveredPlan, safeDirectoryRoots),
+                    directories: discoveredDirectories,
+                    sourceSignature: (filePath) =>
+                        computeBatchGraphSourceSignature(fs.readFileSync(filePath, 'utf8')),
+                    directoryMembership: batchGraphDirectoryMembership
+                });
+                if (write.ok) {
+                    this.planWriteStatus = write.written ? 'written' : 'unchanged';
+                } else {
+                    this.planWriteStatus = 'failed';
+                    this.planWriteFailureReason = write.reason;
+                }
+            }
+        }
+        phases.writePlanMs = now() - phaseStarted;
+        graph.materialisationPlan = this.materialisationPlanTelemetry();
+        phaseStarted = now();
         this.shadows.clearSnapshots();
+        phases.clearSnapshotsMs = now() - phaseStarted;
         this.materialised = true;
 
         return {
@@ -682,7 +1087,31 @@ export class TsGoBatchOverlay {
             transformedCount,
             reusedCount,
             writtenCount,
-            durationMs: Date.now() - started
+            durationMs: now() - started,
+            phases,
+            svelte: {
+                candidateCount: files.length,
+                transformedCount: svelteTransformedCount,
+                reusedCount: svelteReusedCount,
+                writtenCount: svelteWrittenCount
+            },
+            sourceMirrors: {
+                candidateCount: sourceMirrorEntries.length,
+                copiedCount: sourceMirrorCopiedCount,
+                rewrittenCount: sourceMirrorRewrittenCount,
+                reusedCount: sourceMirrorReusedCount,
+                writtenCount: sourceMirrorWrittenCount
+            },
+            supportFiles: {
+                kitShadowCount: kitShadowPaths.length,
+                packageScopeCount: supportPaths.length
+            },
+            cleanup: {
+                skipped: cleanupIsCurrent,
+                previousOwnedCount: previousOwnedPaths.length,
+                liveOwnedCount: liveOwnedPaths.length
+            },
+            graph
         };
     }
 
@@ -914,7 +1343,11 @@ export class TsGoBatchOverlay {
                         kitShadow.addedCode
                     );
                     const { pos: end } = internalHelpers.toOriginalPos(
-                        generatedOffset + diagnostic.length,
+                        generatedDiagnosticEndOffset(
+                            diagnostic,
+                            generatedText,
+                            generatedLineOffsets
+                        ),
                         kitShadow.addedCode
                     );
                     return {
@@ -1028,10 +1461,7 @@ export class TsGoBatchOverlay {
                     return {
                         range: Range.create(
                             { line: diagnostic.line, character: diagnostic.character },
-                            {
-                                line: diagnostic.line,
-                                character: diagnostic.character + diagnostic.length
-                            }
+                            generatedDiagnosticEnd(diagnostic)
                         ),
                         severity: diagnostic.severity,
                         code: diagnostic.code,
@@ -1070,10 +1500,16 @@ export class TsGoBatchOverlay {
         }> = [];
         for (const diagnostic of fileDiagnostics) {
             let start: number;
+            let end: number;
             try {
                 start = sourceFile.getPositionOfLineAndCharacter(
                     diagnostic.line,
                     diagnostic.character
+                );
+                const endPosition = generatedDiagnosticEnd(diagnostic);
+                end = sourceFile.getPositionOfLineAndCharacter(
+                    endPosition.line,
+                    endPosition.character
                 );
             } catch {
                 // The generated file the compiler saw and the one we just rebuilt disagree,
@@ -1085,7 +1521,7 @@ export class TsGoBatchOverlay {
                 tsDiagnostic: {
                     file: sourceFile,
                     start,
-                    length: diagnostic.length,
+                    length: Math.max(1, end - start),
                     category:
                         diagnostic.severity === DiagnosticSeverity.Warning
                             ? ts.DiagnosticCategory.Warning
@@ -1132,9 +1568,10 @@ export class TsGoBatchOverlay {
                 text,
                 lineOffsets
             );
+            const end = offsetAt(generatedDiagnosticEnd(related), text, lineOffsets);
             return Range.create(
                 positionAt(start, text, lineOffsets),
-                positionAt(Math.min(text.length, start + related.length), text, lineOffsets)
+                positionAt(Math.min(text.length, Math.max(start, end)), text, lineOffsets)
             );
         };
 
@@ -1235,10 +1672,7 @@ export class TsGoBatchOverlay {
                     return {
                         range: Range.create(
                             { line: diagnostic.line, character: diagnostic.character },
-                            {
-                                line: diagnostic.line,
-                                character: diagnostic.character + diagnostic.length
-                            }
+                            generatedDiagnosticEnd(diagnostic)
                         ),
                         severity: diagnostic.severity,
                         code: diagnostic.code,
@@ -1346,13 +1780,262 @@ export class TsGoBatchOverlay {
     }
 }
 
+function batchGraphProjectIdentity(input: {
+    projectPath: string;
+    sourceRoot: string;
+    tsconfigPath: string | undefined;
+    configPath: string | undefined;
+}): string {
+    return createHash('sha256')
+        .update(
+            JSON.stringify({
+                projectPath: normalizePath(resolve(input.projectPath)),
+                sourceRoot: normalizePath(resolve(input.sourceRoot)),
+                tsconfigPath: input.tsconfigPath
+                    ? normalizePath(resolve(input.tsconfigPath))
+                    : null,
+                configPath: input.configPath ? normalizePath(resolve(input.configPath)) : null
+            })
+        )
+        .digest('base64url');
+}
+
+function batchGraphLockfileInputs(plan: BatchGraphPlan): string[] {
+    const names = [
+        'pnpm-lock.yaml',
+        'pnpm-workspace.yaml',
+        'package-lock.json',
+        'npm-shrinkwrap.json',
+        'yarn.lock',
+        'bun.lock',
+        'bun.lockb'
+    ];
+    const roots = new Set<string>();
+    const sourceRoot = normalizePath(resolve(plan.project.sourceRoot));
+    let current = normalizePath(resolve(plan.project.projectPath));
+    for (;;) {
+        roots.add(current);
+        if (current === sourceRoot) {
+            break;
+        }
+        const parent = normalizePath(dirname(current));
+        if (parent === current || !isWithinPath(sourceRoot, parent)) {
+            roots.add(sourceRoot);
+            break;
+        }
+        current = parent;
+    }
+    return [...roots].flatMap((root) => names.map((name) => normalizePath(join(root, name))));
+}
+
+function batchGraphPlanFileInputs(
+    plan: BatchGraphPlan,
+    directoryRoots: readonly string[]
+): MaterialisationPlanFileInput[] {
+    const inputs: MaterialisationPlanFileInput[] = [];
+    const seen = new Set<string>(directoryRoots.map((path) => normalizePath(resolve(path))));
+    const claimedRealFiles = new Set<string>();
+    const add = (input: MaterialisationPlanFileInput) => {
+        const path = normalizePath(resolve(input.path));
+        if (seen.has(path)) {
+            return;
+        }
+        let realFile: string | undefined;
+        try {
+            if (fs.statSync(path).isFile()) {
+                realFile = normalizePath(fs.realpathSync(path));
+            }
+        } catch {
+            // Missing optional topology inputs retain their lexical identity below.
+        }
+        if (input.kind === 'layout' && realFile && claimedRealFiles.has(realFile)) {
+            return;
+        }
+        seen.add(path);
+        inputs.push({ ...input, path } as MaterialisationPlanFileInput);
+        if (input.kind !== 'layout' && realFile) {
+            claimedRealFiles.add(realFile);
+        }
+    };
+    for (const { path, signature } of plan.sourceInputs) {
+        add({ kind: 'source', path, signature });
+    }
+    for (const path of plan.configInputs) {
+        add({ kind: 'config', path });
+    }
+    for (const path of plan.manifestInputs) {
+        add({ kind: 'manifest', path, allowMissing: true });
+    }
+    for (const path of batchGraphLockfileInputs(plan)) {
+        add({ kind: 'lockfile', path, allowMissing: true });
+    }
+    for (const path of plan.layoutInputs) {
+        add({ kind: 'layout', path, allowMissing: true });
+    }
+    return inputs;
+}
+
+/**
+ * A persisted plan is useful only when every membership root is narrow enough to validate on
+ * each fresh checker process. Reject a root outside the workspace/dependency closure instead of
+ * accidentally walking a home directory or filesystem root.
+ */
+function safeBatchGraphDirectoryRoots(plan: BatchGraphPlan): string[] | undefined {
+    const sourceRoot = normalizePath(resolve(plan.project.sourceRoot));
+    const dependencyRoots = (plan.dependencyScope?.roots ?? []).map((root) =>
+        normalizePath(resolve(root))
+    );
+    const roots = [...new Set(plan.directoryRoots.map((root) => normalizePath(resolve(root))))];
+    if (roots.length > 512) {
+        return undefined;
+    }
+    for (const root of roots) {
+        if (
+            dirname(root) === root ||
+            (!isWithinPath(sourceRoot, root) &&
+                !dependencyRoots.some((dependencyRoot) => isWithinPath(dependencyRoot, root)))
+        ) {
+            return undefined;
+        }
+    }
+    return roots.sort();
+}
+
+function isWithinPath(root: string, candidate: string): boolean {
+    const rel = relative(root, candidate);
+    return rel === '' || (!rel.startsWith('..') && !rel.startsWith('/') && !rel.startsWith('\\'));
+}
+
+/**
+ * Exact name/topology proof for files that can enter a TypeScript/Svelte graph. File contents
+ * are validated separately; this catches creates, deletes, renames and symlink retargeting while
+ * deliberately excluding dependency/VCS trees which have their own plan inputs.
+ */
+function batchGraphDirectoryMembership(request: {
+    path: string;
+    validator: string;
+}): DirectoryMembershipProof | undefined {
+    if (request.validator !== BATCH_GRAPH_DIRECTORY_VALIDATOR) {
+        return undefined;
+    }
+    const root = normalizePath(resolve(request.path));
+    const entries: string[] = [];
+    const visited = new Set<string>();
+    const excluded = new Set(['node_modules', '.git', '.hg', '.svn', '.svelte-ls-overlay']);
+
+    const walk = (directory: string, prefix: string) => {
+        const realDirectory = normalizePath(fs.realpathSync(directory));
+        const repeated = visited.has(realDirectory);
+        entries.push(`@directory\0${prefix}\0${realDirectory}\0${repeated ? 'repeat' : 'first'}`);
+        if (repeated) {
+            return;
+        }
+        visited.add(realDirectory);
+        const children = fs
+            .readdirSync(directory, { withFileTypes: true })
+            .sort((left, right) => left.name.localeCompare(right.name));
+        for (const child of children) {
+            if (excluded.has(child.name)) {
+                continue;
+            }
+            const absolute = normalizePath(join(directory, child.name));
+            const name = prefix ? `${prefix}/${child.name}` : child.name;
+            if (child.isSymbolicLink()) {
+                const target = fs.readlinkSync(absolute);
+                let targetKind = 'missing';
+                try {
+                    const stat = fs.statSync(absolute);
+                    targetKind = stat.isDirectory()
+                        ? 'directory'
+                        : stat.isFile()
+                          ? 'file'
+                          : 'other';
+                } catch {
+                    // A dangling link is still exact graph topology and remains in the proof.
+                }
+                entries.push(`${name}\0symlink\0${target}\0${targetKind}`);
+                if (targetKind === 'directory') {
+                    walk(absolute, name);
+                }
+            } else if (child.isDirectory()) {
+                entries.push(`${name}\0directory`);
+                walk(absolute, name);
+            } else if (child.isFile()) {
+                entries.push(`${name}\0file`);
+            } else {
+                entries.push(`${name}\0other`);
+            }
+        }
+    };
+    walk(root, '');
+    return {
+        stamp: createHash('sha256').update(entries.join('\0')).digest('base64url'),
+        entryCount: entries.length
+    };
+}
+
 function readSourceStat(filePath: string): StoredSourceStat {
     const stat = fs.statSync(filePath, { bigint: true });
+    if (!stat.isFile()) {
+        throw new Error(`not a regular file: ${filePath}`);
+    }
     return {
         size: stat.size.toString(),
         mtimeNs: stat.mtimeNs.toString(),
         ctimeNs: stat.ctimeNs.toString()
     };
+}
+
+function validateStoredOutput(
+    previous: StoredShadowState,
+    outputPath: string
+): { valid: true; stat: StoredSourceStat } | { valid: false } {
+    try {
+        const stat = readSourceStat(outputPath);
+        if (sameSourceStat(previous.outputStat, stat)) {
+            return { valid: true, stat };
+        }
+        const output = readSourceWithIdentity(outputPath, stat);
+        return output.contentStamp === previous.outputContentStamp
+            ? { valid: true, stat: output.stat }
+            : { valid: false };
+    } catch {
+        return { valid: false };
+    }
+}
+
+function writeCurrentBatchOutput(
+    shadows: ShadowManager,
+    outputPath: string,
+    text: string,
+    forceRewrite: boolean
+): { changed: boolean; stat: StoredSourceStat; contentStamp: string } {
+    if (forceRewrite) {
+        shadows.removeShadow(outputPath);
+    }
+    let changed = shadows.writeShadow(outputPath, text);
+    if (!changed) {
+        const current = readSourceWithIdentity(outputPath);
+        if (current.text === text) {
+            return { changed: false, stat: current.stat, contentStamp: current.contentStamp };
+        }
+        // `lastWritten` is process-local and an external writer can replace a file without
+        // invalidating it. Clear that stamp and overwrite rather than surfacing a false failure.
+        shadows.removeShadow(outputPath);
+        changed = shadows.writeShadow(outputPath, text);
+        if (!changed) {
+            throw new Error(`could not rewrite current batch output ${outputPath}`);
+        }
+    }
+    return {
+        changed,
+        stat: readSourceStat(outputPath),
+        contentStamp: textContentStamp(text)
+    };
+}
+
+function textContentStamp(text: string): string {
+    return createHash('sha256').update(text, 'utf8').digest('base64url');
 }
 
 function sameSourceStat(
@@ -1391,7 +2074,8 @@ function sameBatchOutputIdentities(
             left.shadowPath === right.shadowPath &&
             left.rewriteIdentity === right.rewriteIdentity &&
             left.mirrorKind === right.mirrorKind &&
-            left.sourceContentStamp === right.sourceContentStamp
+            left.sourceContentStamp === right.sourceContentStamp &&
+            left.outputContentStamp === right.outputContentStamp
         );
     });
 }
@@ -1410,7 +2094,7 @@ function readSourceWithIdentity(
             return {
                 text,
                 stat: after,
-                contentStamp: createHash('sha256').update(text, 'utf8').digest('base64url')
+                contentStamp: textContentStamp(text)
             };
         }
         before = after;
@@ -1424,10 +2108,34 @@ function generatedDiagnosticIdentity(diagnostic: GeneratedDiagnostic): string {
         diagnostic.line,
         diagnostic.character,
         diagnostic.length,
+        diagnostic.endLine,
+        diagnostic.endCharacter,
         diagnostic.severity,
         diagnostic.code,
         diagnostic.message
     ]);
+}
+
+function generatedDiagnosticEnd(
+    diagnostic: Pick<
+        GeneratedDiagnostic | GeneratedDiagnosticRelatedInformation,
+        'line' | 'character' | 'length' | 'endLine' | 'endCharacter'
+    >
+): Position {
+    return diagnostic.endLine !== undefined && diagnostic.endCharacter !== undefined
+        ? Position.create(diagnostic.endLine, diagnostic.endCharacter)
+        : Position.create(diagnostic.line, diagnostic.character + diagnostic.length);
+}
+
+function generatedDiagnosticEndOffset(
+    diagnostic: Pick<
+        GeneratedDiagnostic | GeneratedDiagnosticRelatedInformation,
+        'line' | 'character' | 'length' | 'endLine' | 'endCharacter'
+    >,
+    text: string,
+    lineOffsets: number[]
+): number {
+    return offsetAt(generatedDiagnosticEnd(diagnostic), text, lineOffsets);
 }
 
 function mapTsDiagnosticSeverity(category: ts.DiagnosticCategory): DiagnosticSeverity {

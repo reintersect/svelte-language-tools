@@ -39,6 +39,36 @@ export interface ExplicitConfigScope {
     rootDirectory: string;
 }
 
+export interface SvelteConfigTransformIdentity {
+    /** The authored config file, omitted for the synthetic fallback config. */
+    readonly configFile?: {
+        readonly path: string;
+        readonly stamp: string;
+    };
+    readonly source?: SvelteConfig['configSource'];
+    readonly fallback?: true;
+    readonly namespace?: CompileOptions['namespace'];
+    readonly accessors?: CompileOptions['accessors'];
+    readonly customElement?: CompileOptions['customElement'] | string;
+    readonly defaultLanguages: readonly InternalPreprocessorGroup['defaultLanguages'][];
+    readonly preprocessors: readonly {
+        readonly markup?: string;
+        readonly script?: string;
+        readonly style?: string;
+    }[];
+}
+
+/**
+ * A config and the metadata used by materialisation. The transform identity is computed once
+ * when the config is loaded, rather than rediscovering and rereading the config for every file.
+ */
+export interface ResolvedSvelteConfig {
+    readonly config: SvelteConfig;
+    readonly configPath: string;
+    readonly revision: number;
+    readonly transformIdentity: SvelteConfigTransformIdentity;
+}
+
 type LoadConfigFromDirectoryFn = typeof loadConfigFromDirectory;
 
 const DEFAULT_OPTIONS: CompileOptions = {
@@ -70,6 +100,13 @@ export class ConfigLoader {
     private configFiles = new FileMap<SvelteConfig>();
     private configFilesAsync = new FileMap<Promise<SvelteConfig>>();
     private filePathToConfigPath = new FileMap<string>();
+    /** Effective loaded config for a directory. `null` is a cached negative lookup. */
+    private directoryToLoadedConfigPath = new FileMap<string | null>();
+    /** On-disk config discovery for a directory. `null` is a cached negative lookup. */
+    private directoryToDiscoveredConfigPath = new FileMap<string | null>();
+    private configTransformIdentities = new FileMap<SvelteConfigTransformIdentity>();
+    /** Candidate path (for example a colocated Svelte config) to the loader's actual result. */
+    private effectiveConfigPaths = new FileMap<string>();
     /** Also clear @reintersect/svelte-load-config's process-wide cache on the next real load. */
     private clearUpstreamCache = false;
     /** Prevent a config load started before invalidation from repopulating the cleared maps. */
@@ -80,7 +117,7 @@ export class ConfigLoader {
 
     constructor(
         private globSync: typeof fdir,
-        private fs: Pick<typeof _fs, 'existsSync'>,
+        private fs: Pick<typeof _fs, 'existsSync'> & Partial<Pick<typeof _fs, 'readFileSync'>>,
         private path: Pick<typeof _path, 'dirname' | 'relative' | 'join'>,
         processFeatures: (typeof process)['features'] & {
             typescript?: false | 'transform';
@@ -103,7 +140,15 @@ export class ConfigLoader {
      * Only applies within `rootDirectory` (the initial tsconfig/workspace being checked).
      */
     setExplicitConfigScope(scope: ExplicitConfigScope | undefined): void {
+        const changed =
+            normalizePath(this.explicitConfigScope?.configPath ?? '') !==
+                normalizePath(scope?.configPath ?? '') ||
+            normalizePath(this.explicitConfigScope?.rootDirectory ?? '') !==
+                normalizePath(scope?.rootDirectory ?? '');
         this.explicitConfigScope = scope;
+        if (changed) {
+            this.invalidateConfigs();
+        }
     }
 
     /**
@@ -118,6 +163,10 @@ export class ConfigLoader {
         this.configFiles.clear();
         this.configFilesAsync.clear();
         this.filePathToConfigPath.clear();
+        this.directoryToLoadedConfigPath.clear();
+        this.directoryToDiscoveredConfigPath.clear();
+        this.configTransformIdentities.clear();
+        this.effectiveConfigPaths.clear();
         this.clearUpstreamCache = true;
     }
 
@@ -237,7 +286,7 @@ export class ConfigLoader {
         }
         const path = this.path.join(directory, 'svelte.config.js');
         this.configFilesAsync.set(path, Promise.resolve(fallback));
-        this.configFiles.set(path, fallback);
+        this.cacheLoadedConfig(path, fallback);
     }
 
     private searchConfigPathUpwards(path: string) {
@@ -245,9 +294,20 @@ export class ConfigLoader {
             return this.explicitConfigScope.configPath;
         }
 
+        const visitedDirectories: string[] = [];
         let currentDir = path;
-        let nextDir = this.path.dirname(path);
-        while (currentDir !== nextDir) {
+        for (;;) {
+            if (this.directoryToDiscoveredConfigPath.has(currentDir)) {
+                const cached = this.directoryToDiscoveredConfigPath.get(currentDir) ?? null;
+                this.cacheDirectoryResolution(
+                    this.directoryToDiscoveredConfigPath,
+                    visitedDirectories,
+                    cached
+                );
+                return cached ?? undefined;
+            }
+
+            visitedDirectories.push(currentDir);
             const configPath =
                 findSvelteConfigInDirectory(
                     this.fs,
@@ -256,11 +316,24 @@ export class ConfigLoader {
                     this.loadSvelteConfigTs
                 ) ?? findViteConfigInDirectory(this.fs, this.path, currentDir);
             if (configPath) {
+                this.cacheDirectoryResolution(
+                    this.directoryToDiscoveredConfigPath,
+                    visitedDirectories,
+                    configPath
+                );
                 return configPath;
             }
 
-            currentDir = nextDir;
-            nextDir = this.path.dirname(currentDir);
+            const parent = this.path.dirname(currentDir);
+            if (parent === currentDir) {
+                this.cacheDirectoryResolution(
+                    this.directoryToDiscoveredConfigPath,
+                    visitedDirectories,
+                    null
+                );
+                return undefined;
+            }
+            currentDir = parent;
         }
     }
 
@@ -284,9 +357,10 @@ export class ConfigLoader {
             if (revision !== this.configRevision) {
                 return configFilePath;
             }
-            this.configFiles.set(configFilePath, config);
+            this.cacheLoadedConfig(configFilePath, config);
             if (configFilePath !== configPath) {
                 this.configFiles.set(configPath, config);
+                this.effectiveConfigPaths.set(configPath, configFilePath);
             }
             return configFilePath;
         }
@@ -395,20 +469,66 @@ export class ConfigLoader {
      * @param file
      */
     getConfig(file: string): SvelteConfig | undefined {
+        return this.getResolvedConfig(file)?.config;
+    }
+
+    /**
+     * Return the loaded config, its effective path and its precomputed transform identity.
+     * Directory associations (including misses) are memoized until `invalidateConfigs()`.
+     */
+    getResolvedConfig(file: string): ResolvedSvelteConfig | undefined {
         const cached = this.filePathToConfigPath.get(file);
         if (cached) {
-            return this.configFiles.get(cached);
+            return this.resolvedConfigForPath(cached);
         }
 
-        let currentDir = file;
-        let nextDir = this.path.dirname(file);
-        while (currentDir !== nextDir) {
-            currentDir = nextDir;
-            const config = this.tryGetConfigForDirectory(file, currentDir);
-            if (config) {
-                return config;
+        if (this.explicitConfigScope && this.isInExplicitConfigScope(file)) {
+            const explicit = this.resolvedConfigForPath(this.explicitConfigScope.configPath);
+            if (explicit) {
+                this.filePathToConfigPath.set(file, explicit.configPath);
+                return explicit;
             }
-            nextDir = this.path.dirname(currentDir);
+        }
+
+        const visitedDirectories: string[] = [];
+        let currentDir = this.path.dirname(file);
+        for (;;) {
+            if (this.directoryToLoadedConfigPath.has(currentDir)) {
+                const cachedPath = this.directoryToLoadedConfigPath.get(currentDir) ?? null;
+                this.cacheDirectoryResolution(
+                    this.directoryToLoadedConfigPath,
+                    visitedDirectories,
+                    cachedPath
+                );
+                if (!cachedPath) {
+                    return undefined;
+                }
+                this.filePathToConfigPath.set(file, cachedPath);
+                return this.resolvedConfigForPath(cachedPath);
+            }
+
+            visitedDirectories.push(currentDir);
+            const configPath = this.tryGetConfigPathForDirectory(currentDir);
+            if (configPath) {
+                this.cacheDirectoryResolution(
+                    this.directoryToLoadedConfigPath,
+                    visitedDirectories,
+                    configPath
+                );
+                this.filePathToConfigPath.set(file, configPath);
+                return this.resolvedConfigForPath(configPath);
+            }
+
+            const parent = this.path.dirname(currentDir);
+            if (parent === currentDir) {
+                this.cacheDirectoryResolution(
+                    this.directoryToLoadedConfigPath,
+                    visitedDirectories,
+                    null
+                );
+                return undefined;
+            }
+            currentDir = parent;
         }
     }
 
@@ -416,9 +536,14 @@ export class ConfigLoader {
      * Like `getConfig`, but will search for a config above if no config found.
      */
     async awaitConfig(file: string): Promise<SvelteConfig | undefined> {
-        const config = this.getConfig(file);
-        if (config) {
-            return config;
+        return (await this.awaitResolvedConfig(file))?.config;
+    }
+
+    /** Like `getResolvedConfig`, but loads/discovers the effective config on a miss. */
+    async awaitResolvedConfig(file: string): Promise<ResolvedSvelteConfig | undefined> {
+        const resolved = this.getResolvedConfig(file);
+        if (resolved) {
+            return resolved;
         }
 
         const fileDirectory = this.path.dirname(file);
@@ -428,33 +553,107 @@ export class ConfigLoader {
         } else {
             await this.addFallbackConfig(fileDirectory);
         }
-        return this.getConfig(file);
+        return this.getResolvedConfig(file);
     }
 
-    private tryGetConfigForDirectory(file: string, fromDirectory: string) {
-        if (this.explicitConfigScope && this.isInExplicitConfigScope(file)) {
-            const config = this.configFiles.get(this.explicitConfigScope.configPath);
-            if (config) {
-                this.filePathToConfigPath.set(file, this.explicitConfigScope.configPath);
-                return config;
-            }
+    /**
+     * Load the config authored in exactly `directory`, without walking to an ancestor and without
+     * synthesizing a fallback. This is useful for project-wide settings (for example SvelteKit's
+     * file locations), whose legacy lookup deliberately uses `traverse: false`.
+     *
+     * The result is cached in the same maps as document-driven config resolution. A caller can
+     * therefore inspect project settings up front and later prime every component without
+     * importing or resolving the project config through a second loader path.
+     */
+    async awaitResolvedConfigForDirectory(
+        directory: string
+    ): Promise<ResolvedSvelteConfig | undefined> {
+        const configPath =
+            this.explicitConfigScope && this.isInExplicitConfigScope(directory)
+                ? this.explicitConfigScope.configPath
+                : (findSvelteConfigInDirectory(
+                      this.fs,
+                      this.path,
+                      directory,
+                      this.loadSvelteConfigTs
+                  ) ?? findViteConfigInDirectory(this.fs, this.path, directory));
+        if (!configPath) {
+            return undefined;
         }
 
+        const revision = this.configRevision;
+        const loadedConfigPath = await this.loadAndCacheConfig(configPath, directory);
+        if (revision !== this.configRevision) {
+            return undefined;
+        }
+        const resolved =
+            this.resolvedConfigForPath(configPath) ??
+            (loadedConfigPath ? this.resolvedConfigForPath(loadedConfigPath) : undefined);
+        if (!resolved) {
+            // The load was invalidated while it was in flight. Its replacement generation must
+            // perform its own lookup instead of observing the stale result.
+            return undefined;
+        }
+
+        this.directoryToDiscoveredConfigPath.set(directory, configPath);
+        this.directoryToLoadedConfigPath.set(directory, resolved.configPath);
+        return resolved;
+    }
+
+    private tryGetConfigPathForDirectory(fromDirectory: string): string | undefined {
         for (const ending of getSvelteConfigExtensions(this.loadSvelteConfigTs)) {
             const configPath = this.path.join(fromDirectory, `svelte.config.${ending}`);
-            const config = this.configFiles.get(configPath);
-            if (config) {
-                this.filePathToConfigPath.set(file, configPath);
-                return config;
+            if (this.configFiles.has(configPath)) {
+                return configPath;
             }
         }
         for (const ending of VITE_CONFIG_EXTENSIONS) {
             const configPath = this.path.join(fromDirectory, `vite.config.${ending}`);
-            const config = this.configFiles.get(configPath);
-            if (config) {
-                this.filePathToConfigPath.set(file, configPath);
-                return config;
+            if (this.configFiles.has(configPath)) {
+                return configPath;
             }
+        }
+    }
+
+    private cacheLoadedConfig(configPath: string, config: SvelteConfig): void {
+        this.configFiles.set(configPath, config);
+        this.effectiveConfigPaths.set(configPath, configPath);
+        this.configTransformIdentities.set(
+            configPath,
+            createTransformIdentity(config, configPath, this.fs)
+        );
+        // A newly loaded config may replace cached misses or a farther ancestor association.
+        this.filePathToConfigPath.clear();
+        this.directoryToLoadedConfigPath.clear();
+    }
+
+    private resolvedConfigForPath(configPath: string): ResolvedSvelteConfig | undefined {
+        const effectiveConfigPath = this.effectiveConfigPaths.get(configPath) ?? configPath;
+        const config =
+            this.configFiles.get(configPath) ?? this.configFiles.get(effectiveConfigPath);
+        if (!config) {
+            return undefined;
+        }
+        let transformIdentity = this.configTransformIdentities.get(effectiveConfigPath);
+        if (!transformIdentity) {
+            transformIdentity = createTransformIdentity(config, effectiveConfigPath, this.fs);
+            this.configTransformIdentities.set(effectiveConfigPath, transformIdentity);
+        }
+        return {
+            config,
+            configPath: effectiveConfigPath,
+            revision: this.configRevision,
+            transformIdentity
+        };
+    }
+
+    private cacheDirectoryResolution(
+        cache: FileMap<string | null>,
+        directories: readonly string[],
+        configPath: string | null
+    ): void {
+        for (const directory of directories) {
+            cache.set(directory, configPath);
         }
     }
 
@@ -566,6 +765,71 @@ function getFallbackLogMessage(
         return 'Found vite.config but there was an error loading Svelte options from it. ';
     }
     return 'No svelte.config.js or vite.config found. ';
+}
+
+function createTransformIdentity(
+    config: SvelteConfig,
+    configPath: string,
+    fs: Partial<Pick<typeof _fs, 'readFileSync'>>
+): SvelteConfigTransformIdentity {
+    const compiler = config.compilerOptions;
+    const preprocess = Array.isArray(config.preprocess) ? config.preprocess : [config.preprocess];
+    const contents = readConfigContents(configPath, fs);
+    return {
+        configFile:
+            contents === undefined
+                ? undefined
+                : {
+                      path: normalizePath(configPath),
+                      stamp: contentStamp(contents)
+                  },
+        source: config.configSource,
+        fallback: config.isFallbackConfig ? true : undefined,
+        namespace: compiler?.namespace,
+        accessors: compiler?.accessors,
+        customElement:
+            typeof compiler?.customElement === 'function'
+                ? String(compiler.customElement)
+                : compiler?.customElement,
+        defaultLanguages: preprocess
+            .map((entry) => entry?.defaultLanguages)
+            .filter(
+                (entry): entry is NonNullable<InternalPreprocessorGroup['defaultLanguages']> =>
+                    !!entry
+            ),
+        preprocessors: preprocess
+            .filter((entry): entry is InternalPreprocessorGroup => !!entry)
+            .map((entry) => ({
+                markup: functionIdentity(entry.markup),
+                script: functionIdentity(entry.script),
+                style: functionIdentity(entry.style)
+            }))
+    };
+}
+
+function readConfigContents(
+    configPath: string,
+    fs: Partial<Pick<typeof _fs, 'readFileSync'>>
+): string | undefined {
+    try {
+        const contents = fs.readFileSync?.(configPath, 'utf8');
+        return typeof contents === 'string' ? contents : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function contentStamp(text: string): string {
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < text.length; index++) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return `${text.length}:${hash >>> 0}`;
+}
+
+function functionIdentity(value: unknown): string | undefined {
+    return typeof value === 'function' ? String(value) : undefined;
 }
 
 export const configLoader = new ConfigLoader(

@@ -233,16 +233,28 @@ function getPreprocessErrorDiagnostics(document: Document, error: any): Diagnost
     return getOtherErrorDiagnostics(error);
 }
 
-function getConfigLoadErrorDiagnostics(error: any, configSource?: 'svelte' | 'vite'): Diagnostic[] {
+export function getConfigLoadErrorDiagnostics(
+    error: any,
+    configSource?: 'svelte' | 'vite'
+): Diagnostic[] {
     const configFile = configSource === 'vite' ? 'vite.config' : 'svelte.config.js';
-    return [
-        {
-            message: `Error in ${configFile}\n\n` + error,
-            range: Range.create(Position.create(0, 0), Position.create(0, 5)),
-            severity: DiagnosticSeverity.Error,
-            source: 'svelte'
-        }
-    ];
+    const diagnostic: Diagnostic = {
+        message: `Error in ${configFile}\n\n` + error,
+        range: Range.create(Position.create(0, 0), Position.create(0, 5)),
+        severity: DiagnosticSeverity.Error,
+        source: 'svelte'
+    };
+    configLoadDiagnostics.add(diagnostic);
+    return [diagnostic];
+}
+
+// Internal identity must not leak through Diagnostic.data to LSP clients. The checker consumes
+// these objects in-process, so a WeakSet provides exact dedup/cache classification without
+// changing the public diagnostic payload.
+const configLoadDiagnostics = new WeakSet<object>();
+
+export function isSvelteConfigLoadDiagnostic(diagnostic: Diagnostic): boolean {
+    return configLoadDiagnostics.has(diagnostic);
 }
 
 /**

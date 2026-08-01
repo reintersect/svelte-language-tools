@@ -2,6 +2,7 @@ import assert from 'assert';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import ts from 'typescript';
 import { afterEach, describe, it } from 'mocha';
 import { DiagnosticSeverity } from 'vscode-languageserver';
 import { TsGoBatchOverlay } from '../../../../src/plugins/typescript-go/lsp/BatchOverlay';
@@ -103,6 +104,42 @@ describe('typescript-go BatchOverlay', () => {
         ]);
     });
 
+    it('does not materialise an excluded declaration-backed import', async () => {
+        const root = project(
+            {
+                'src/main.ts': 'import Declared from "./Declared.svelte"; void Declared;',
+                'src/Declared.svelte': '<script>export let value;</script>',
+                'src/Declared.d.svelte.ts': 'export default class Declared {}'
+            },
+            {
+                compilerOptions: {
+                    strict: true,
+                    module: 'esnext',
+                    moduleResolution: 'bundler',
+                    allowArbitraryExtensions: true
+                },
+                include: ['src/**/*'],
+                exclude: ['src/Declared.svelte']
+            }
+        );
+        const batch = await overlay(root);
+        const result = await batch.materialise();
+        const declaration = path.join(root, 'src/Declared.d.svelte.ts').replace(/\\/g, '/');
+
+        assert.strictEqual(result.transformedCount, 0);
+        assert.deepStrictEqual(batch.listProjectSvelteFiles(), []);
+        assert.deepStrictEqual(batch.mapProgramFiles([declaration]), {
+            all: [declaration],
+            svelte: []
+        });
+        const config = JSON.parse(fs.readFileSync(batch.overlayTsconfigPath, 'utf8'));
+        assert.ok(
+            !(config.files as string[]).some((file) =>
+                file.replace(/\\/g, '/').endsWith('/src/Declared.svelte.tsx')
+            )
+        );
+    });
+
     it('reuses a fresh shadow without changing its mtime', async () => {
         const root = project(
             {
@@ -151,10 +188,289 @@ describe('typescript-go BatchOverlay', () => {
         const warm = await second.materialise();
 
         assert.strictEqual(cold.transformedCount, 2);
+        assert.deepStrictEqual(cold.graph.materialisationPlan, {
+            hit: false,
+            missReason: 'not-found',
+            eligible: true,
+            writeStatus: 'written',
+            counters: {
+                lookups: 1,
+                hits: 0,
+                misses: 1,
+                writes: 1,
+                writeSkips: 0,
+                writeFailures: 0,
+                statFastPathInputs: 0,
+                sourceSignatureFallbacks: 0,
+                exactContentFallbacks: 0,
+                directoryValidations: 0,
+                missReasons: { 'not-found': 1 },
+                writeFailureReasons: {}
+            }
+        });
+        assert.strictEqual(warm.graph.materialisationPlan.hit, true);
+        assert.strictEqual(warm.graph.materialisationPlan.eligible, true);
+        assert.strictEqual(warm.graph.materialisationPlan.writeStatus, 'unchanged');
+        assert.strictEqual(warm.graph.materialisationPlan.counters.hits, 1);
+        assert.ok(warm.graph.materialisationPlan.counters.statFastPathInputs > 0);
+        assert.deepStrictEqual(cold.svelte, {
+            candidateCount: 2,
+            transformedCount: 2,
+            reusedCount: 0,
+            writtenCount: 2
+        });
+        assert.deepStrictEqual(cold.sourceMirrors, {
+            candidateCount: 0,
+            copiedCount: 0,
+            rewrittenCount: 0,
+            reusedCount: 0,
+            writtenCount: 0
+        });
         assert.strictEqual(warm.transformedCount, 0);
         assert.strictEqual(warm.reusedCount, 2);
+        assert.deepStrictEqual(warm.svelte, {
+            candidateCount: 2,
+            transformedCount: 0,
+            reusedCount: 2,
+            writtenCount: 0
+        });
+        assert.ok(Object.values(warm.phases).every((duration) => duration >= 0));
         assert.strictEqual(fs.statSync(shadow).mtimeMs, mtime);
         assert.strictEqual(fs.statSync(dependencyShadow).mtimeMs, dependencyMtime);
+    });
+
+    it('accepts ordinary Svelte ownership published by the editor on a checker warm run', async () => {
+        const root = project(
+            {
+                'src/Comp.svelte': '<script lang="ts">const value = 1;</script><p>{value}</p>'
+            },
+            {
+                compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+                include: ['src/**/*']
+            }
+        );
+        const first = await overlay(root);
+        await first.materialise();
+        const state = JSON.parse(
+            fs.readFileSync(path.join(first.overlayPath, 'batch-state.json'), 'utf8')
+        );
+        const editorOwnedPaths = Object.values(state.entries).map(
+            (entry: any) => entry.shadowPath as string
+        );
+        assert.strictEqual(editorOwnedPaths.length, 1);
+        // TsGoPlugin publishes every required component shadow. Reproduce that editor-side
+        // contract before starting a fresh checker process with persisted batch state.
+        (first as any).shadows.reconcileBatchMirrorOwnership([], editorOwnedPaths);
+
+        const second = await overlay(root);
+        const warm = await second.materialise();
+
+        assert.strictEqual(warm.transformedCount, 0);
+        assert.strictEqual(warm.writtenCount, 0);
+        assert.strictEqual(warm.cleanup.skipped, true);
+    });
+
+    it('materialises and types a CommonJS declaration re-export of a raw component', async () => {
+        const root = project(
+            {
+                'package.json': JSON.stringify({
+                    name: 'batch-overlay-fixture',
+                    private: true,
+                    dependencies: { controls: '1.0.0' }
+                }),
+                'src/main.ts': [
+                    'import Button = require("controls");',
+                    'new Button.default({ target: document.body, props: { label: 123 } });'
+                ].join('\n'),
+                'node_modules/controls/package.json': JSON.stringify({
+                    name: 'controls',
+                    version: '1.0.0',
+                    exports: { '.': { types: './index.d.ts', require: './index.js' } }
+                }),
+                'node_modules/controls/index.d.ts':
+                    'import Button = require("./Button.svelte"); export = Button;\n',
+                'node_modules/controls/index.js': 'module.exports = require("./Button.svelte");\n',
+                'node_modules/controls/Button.svelte':
+                    '<script lang="ts">export let label: string;</script><button>{label}</button>'
+            },
+            {
+                compilerOptions: {
+                    strict: true,
+                    module: 'node16',
+                    moduleResolution: 'node16',
+                    allowArbitraryExtensions: true,
+                    noEmit: true
+                },
+                include: ['src/**/*']
+            }
+        );
+        const batch = await overlay(root);
+        const result = await batch.materialise();
+        const state = JSON.parse(
+            fs.readFileSync(path.join(batch.overlayPath, 'batch-state.json'), 'utf8')
+        );
+        assert.ok(
+            Object.keys(state.entries).some((source) =>
+                source.endsWith('/node_modules/controls/Button.svelte')
+            ),
+            JSON.stringify(state.entries)
+        );
+        assert.strictEqual(result.svelte.transformedCount, 1);
+
+        const config = ts.readConfigFile(batch.overlayTsconfigPath, ts.sys.readFile);
+        const parsed = ts.parseJsonConfigFileContent(
+            config.config,
+            ts.sys,
+            path.dirname(batch.overlayTsconfigPath),
+            undefined,
+            batch.overlayTsconfigPath
+        );
+        const diagnostics = ts.getPreEmitDiagnostics(
+            ts.createProgram(parsed.fileNames, parsed.options)
+        );
+        assert.ok(
+            diagnostics.some(
+                (diagnostic) =>
+                    diagnostic.file?.fileName === path.join(root, 'src/main.ts') &&
+                    ts
+                        .flattenDiagnosticMessageText(diagnostic.messageText, '\n')
+                        .includes("Type 'number' is not assignable to type 'string'")
+            ),
+            diagnostics
+                .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'))
+                .join('\n')
+        );
+    });
+
+    it('reuses a persisted graph across a body-only edit and refreshes its source stat', async () => {
+        const root = project(
+            {
+                'src/main.ts': 'import Comp from "./Comp.svelte"; void Comp;\n',
+                'src/Comp.svelte':
+                    '<script lang="ts">const value: number = 1;</script><p>{value}</p>'
+            },
+            {
+                compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+                include: ['src/**/*']
+            }
+        );
+        const first = await overlay(root);
+        const cold = await first.materialise();
+        assert.strictEqual(cold.graph.materialisationPlan.writeStatus, 'written');
+
+        fs.writeFileSync(
+            path.join(root, 'src/main.ts'),
+            'import Comp from "./Comp.svelte"; const bodyOnly = 2; void [Comp, bodyOnly];\n'
+        );
+        const second = await overlay(root);
+        const warmGraph = await second.materialise();
+
+        assert.strictEqual(
+            warmGraph.graph.materialisationPlan.hit,
+            true,
+            JSON.stringify(warmGraph.graph.materialisationPlan)
+        );
+        assert.ok(
+            warmGraph.graph.materialisationPlan.counters.sourceSignatureFallbacks >= 1,
+            'the changed stat should validate only graph-relevant source semantics'
+        );
+        assert.strictEqual(warmGraph.graph.materialisationPlan.writeStatus, 'written');
+        assert.strictEqual(warmGraph.svelte.transformedCount, 0);
+
+        fs.writeFileSync(
+            path.join(root, 'src/Comp.svelte'),
+            '<script lang="ts">const value: number = 2;</script><p>{value}</p>'
+        );
+        const third = await overlay(root);
+        const svelteBodyEdit = await third.materialise();
+        assert.strictEqual(
+            svelteBodyEdit.graph.materialisationPlan.hit,
+            true,
+            JSON.stringify(svelteBodyEdit.graph.materialisationPlan)
+        );
+        assert.strictEqual(svelteBodyEdit.svelte.transformedCount, 1);
+    });
+
+    it('invalidates a persisted graph when an existing root imports a newly-created component', async () => {
+        const root = project(
+            {
+                'src/main.ts': 'export const value = 1;\n'
+            },
+            {
+                compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+                include: ['src/**/*']
+            }
+        );
+        const first = await overlay(root);
+        const cold = await first.materialise();
+        assert.strictEqual(cold.graph.materialisationPlan.writeStatus, 'written');
+
+        fs.writeFileSync(
+            path.join(root, 'src/main.ts'),
+            'import NewComponent from "./NewComponent.svelte"; void NewComponent;\n'
+        );
+        fs.writeFileSync(path.join(root, 'src/NewComponent.svelte'), '<p>new</p>');
+        const second = await overlay(root);
+        const rebuilt = await second.materialise();
+
+        assert.strictEqual(rebuilt.graph.materialisationPlan.hit, false);
+        assert.ok(
+            ['source-signature-mismatch', 'directory-membership-mismatch'].includes(
+                rebuilt.graph.materialisationPlan.missReason ?? ''
+            )
+        );
+        assert.ok(fs.existsSync(componentShadow(second, 'src/NewComponent.svelte')));
+        assert.ok(
+            second.listProjectSvelteFiles().some((file) => file.endsWith('NewComponent.svelte'))
+        );
+    });
+
+    it('invalidates a persisted graph when a previously absent public target is created', async () => {
+        const root = project(
+            {
+                'package.json': JSON.stringify({
+                    name: 'batch-overlay-fixture',
+                    private: true,
+                    dependencies: { facade: '1.0.0' }
+                }),
+                'src/main.ts': 'import "facade";\n',
+                'node_modules/facade/package.json': JSON.stringify({
+                    name: 'facade',
+                    version: '1.0.0',
+                    types: './index.d.ts'
+                }),
+                'node_modules/facade/index.d.ts': 'export * from "./optional.js";\n'
+            },
+            {
+                compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+                include: ['src/**/*']
+            }
+        );
+        const first = await overlay(root);
+        const cold = await first.materialise();
+        assert.strictEqual(cold.graph.dependencyScope.mode, 'reachable');
+        assert.strictEqual(cold.graph.materialisationPlan.writeStatus, 'written');
+
+        fs.writeFileSync(
+            path.join(root, 'node_modules/facade/optional.d.ts'),
+            'export { default } from "./Optional.svelte";\n'
+        );
+        fs.writeFileSync(
+            path.join(root, 'node_modules/facade/Optional.svelte'),
+            '<script lang="ts">export let value: string;</script>'
+        );
+        TsGoBatchOverlay.invalidateWorkspaceIndex();
+        const second = await overlay(root);
+        const rebuilt = await second.materialise();
+
+        assert.strictEqual(rebuilt.graph.materialisationPlan.hit, false);
+        assert.ok(
+            ['input-presence-changed', 'layout-mismatch', 'directory-membership-mismatch'].includes(
+                rebuilt.graph.materialisationPlan.missReason ?? ''
+            ),
+            JSON.stringify(rebuilt.graph.materialisationPlan)
+        );
+        assert.strictEqual(rebuilt.svelte.transformedCount, 1);
     });
 
     it('skips mirror reconciliation and pruning on an identity-perfect collision warm run', async () => {
@@ -172,7 +488,13 @@ describe('typescript-go BatchOverlay', () => {
             }
         );
         const first = await overlay(root);
-        await first.materialise();
+        const cold = await first.materialise();
+        assert.strictEqual(cold.svelte.candidateCount, 1);
+        assert.ok(cold.sourceMirrors.candidateCount > 0);
+        assert.strictEqual(
+            cold.sourceMirrors.copiedCount + cold.sourceMirrors.rewrittenCount,
+            cold.sourceMirrors.candidateCount
+        );
 
         const second = await overlay(root);
         const shadows = (second as any).shadows;
@@ -193,6 +515,8 @@ describe('typescript-go BatchOverlay', () => {
 
         assert.strictEqual(warm.transformedCount, 0);
         assert.strictEqual(warm.writtenCount, 0);
+        assert.strictEqual(warm.sourceMirrors.reusedCount, warm.sourceMirrors.candidateCount);
+        assert.strictEqual(warm.cleanup.skipped, true);
         assert.strictEqual(reconcileCalls, 0);
         assert.strictEqual(pruneCalls, 0);
     });
@@ -295,8 +619,88 @@ describe('typescript-go BatchOverlay', () => {
         assert.strictEqual(warm.reusedCount, 1);
         assert.strictEqual(warm.writtenCount, 0);
         assert.strictEqual(fs.statSync(shadow).mtimeMs, shadowMtime);
-        assert.strictEqual(state.version, 4);
+        assert.strictEqual(state.version, 5);
         assert.match(state.entries[source.replace(/\\/g, '/')].sourceContentStamp, /^[\w-]{40,}$/);
+    });
+
+    it('reuses an output after a metadata-only touch and refreshes its persisted stat', async () => {
+        const root = project(
+            { 'src/Comp.svelte': '<script lang="ts">const value = 1;</script><p>{value}</p>' },
+            {
+                compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+                include: ['src/**/*']
+            }
+        );
+        const first = await overlay(root);
+        await first.materialise();
+        const shadow = componentShadow(first, 'src/Comp.svelte');
+        const before = fs.statSync(shadow);
+        const touched = new Date(before.mtimeMs + 2_000);
+        fs.utimesSync(shadow, before.atime, touched);
+
+        const second = await overlay(root);
+        const warm = await second.materialise();
+
+        assert.strictEqual(warm.svelte.transformedCount, 0);
+        assert.strictEqual(warm.svelte.reusedCount, 1);
+        assert.strictEqual(warm.svelte.writtenCount, 0);
+        assert.strictEqual(fs.statSync(shadow).mtimeMs, touched.getTime());
+    });
+
+    it('rewrites a shadow replaced with foreign bytes even when its source is unchanged', async () => {
+        const root = project(
+            { 'src/Comp.svelte': '<script lang="ts">const value = 1;</script><p>{value}</p>' },
+            {
+                compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+                include: ['src/**/*']
+            }
+        );
+        const first = await overlay(root);
+        await first.materialise();
+        const shadow = componentShadow(first, 'src/Comp.svelte');
+        const authoritative = fs.readFileSync(shadow, 'utf8');
+        fs.writeFileSync(shadow, '/* foreign overwrite */\n');
+
+        const second = await overlay(root);
+        const repaired = await second.materialise();
+
+        assert.strictEqual(repaired.svelte.transformedCount, 1);
+        assert.strictEqual(repaired.svelte.writtenCount, 1);
+        assert.strictEqual(fs.readFileSync(shadow, 'utf8'), authoritative);
+    });
+
+    it('rewrites a source mirror replaced with foreign bytes', async () => {
+        const root = project(
+            {
+                'src/Widget.svelte':
+                    '<script lang="ts">import { helper } from "./Widget.svelte.js";</script><p>{helper}</p>',
+                'src/Widget.svelte.ts': 'export const helper = "ok";\n',
+                'src/index.ts': 'import Widget from "./Widget.svelte"; void Widget;\n'
+            },
+            {
+                compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+                include: ['src/**/*']
+            }
+        );
+        const first = await overlay(root);
+        const cold = await first.materialise();
+        assert.ok(cold.sourceMirrors.candidateCount > 0);
+        const state = JSON.parse(
+            fs.readFileSync(path.join(first.overlayPath, 'batch-state.json'), 'utf8')
+        );
+        const mirrored = Object.values(state.entries).find(
+            (entry: any) => entry.mirrorKind === 'script'
+        ) as { shadowPath: string } | undefined;
+        assert.ok(mirrored, JSON.stringify(state.entries));
+        const authoritative = fs.readFileSync(mirrored.shadowPath, 'utf8');
+        fs.writeFileSync(mirrored.shadowPath, '/* foreign overwrite */\n');
+
+        const second = await overlay(root);
+        const repaired = await second.materialise();
+
+        assert.ok(repaired.sourceMirrors.rewrittenCount >= 1);
+        assert.ok(repaired.sourceMirrors.writtenCount >= 1);
+        assert.strictEqual(fs.readFileSync(mirrored.shadowPath, 'utf8'), authoritative);
     });
 
     it('invalidates a same-size edit even when its mtime is restored', async () => {
@@ -349,6 +753,83 @@ describe('typescript-go BatchOverlay', () => {
             /get foo\(\)/,
             `the accessors config must affect generated types:\n${generated}`
         );
+    });
+
+    it('shares one project config load between Kit settings and component transforms', async () => {
+        const root = project(
+            {
+                'src/Comp.svelte': '<script lang="ts">export let foo: number;</script>',
+                'src/custom-params/id.ts':
+                    'export function match(value: string): boolean { return value.length > 0; }'
+            },
+            {
+                compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+                include: ['src/**/*.svelte', 'src/**/*.ts']
+            }
+        );
+        const marker = path.join(root, 'config-load-count');
+        fs.writeFileSync(
+            path.join(root, 'svelte.config.cjs'),
+            `const fs = require('fs');
+const marker = ${JSON.stringify(marker)};
+const count = fs.existsSync(marker) ? Number(fs.readFileSync(marker, 'utf8')) : 0;
+fs.writeFileSync(marker, String(count + 1));
+module.exports = {
+    compilerOptions: { accessors: true },
+    kit: { files: { params: 'src/custom-params' } }
+};`
+        );
+
+        const batch = await overlay(root);
+        const result = await batch.materialise();
+        const generated = fs.readFileSync(componentShadow(batch, 'src/Comp.svelte'), 'utf8');
+
+        assert.strictEqual(fs.readFileSync(marker, 'utf8'), '1');
+        assert.strictEqual(result.supportFiles.kitShadowCount, 1);
+        assert.match(generated, /get foo\(\)/);
+    });
+
+    it('does not execute unrelated workspace configs when reachability is complete', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'svelte-batch-config-scope-'));
+        temporaryProjects.push(root);
+        const checked = path.join(root, 'apps/checked');
+        const unrelated = path.join(root, 'apps/unrelated');
+        const marker = path.join(root, 'unrelated-config-loaded');
+        fs.mkdirSync(path.join(checked, 'src'), { recursive: true });
+        fs.mkdirSync(unrelated, { recursive: true });
+        fs.writeFileSync(
+            path.join(root, 'package.json'),
+            JSON.stringify({ name: 'workspace', private: true, workspaces: ['apps/*'] })
+        );
+        fs.writeFileSync(
+            path.join(checked, 'package.json'),
+            JSON.stringify({ name: 'checked', private: true })
+        );
+        fs.writeFileSync(
+            path.join(checked, 'tsconfig.json'),
+            JSON.stringify({
+                compilerOptions: {
+                    strict: true,
+                    module: 'esnext',
+                    moduleResolution: 'bundler'
+                },
+                include: ['src/**/*.svelte']
+            })
+        );
+        fs.writeFileSync(path.join(checked, 'src/App.svelte'), '<p>checked</p>');
+        fs.writeFileSync(
+            path.join(unrelated, 'svelte.config.cjs'),
+            `require('fs').writeFileSync(${JSON.stringify(marker)}, 'loaded'); module.exports = {};`
+        );
+
+        const batch = await TsGoBatchOverlay.create({
+            workspacePath: checked,
+            tsconfigPath: path.join(checked, 'tsconfig.json')
+        });
+        assert.ok(batch);
+        await batch.materialise();
+
+        assert.strictEqual(fs.existsSync(marker), false);
     });
 
     it('applies namespace, custom-element and default-language config to batch shadows', async () => {

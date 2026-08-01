@@ -2,10 +2,38 @@ import assert from 'assert';
 import { DiagnosticSeverity, Range } from 'vscode-languageserver';
 import {
     deduplicateSvelteParserDiagnostics,
-    preloadSvelteConfigsForClassicDiagnostics
+    preloadSvelteConfigsForClassicDiagnostics,
+    SvelteCheck,
+    SvelteCheckOptions
 } from '../src/svelte-check';
 
+function typecheckRemovedTsGoInjection(): void {
+    const options: SvelteCheckOptions = {
+        // @ts-expect-error The executable and API package identity must be resolved together.
+        experimental: { tsgo: { apiModule: {}, astModule: {} } }
+    };
+    void options;
+}
+
+void typecheckRemovedTsGoInjection;
+
 describe('SvelteCheck config lifecycle', () => {
+    it('rejects legacy runtime tsgo module injection', () => {
+        const legacyOptions = {
+            experimental: {
+                tsgo: {
+                    apiModule: { API: class {} },
+                    astModule: { ScriptKind: {} }
+                }
+            }
+        } as unknown as SvelteCheckOptions;
+
+        assert.throws(
+            () => new SvelteCheck('/workspace', legacyOptions),
+            /caller-provided API modules cannot be matched to the resolved native engine/
+        );
+    });
+
     it('settles every Svelte config before classic diagnostics may continue', async () => {
         const started: string[] = [];
         const finished: string[] = [];

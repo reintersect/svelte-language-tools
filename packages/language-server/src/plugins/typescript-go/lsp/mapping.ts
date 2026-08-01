@@ -47,9 +47,10 @@ export function mapLocationBack(
  */
 export function mapWorkspaceEditBack(
     shadows: ShadowLookup,
-    edit: WorkspaceEdit | null | undefined
+    edit: WorkspaceEdit | null | undefined,
+    shouldCancel?: () => boolean
 ): WorkspaceEdit | null {
-    if (!edit) {
+    if (!edit || shouldCancel?.()) {
         return null;
     }
 
@@ -63,6 +64,9 @@ export function mapWorkspaceEditBack(
         uri: string,
         edits: TextEdit[]
     ): { uri: string; edits: TextEdit[] } | undefined => {
+        if (shouldCancel?.()) {
+            return undefined;
+        }
         const filePath = urlToPath(uri);
         const originalPath = filePath ? shadows.getOriginalPath(filePath) : undefined;
         if (!originalPath) {
@@ -72,18 +76,28 @@ export function mapWorkspaceEditBack(
         if (!snapshot) {
             return undefined;
         }
-        const mapped = edits
-            .map((textEdit) => {
-                const range = mapRangeToOriginal(snapshot, textEdit.range);
-                return isMapped(range) ? { ...textEdit, range } : undefined;
-            })
-            .filter((e): e is TextEdit => !!e);
+        const mapped: TextEdit[] = [];
+        for (const textEdit of edits) {
+            if (shouldCancel?.()) {
+                return undefined;
+            }
+            const range = mapRangeToOriginal(snapshot, textEdit.range);
+            if (isMapped(range)) {
+                mapped.push({ ...textEdit, range });
+            }
+        }
         return { uri: pathToUrl(originalPath), edits: mapped };
     };
 
     const changes: Record<string, TextEdit[]> = {};
     for (const [uri, edits] of Object.entries(edit.changes ?? {})) {
+        if (shouldCancel?.()) {
+            return null;
+        }
         const mapped = mapEdits(uri, edits);
+        if (shouldCancel?.()) {
+            return null;
+        }
         if (mapped?.edits.length) {
             changes[mapped.uri] = (changes[mapped.uri] ?? []).concat(mapped.edits);
         }
@@ -91,8 +105,14 @@ export function mapWorkspaceEditBack(
 
     const documentChanges: NonNullable<WorkspaceEdit['documentChanges']> = [];
     for (const change of edit.documentChanges ?? []) {
+        if (shouldCancel?.()) {
+            return null;
+        }
         if ('textDocument' in change && Array.isArray(change.edits)) {
             const mapped = mapEdits(change.textDocument.uri, change.edits as TextEdit[]);
+            if (shouldCancel?.()) {
+                return null;
+            }
             if (mapped?.edits.length) {
                 documentChanges.push({
                     ...change,
@@ -107,13 +127,25 @@ export function mapWorkspaceEditBack(
         // shadow. Preserve them in both cases, translating only the shadow URI(s).
         if ('kind' in change) {
             if (change.kind === 'rename') {
+                const oldUri = mapUri(change.oldUri);
+                if (shouldCancel?.()) {
+                    return null;
+                }
+                const newUri = mapUri(change.newUri);
+                if (shouldCancel?.()) {
+                    return null;
+                }
                 documentChanges.push({
                     ...change,
-                    oldUri: mapUri(change.oldUri),
-                    newUri: mapUri(change.newUri)
+                    oldUri,
+                    newUri
                 });
             } else if (change.kind === 'create' || change.kind === 'delete') {
-                documentChanges.push({ ...change, uri: mapUri(change.uri) });
+                const uri = mapUri(change.uri);
+                if (shouldCancel?.()) {
+                    return null;
+                }
+                documentChanges.push({ ...change, uri });
             }
         }
     }
@@ -133,12 +165,16 @@ export function mapWorkspaceEditBack(
  * Each token is [deltaLine, deltaStartChar, length, tokenType, tokenModifiers].
  */
 export function decodeSemanticTokens(
-    data: number[]
+    data: number[],
+    shouldCancel?: () => boolean
 ): Array<[line: number, char: number, length: number, type: number, modifiers: number]> {
     const out: Array<[number, number, number, number, number]> = [];
     let line = 0;
     let char = 0;
     for (let i = 0; i + 4 < data.length; i += 5) {
+        if (shouldCancel?.()) {
+            return [];
+        }
         const deltaLine = data[i];
         const deltaChar = data[i + 1];
         line += deltaLine;

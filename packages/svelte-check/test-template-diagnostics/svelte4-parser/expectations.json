@@ -1,0 +1,63 @@
+{
+    "schemaVersion": 1,
+    "svelteVersion": "4.2.20",
+    "diagnosticSources": "js,svelte",
+    "cases": [
+        {
+            "file": "src/08-broken-each-destructure.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "unexpected-token",
+                    "range": [0, 27, 0, 27],
+                    "message": "Expected }",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#unexpected_token"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/09-broken-await-destructure.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "unexpected-token",
+                    "range": [1, 4, 1, 4],
+                    "message": "Expected }",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#unexpected_token"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/10-invalid-bind-expression.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "invalid-directive-value",
+                    "range": [4, 7, 4, 29],
+                    "message": "Can only bind to an identifier (e.g. `foo`) or a member expression (e.g. `foo.bar` or `foo[baz]`)",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#invalid_directive_value"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/11-directive-missing-name.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "empty-directive-name",
+                    "range": [0, 11, 0, 11],
+                    "message": "EventHandler name cannot be empty",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#empty_directive_name"
+                    }
+                }
+            ]
+        }
+    ]
+}

@@ -26,11 +26,25 @@ jobs:
           SVELTE_LS_TSGO_PACKAGE: "@typescript/native-preview"
         run: |
           node -e "
-            const expected = require('./package.json').devDependencies['@typescript/native-preview'].replace(/^[^0-9]*/, '');
+            const packageName = process.env.SVELTE_LS_TSGO_PACKAGE;
+            const pins = [
+              './package.json',
+              './packages/language-server/package.json',
+              './packages/svelte-check/package.json'
+            ].map(file => ({ file, version: require(file).devDependencies?.[packageName] }));
+            for (const pin of pins) {
+              if (typeof pin.version !== 'string' || !pin.version) {
+                throw new Error(pin.file + ' does not pin ' + packageName);
+              }
+            }
+            const expected = pins[0].version;
+            if (pins.some(pin => pin.version !== expected)) {
+              throw new Error('native-engine pins differ: ' + pins.map(pin => pin.file + '=' + pin.version).join(', '));
+            }
             const { resolveTsGoEngine } = require('./packages/language-server/dist/src/plugins/typescript-go/lsp/TsGoEngine.js');
             const engine = resolveTsGoEngine(process.cwd());
             if (!engine) throw new Error('the pinned native engine did not resolve');
-            if (engine.packageName !== process.env.SVELTE_LS_TSGO_PACKAGE) throw new Error('resolved ' + engine.packageName);
+            if (engine.packageName !== packageName) throw new Error('resolved ' + engine.packageName);
             if (engine.version !== expected) throw new Error('expected ' + expected + ', resolved ' + engine.version);
             console.log(engine.packageName + '@' + engine.version + ' -> ' + engine.binPath);
           "

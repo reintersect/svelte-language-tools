@@ -7,11 +7,12 @@
 // Usage:
 //   node bench/compare-checker-engines.mjs --project ../reintersect/apps/dashboard \
 //     --tsconfig tsconfig.json [--effect-allow-source effect] [--effect-allow-code CODE]
-import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { createRequire } from 'node:module';
+import { runBoundedProcess } from './bounded-process.mjs';
+import { normalizeCheckerProgramMembership } from './checker-program-membership.mjs';
 
 if (process.argv.includes('--help')) {
     console.log(
@@ -189,45 +190,12 @@ async function runEngine(options, engine) {
     else delete env.SVELTE_LS_TSGO_PACKAGE;
 
     const started = performance.now();
-    const result = await new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, args, {
-            cwd: options.project,
-            env,
-            stdio: ['ignore', 'pipe', 'pipe']
-        });
-        let stdout = '';
-        let stderr = '';
-        let bytes = 0;
-        let terminalError;
-        const timer = setTimeout(() => {
-            terminalError = new Error(`${engine.label} timed out after ${options.timeoutMs}ms`);
-            child.kill();
-        }, options.timeoutMs);
-        const collect = (target, chunk) => {
-            bytes += Buffer.byteLength(chunk);
-            if (bytes > options.outputLimit) {
-                terminalError = new Error(
-                    `${engine.label} exceeded ${options.outputLimit} output bytes`
-                );
-                child.kill();
-                return;
-            }
-            if (target === 'stdout') stdout += chunk;
-            else stderr += chunk;
-        };
-        child.stdout.setEncoding('utf8');
-        child.stderr.setEncoding('utf8');
-        child.stdout.on('data', (chunk) => collect('stdout', chunk));
-        child.stderr.on('data', (chunk) => collect('stderr', chunk));
-        child.on('error', (error) => {
-            clearTimeout(timer);
-            reject(error);
-        });
-        child.on('close', (code, signal) => {
-            clearTimeout(timer);
-            if (terminalError) return reject(terminalError);
-            resolve({ code, signal, stdout, stderr });
-        });
+    const result = await runBoundedProcess(process.execPath, args, {
+        cwd: options.project,
+        env,
+        timeoutMs: options.timeoutMs,
+        outputLimit: options.outputLimit,
+        label: engine.label
     });
     const parsed = parseMachineOutput(result.stdout);
     const run = {
@@ -269,6 +237,15 @@ function validateRun(run) {
         if (completion.warningCount !== warnings.length) {
             issues.push(
                 `reported ${completion.warningCount} warnings but emitted ${warnings.length}`
+            );
+        }
+        const filesWithProblems = new Set(
+            [...errors, ...warnings].map((record) => normalizeUri(record.filename))
+        );
+        if (completion.fileCountWithProblems !== filesWithProblems.size) {
+            issues.push(
+                `reported ${completion.fileCountWithProblems} files with problems but emitted ` +
+                    `diagnostics for ${filesWithProblems.size}`
             );
         }
         const expectedExit = errors.length ? 1 : 0;
@@ -321,17 +298,14 @@ function diagnostics(run, options) {
 }
 
 function program(run, options) {
-    return run.records
-        .filter((record) => record.type === 'FILE')
-        .map((record) => normalizedFilename(record.filename, options))
-        .filter(
-            (filename) =>
-                !isCheckerImplementationFile(filename) &&
-                !filename.includes('/node_modules/') &&
-                !filename.startsWith('node_modules/') &&
-                !filename.includes('/node_modules/.cache/svelte-lsp/')
-        )
-        .sort();
+    return normalizeCheckerProgramMembership(
+        run.records.filter((record) => record.type === 'FILE').map((record) => record.filename),
+        {
+            project: options.project,
+            membershipRoot: options.membershipRoot,
+            isImplementationFile: isCheckerImplementationFile
+        }
+    );
 }
 
 function isCheckerImplementationFile(filename) {
@@ -388,6 +362,18 @@ function printDifference(label, left, right) {
     return false;
 }
 
+function printProgramAliases(run, membership) {
+    if (!membership.aliases.length) {
+        console.log(`PASS ${run.label} source program has no real/shadow aliases`);
+        return true;
+    }
+    console.error(
+        `FAIL ${run.label} source program has ${membership.aliases.length} real/shadow alias(es)`
+    );
+    console.error('aliases:', JSON.stringify(membership.aliases.slice(0, 8), null, 2));
+    return false;
+}
+
 const opts = parseArgs(process.argv);
 if (!fs.existsSync(CLI)) throw new Error(`checker is not built: ${CLI}`);
 if (!fs.existsSync(opts.tsconfig)) throw new Error(`tsconfig not found: ${opts.tsconfig}`);
@@ -406,6 +392,10 @@ for (const engine of table) {
 let passed = true;
 const classic = runs.find((run) => run.label === 'classic');
 const stock = runs.find((run) => run.label === 'stock');
+const programByRun = new Map(runs.map((run) => [run, program(run, opts)]));
+for (const run of runs) {
+    passed = printProgramAliases(run, programByRun.get(run)) && passed;
+}
 passed =
     printDifference(
         'classic vs stock diagnostics',
@@ -415,8 +405,8 @@ passed =
 passed =
     printDifference(
         'classic vs stock source program',
-        program(classic, opts),
-        program(stock, opts)
+        programByRun.get(classic).files,
+        programByRun.get(stock).files
     ) && passed;
 
 const effect = runs.find((run) => run.label === 'effect');
@@ -452,8 +442,8 @@ if (effect) {
     passed =
         printDifference(
             'stock vs effect source program',
-            program(stock, opts),
-            program(effect, opts)
+            programByRun.get(stock).files,
+            programByRun.get(effect).files
         ) && passed;
 }
 

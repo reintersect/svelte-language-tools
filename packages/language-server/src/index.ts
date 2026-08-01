@@ -1,6 +1,7 @@
 export * from './server';
 export { offsetAt, positionAt, getLineOffsets } from './lib/documents';
 export { normalizePath } from './utils';
+export { isSvelteConfigLoadDiagnostic } from './plugins/svelte/features/getDiagnostics';
 export {
     mapSvelteCheckDiagnostics,
     SvelteCheck,
@@ -8,6 +9,10 @@ export {
     SvelteCheckOptions
 } from './svelte-check';
 export {
+    BatchMaterialisationPlanTelemetry,
+    BatchMaterialisePhaseTimings,
+    BatchMaterialiseResult,
+    BatchOverlayCreationTimings,
     TsGoBatchOverlay,
     FileDiagnostics,
     GeneratedDiagnostic,

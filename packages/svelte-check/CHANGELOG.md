@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.8.5
+
+### Patch Changes
+
+-   Make native checker runs deterministic and fail-closed on spawn, signal, timeout, malformed or
+    incomplete output. Restore parser, configuration, dependency and template diagnostic parity; make
+    warm incremental runs reuse unchanged shadows without rewriting them; and validate diagnostics plus
+    normalized program membership with strict bounded classic-versus-native oracles. Use
+    `@reintersect/svelte-load-config` as the canonical configuration runtime.
+-   Updated dependencies []:
+    -   @reintersect/svelte-load-config@0.2.4
+
 ## 4.8.4
 
 ### Patch Changes

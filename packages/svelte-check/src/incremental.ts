@@ -48,8 +48,11 @@ export type ParsedDiagnostic = {
     filePath: string | null;
     line: number;
     character: number;
-    /** Span length in characters, parsed from tsc pretty-output ~~ underlines */
+    /** Same-line span length, or the fallback length when no complete pretty range is present. */
     length: number;
+    /** Explicit zero-based end position for a range that crosses a line boundary. */
+    endLine?: number;
+    endCharacter?: number;
     severity: DiagnosticSeverity;
     code: number;
     message: string;
@@ -61,6 +64,8 @@ export type ParsedDiagnosticRelatedInformation = {
     line: number;
     character: number;
     length: number;
+    endLine?: number;
+    endCharacter?: number;
     message: string;
 };
 
@@ -590,7 +595,7 @@ export function mapCliDiagnosticsToLsp(
                         entry.addedCode!
                     );
                     const { pos: endOffset } = internalHelpers.toOriginalPos(
-                        generatedOffset + diag.length,
+                        offsetAt(parsedDiagnosticEnd(diag), generatedText, generatedLineOffsets),
                         entry.addedCode!
                     );
                     const startPos = positionAt(startOffset, sourceText, sourceLineOffsets);
@@ -644,7 +649,7 @@ export function mapCliDiagnosticsToLsp(
             const mappedDiagnostics = fileDiagnostics.map((diag) => ({
                 range: Range.create(
                     { line: diag.line, character: diag.character },
-                    { line: diag.line, character: diag.character + diag.length }
+                    parsedDiagnosticEnd(diag)
                 ),
                 severity: diag.severity,
                 code: diag.code,
@@ -748,7 +753,7 @@ export function parseDiagnostics(output: string, baseDir: string): ParsedDiagnos
         // Keep the chain's newlines/indentation: flattening it to the first header line loses
         // the actual reason each overload failed.
         const messageLines = [firstMessage];
-        let length = 1;
+        const parsedRange = parsePrettyRange(lines, i + 1, primaryEnd, lineNum, colNum, tildeRegex);
         let collectingMessage = true;
         for (let j = i + 1; j < primaryEnd; j++) {
             const raw = lines[j];
@@ -756,7 +761,6 @@ export function parseDiagnostics(output: string, baseDir: string): ParsedDiagnos
 
             const tildeMatch = tildeRegex.exec(raw);
             if (tildeMatch) {
-                length = tildeMatch[2].length;
                 collectingMessage = false;
                 continue;
             }
@@ -796,7 +800,13 @@ export function parseDiagnostics(output: string, baseDir: string): ParsedDiagnos
             filePath: resolvedPath,
             line: lineNum,
             character: colNum,
-            length,
+            length: parsedRange.length,
+            ...(parsedRange.endLine !== undefined
+                ? {
+                      endLine: parsedRange.endLine,
+                      endCharacter: parsedRange.endCharacter
+                  }
+                : {}),
             severity:
                 severity === 'warning'
                     ? DiagnosticSeverity.Warning
@@ -832,7 +842,9 @@ function parseRelatedInformation(
         return undefined;
     }
     const [, filePath, lineStr, characterStr, inlineMessage] = location;
-    let length = 1;
+    const line = Math.max(0, Number(lineStr) - 1);
+    const character = Math.max(0, Number(characterStr) - 1);
+    const parsedRange = parsePrettyRange(lines, start + 1, end, line, character, tildeRegex);
     let sawCodeFrame = false;
     let messageStarted = false;
     const messageLines: string[] = inlineMessage ? [inlineMessage] : [];
@@ -858,7 +870,6 @@ function parseRelatedInformation(
         }
         const tilde = tildeRegex.exec(raw);
         if (tilde) {
-            length = tilde[2].length;
             sawCodeFrame = true;
             continue;
         }
@@ -877,11 +888,92 @@ function parseRelatedInformation(
     }
     return {
         filePath: resolveCompilerPath(filePath, baseDir),
-        line: Math.max(0, Number(lineStr) - 1),
-        character: Math.max(0, Number(characterStr) - 1),
-        length,
+        line,
+        character,
+        length: parsedRange.length,
+        ...(parsedRange.endLine !== undefined
+            ? {
+                  endLine: parsedRange.endLine,
+                  endCharacter: parsedRange.endCharacter
+              }
+            : {}),
         message: messageLines.join('\n')
     };
+}
+
+/**
+ * Recover a complete UTF-16 range from TypeScript's pretty code frame.
+ *
+ * The header carries only the start position. Each rendered source row is immediately followed
+ * by an underline row, including a whitespace-only underline when a multiline span ends at
+ * column zero. Keeping the final rendered row therefore also handles the formatter's ellipsis
+ * for spans longer than five lines.
+ */
+function parsePrettyRange(
+    lines: string[],
+    start: number,
+    end: number,
+    fallbackLine: number,
+    _fallbackCharacter: number,
+    tildeRegex: RegExp
+): { length: number; endLine?: number; endCharacter?: number } {
+    let pendingSource: { line: number; contentStart: number } | undefined;
+    let rangeEnd: { line: number; character: number; underlineLength: number } | undefined;
+
+    for (let index = start; index < end; index++) {
+        const raw = lines[index];
+        if (pendingSource) {
+            const underline = tildeRegex.exec(raw);
+            if (underline || /^\s*$/.test(raw)) {
+                const underlineStart = underline?.[1].length ?? pendingSource.contentStart;
+                const character = Math.max(0, underlineStart - pendingSource.contentStart);
+                rangeEnd = {
+                    line: pendingSource.line,
+                    character: character + (underline?.[2].length ?? 0),
+                    underlineLength: underline?.[2].length ?? 0
+                };
+                pendingSource = undefined;
+                continue;
+            }
+            pendingSource = undefined;
+        }
+
+        // TypeScript's gutter is `[indent][right-aligned line number][one space]`. Capturing the
+        // full prefix gives the authored-code column of the following underline without having
+        // to guess the gutter width (which differs for primary and related frames).
+        const source = /^(\s*(\d+)\s)(.*)$/.exec(raw);
+        if (source) {
+            pendingSource = {
+                line: Math.max(0, Number(source[2]) - 1),
+                contentStart: source[1].length
+            };
+        }
+    }
+
+    if (!rangeEnd) {
+        return { length: 1 };
+    }
+    if (rangeEnd.line === fallbackLine) {
+        // The underline width is authoritative for same-line spans. Some native preview builds
+        // render a gutter whose visual alignment does not exactly reproduce the header column.
+        return { length: Math.max(1, rangeEnd.underlineLength) };
+    }
+    return {
+        length: 1,
+        endLine: rangeEnd.line,
+        endCharacter: rangeEnd.character
+    };
+}
+
+function parsedDiagnosticEnd(
+    diagnostic: Pick<
+        ParsedDiagnostic | ParsedDiagnosticRelatedInformation,
+        'line' | 'character' | 'length' | 'endLine' | 'endCharacter'
+    >
+): { line: number; character: number } {
+    return diagnostic.endLine !== undefined && diagnostic.endCharacter !== undefined
+        ? { line: diagnostic.endLine, character: diagnostic.endCharacter }
+        : { line: diagnostic.line, character: diagnostic.character + diagnostic.length };
 }
 
 function resolveCompilerPath(filePath: string, baseDir: string): string {
@@ -954,11 +1046,13 @@ function cliDiagnosticToTsDiagnostic(
         isTsFile ? ts.ScriptKind.TS : ts.ScriptKind.JS
     );
     const start = sourceFile.getPositionOfLineAndCharacter(diag.line, diag.character);
+    const endPosition = parsedDiagnosticEnd(diag);
+    const end = sourceFile.getPositionOfLineAndCharacter(endPosition.line, endPosition.character);
 
     return {
         file: sourceFile,
         start,
-        length: diag.length,
+        length: Math.max(1, end - start),
         category:
             diag.severity === DiagnosticSeverity.Warning
                 ? ts.DiagnosticCategory.Warning

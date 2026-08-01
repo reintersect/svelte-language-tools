@@ -39,6 +39,13 @@ export interface ProjectRegistryOptions {
     fallbackRoot: string;
 }
 
+export interface ProjectGraphInputs {
+    /** Root and extended TypeScript configuration files read for this manager. */
+    configInputs: readonly string[];
+    /** Existing or absent package manifests consulted while resolving this manager's graph. */
+    manifestInputs: readonly string[];
+}
+
 /**
  * One {@link ShadowManager} per TypeScript project, resolved from the file being edited.
  *
@@ -54,6 +61,10 @@ export interface ProjectRegistryOptions {
  */
 export class ProjectRegistry implements ShadowLookup {
     private readonly byProjectRoot = new Map<string, ShadowManager>();
+    private readonly projectMetadata = new Map<
+        ShadowManager,
+        { key: string; projectRoot: string; tsconfigPath: string | undefined }
+    >();
     /** Resolved tsconfig per containing directory, since the walk hits the filesystem. */
     private readonly tsconfigByDir = new Map<string, string | undefined>();
     private readonly workspaceRoots: string[];
@@ -65,7 +76,15 @@ export class ProjectRegistry implements ShadowLookup {
     private readonly svelteFileScans = new Map<string, string[]>();
     /** Shared reverse index avoids scanning every manager on each mapped location/edit. */
     private readonly originalByShadowPath = new Map<string, string>();
-    private readonly managerByOriginalPath = new Map<string, ShadowManager>();
+    /** One canonical source may be materialised by several consuming projects. */
+    private readonly managersByOriginalPath = new Map<string, Set<ShadowManager>>();
+    /** Exact graph inputs let watcher invalidation replace consumers, not merely file owners. */
+    private readonly graphInputsByManager = new Map<
+        ShadowManager,
+        { configInputs: Set<string>; manifestInputs: Set<string> }
+    >();
+    private readonly managersByConfigInput = new Map<string, Set<ShadowManager>>();
+    private readonly managersByManifestInput = new Map<string, Set<ShadowManager>>();
 
     constructor(private readonly options: ProjectRegistryOptions) {
         this.workspaceRoots = options.workspaceRoots.map((root) => normalizePath(root));
@@ -125,9 +144,12 @@ export class ProjectRegistry implements ShadowLookup {
             const shadow = normalizePath(shadowPath);
             const original = normalizePath(originalPath);
             this.originalByShadowPath.set(shadow, original);
-            this.managerByOriginalPath.set(original, shadows);
+            const managers = this.managersByOriginalPath.get(original) ?? new Set();
+            managers.add(shadows);
+            this.managersByOriginalPath.set(original, managers);
         });
         this.byProjectRoot.set(key, shadows);
+        this.projectMetadata.set(shadows, { key, projectRoot, tsconfigPath });
         return shadows;
     }
 
@@ -155,6 +177,29 @@ export class ProjectRegistry implements ShadowLookup {
         this.svelteFileScans.clear();
     }
 
+    /** Replace the exact config/manifest input index after a manager publishes a complete graph. */
+    recordProjectGraphInputs(manager: ShadowManager, inputs: ProjectGraphInputs): void {
+        this.forgetProjectGraphInputs(manager);
+        const configInputs = new Set(inputs.configInputs.map(normalizePath));
+        const manifestInputs = new Set(inputs.manifestInputs.map(normalizePath));
+        this.graphInputsByManager.set(manager, { configInputs, manifestInputs });
+        for (const input of configInputs) {
+            addIndexedManager(this.managersByConfigInput, input, manager);
+        }
+        for (const input of manifestInputs) {
+            addIndexedManager(this.managersByManifestInput, input, manager);
+        }
+    }
+
+    /** Whether this exact path was read as a structural input by a live manager. */
+    isTrackedStructuralInput(filePath: string): boolean {
+        const normalized = normalizePath(filePath);
+        return (
+            this.managersByConfigInput.has(normalized) ||
+            this.managersByManifestInput.has(normalized)
+        );
+    }
+
     /**
      * Invalidate project ownership after a file-tree change.
      *
@@ -164,33 +209,183 @@ export class ProjectRegistry implements ShadowLookup {
      * determine package roots, dependency Svelte files and subpath-import mappings inside every
      * shadow manager.
      *
-     * Structural changes are rare, so rebuilding all lazily-created managers is preferable to a
-     * clever partial invalidation that can retain a manager with stale compiler/package options.
-     * The returned managers let the plugin forget any corresponding materialisation promises.
+     * Completed graph inputs identify exact consumers. Previously unseen manifests deliberately
+     * fall back to every live manager because a new export can make an unresolved import resolve.
+     * The returned managers let the plugin forget corresponding materialisation promises.
      */
     invalidateForStructuralChange(filePath: string): ShadowManager[] {
-        this.invalidateWorkspaceScans();
-        this.originalByShadowPath.clear();
-        this.managerByOriginalPath.clear();
+        return this.invalidateForStructuralChanges([filePath]);
+    }
 
-        const name = basename(normalizePath(filePath));
-        const projectStructure =
-            name === 'tsconfig.json' || name === 'jsconfig.json' || name === 'package.json';
-        const transformConfig = /^(?:svelte|vite)\.config\.(?:[cm]?[jt]s)$/.test(name);
-        const sourceMembership = /\.(?:svelte|[cm]?[jt]sx?)$/.test(name);
-        if (!projectStructure && !transformConfig && !sourceMembership) {
-            return [];
+    /**
+     * Batch form keeps every graph-input index alive until all coalesced watcher events have
+     * selected their consumers. Removing a manager after the first event must not turn a second,
+     * otherwise-exact event into an unnecessary all-project fallback.
+     */
+    invalidateForStructuralChanges(filePaths: readonly string[]): ShadowManager[] {
+        const affected = new Set<ShadowManager>();
+        const addConsumersOf = (candidate: string) => {
+            for (const manager of this.managersByOriginalPath.get(candidate) ?? []) {
+                affected.add(manager);
+            }
+        };
+        let invalidatesWorkspaceScan = false;
+
+        for (const filePath of new Set(filePaths.map(normalizePath))) {
+            const name = basename(filePath);
+            const standardConfig = name === 'tsconfig.json' || name === 'jsconfig.json';
+            const packageManifest = name === 'package.json';
+            const configConsumers = this.managersByConfigInput.get(filePath);
+            const manifestConsumers = this.managersByManifestInput.get(filePath);
+            const trackedInput = !!configConsumers?.size || !!manifestConsumers?.size;
+            const transformConfig = /^(?:svelte|vite)\.config\.(?:[cm]?[jt]s)$/.test(name);
+            const sourceMembership = /\.(?:svelte|[cm]?[jt]sx?)$/.test(name);
+            if (
+                !standardConfig &&
+                !packageManifest &&
+                !trackedInput &&
+                !transformConfig &&
+                !sourceMembership
+            ) {
+                continue;
+            }
+
+            invalidatesWorkspaceScan = true;
+            addConsumersOf(filePath);
+            for (const manager of configConsumers ?? []) {
+                affected.add(manager);
+            }
+            for (const manager of manifestConsumers ?? []) {
+                affected.add(manager);
+            }
+
+            const containingDirectory = dirname(filePath);
+            if (standardConfig) {
+                // Both a cached positive answer and a cached "no config" below this directory may
+                // change. Unrelated packages retain their project managers and dependency indexes.
+                for (const directory of [...this.tsconfigByDir.keys()]) {
+                    if (isWithin(containingDirectory, directory)) {
+                        this.tsconfigByDir.delete(directory);
+                    }
+                }
+                for (const [manager, metadata] of this.projectMetadata) {
+                    if (
+                        isWithin(containingDirectory, metadata.projectRoot) ||
+                        isWithin(metadata.projectRoot, containingDirectory)
+                    ) {
+                        affected.add(manager);
+                    }
+                }
+            } else if (packageManifest) {
+                // Exact graph inputs cover manifests TypeScript/package resolution actually
+                // consulted, including absent package.json candidates. If this path has never
+                // appeared in a live graph, a new sibling package/export can make a previously
+                // unresolved import resolve; no narrower consumer set is provable yet.
+                if (!manifestConsumers?.size) {
+                    for (const manager of this.byProjectRoot.values()) {
+                        affected.add(manager);
+                    }
+                }
+                for (const [original, managers] of this.managersByOriginalPath) {
+                    if (!isWithin(containingDirectory, original)) {
+                        continue;
+                    }
+                    for (const manager of managers) {
+                        affected.add(manager);
+                    }
+                }
+                for (const [manager, metadata] of this.projectMetadata) {
+                    if (
+                        isWithin(containingDirectory, metadata.projectRoot) ||
+                        isWithin(metadata.projectRoot, containingDirectory)
+                    ) {
+                        affected.add(manager);
+                    }
+                }
+            } else if (trackedInput) {
+                // Arbitrarily named/package-provided extended configs invalidate only managers
+                // whose completed graph recorded that exact input.
+            } else if (transformConfig) {
+                for (const [original, managers] of this.managersByOriginalPath) {
+                    if (!isWithin(containingDirectory, original)) {
+                        continue;
+                    }
+                    for (const manager of managers) {
+                        affected.add(manager);
+                    }
+                }
+                for (const [manager, metadata] of this.projectMetadata) {
+                    if (
+                        isWithin(containingDirectory, metadata.projectRoot) ||
+                        isWithin(metadata.projectRoot, containingDirectory)
+                    ) {
+                        affected.add(manager);
+                    }
+                }
+            } else {
+                // Source graph changes affect the owning project and any project which consumed
+                // the same Svelte/ordinary source through the reverse materialisation index.
+                // A previously absent Svelte target has no reverse-index entry yet, though, and
+                // can make an unresolved import or export resolve in any live project. Creation,
+                // deletion and rename are all delivered through this structural path, so fail
+                // closed unless an existing materialisation proves the exact consumers.
+                const exactSourceConsumers = this.managersByOriginalPath.get(filePath);
+                if (/\.svelte$/i.test(filePath) && !exactSourceConsumers?.size) {
+                    for (const manager of this.byProjectRoot.values()) {
+                        affected.add(manager);
+                    }
+                    continue;
+                }
+                const nearest = this.findNearestTsconfig(filePath, containingDirectory);
+                for (const [manager, metadata] of this.projectMetadata) {
+                    if (
+                        (nearest && metadata.tsconfigPath === nearest) ||
+                        (!nearest &&
+                            !metadata.tsconfigPath &&
+                            isWithin(metadata.projectRoot, filePath))
+                    ) {
+                        affected.add(manager);
+                    }
+                }
+            }
         }
 
-        const invalidated = this.all();
-        if (projectStructure) {
-            this.tsconfigByDir.clear();
+        if (invalidatesWorkspaceScan) {
+            this.invalidateWorkspaceScans();
         }
-        // Every recognized structural change can alter the overlay's files/rootDirs/paths,
-        // compiler/config identity or dependency graph. Reusing the manager after clearing only
-        // its scans leaves the already-written overlay tsconfig stale.
-        this.byProjectRoot.clear();
-        return invalidated;
+
+        // Reusing any affected manager after clearing only its scans would retain an already
+        // written overlay tsconfig with stale roots/options. Remove precisely those managers;
+        // callers invalidate their local caches and lazily construct replacements.
+        for (const manager of affected) {
+            const metadata = this.projectMetadata.get(manager);
+            if (metadata && this.byProjectRoot.get(metadata.key) === manager) {
+                this.byProjectRoot.delete(metadata.key);
+            }
+            this.projectMetadata.delete(manager);
+            this.forgetProjectGraphInputs(manager);
+            for (const [original, managers] of this.managersByOriginalPath) {
+                managers.delete(manager);
+                if (!managers.size) {
+                    this.managersByOriginalPath.delete(original);
+                }
+            }
+        }
+        return [...affected];
+    }
+
+    private forgetProjectGraphInputs(manager: ShadowManager): void {
+        const previous = this.graphInputsByManager.get(manager);
+        if (!previous) {
+            return;
+        }
+        this.graphInputsByManager.delete(manager);
+        for (const input of previous.configInputs) {
+            removeIndexedManager(this.managersByConfigInput, input, manager);
+        }
+        for (const input of previous.manifestInputs) {
+            removeIndexedManager(this.managersByManifestInput, input, manager);
+        }
     }
 
     /**
@@ -257,7 +452,9 @@ export class ProjectRegistry implements ShadowLookup {
             const original = shadows.getOriginalPath(normalized);
             if (original) {
                 this.originalByShadowPath.set(normalized, original);
-                this.managerByOriginalPath.set(original, shadows);
+                const managers = this.managersByOriginalPath.get(original) ?? new Set();
+                managers.add(shadows);
+                this.managersByOriginalPath.set(original, managers);
                 return original;
             }
         }
@@ -271,20 +468,38 @@ export class ProjectRegistry implements ShadowLookup {
      */
     ensureSnapshot(svelteFilePath: string): SvelteDocumentSnapshot | undefined {
         const normalized = normalizePath(svelteFilePath);
-        const indexedManager = this.managerByOriginalPath.get(normalized);
-        if (indexedManager) {
-            return indexedManager.ensureSnapshot(normalized);
+        // A dependency consumer may have registered this source first, but the source's own
+        // project is where an editor-open (and therefore potentially dirty) snapshot is pinned.
+        // Never let insertion order in the reverse index replace that live buffer with a fresh
+        // transform of the saved file from some other manager.
+        const owner = this.forFile(normalized);
+        const ownerSnapshot = owner.getSnapshot(normalized);
+        if (ownerSnapshot) {
+            addIndexedManager(this.managersByOriginalPath, normalized, owner);
+            return ownerSnapshot;
+        }
+
+        // Another consumer can still hold the only materialised mapping snapshot. Consult every
+        // cache before allowing ensureSnapshot to read from disk.
+        const indexedManagers = this.managersByOriginalPath.get(normalized);
+        for (const indexedManager of indexedManagers ?? []) {
+            const cached = indexedManager.getSnapshot(normalized);
+            if (cached) {
+                return cached;
+            }
         }
         for (const shadows of this.byProjectRoot.values()) {
             const cached = shadows.getSnapshot(normalized);
             if (cached) {
-                this.managerByOriginalPath.set(normalized, shadows);
+                addIndexedManager(this.managersByOriginalPath, normalized, shadows);
                 return cached;
             }
         }
-        const manager = this.forFile(normalized);
-        this.managerByOriginalPath.set(normalized, manager);
-        return manager.ensureSnapshot(normalized);
+
+        // No live mapping exists. Transform once from disk using the source's own project and
+        // remember it for later cross-project navigation.
+        addIndexedManager(this.managersByOriginalPath, normalized, owner);
+        return owner.ensureSnapshot(normalized);
     }
 
     getSnapshotByShadowPath(shadowPath: string): SvelteDocumentSnapshot | undefined {
@@ -296,4 +511,26 @@ export class ProjectRegistry implements ShadowLookup {
 /** Whether `path` is `root` or inside it. Both must be normalized. */
 function isWithin(root: string, path: string): boolean {
     return path === root || path.startsWith(root + '/');
+}
+
+function addIndexedManager(
+    index: Map<string, Set<ShadowManager>>,
+    input: string,
+    manager: ShadowManager
+): void {
+    const managers = index.get(input) ?? new Set<ShadowManager>();
+    managers.add(manager);
+    index.set(input, managers);
+}
+
+function removeIndexedManager(
+    index: Map<string, Set<ShadowManager>>,
+    input: string,
+    manager: ShadowManager
+): void {
+    const managers = index.get(input);
+    managers?.delete(manager);
+    if (!managers?.size) {
+        index.delete(input);
+    }
 }

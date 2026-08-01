@@ -1,5 +1,13 @@
 # @reintersect/svelte-load-config
 
+## 0.2.4
+
+### Patch Changes
+
+-   Isolate concurrent Svelte and Vite configuration loads with explicit roots and config paths instead
+    of changing the process working directory. Preserve and serialize the legacy Vite environment only
+    for callers which still need it.
+
 ## 0.2.3
 
 ### Patch Changes

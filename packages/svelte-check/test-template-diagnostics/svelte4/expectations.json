@@ -1,0 +1,129 @@
+{
+    "schemaVersion": 1,
+    "svelteVersion": "4.2.20",
+    "diagnosticSources": "js,svelte",
+    "cases": [
+        {
+            "file": "src/00-undeclared-component.svelte",
+            "diagnostics": [
+                {
+                    "type": "WARNING",
+                    "severity": 2,
+                    "source": "svelte",
+                    "code": "missing-declaration",
+                    "range": [5, 4, 5, 21],
+                    "message": "'Button' is not defined",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-warnings#missing_declaration"
+                    }
+                },
+                {
+                    "code": 2304,
+                    "range": [5, 5, 5, 11],
+                    "message": "Cannot find name 'Button'."
+                },
+                {
+                    "code": 2304,
+                    "range": [5, 14, 5, 20],
+                    "message": "Cannot find name 'Button'."
+                }
+            ]
+        },
+        {
+            "file": "src/01-each-nested-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [4, 40, 4, 47],
+                    "message": "Property 'missing' does not exist on type '{ id: number; profile: { name: string; }; }'."
+                }
+            ]
+        },
+        {
+            "file": "src/02-each-tuple-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2493,
+                    "range": [4, 28, 4, 33],
+                    "message": "Tuple type '[number, string]' of length '2' has no element at index '2'."
+                }
+            ]
+        },
+        {
+            "file": "src/03-await-object-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2551,
+                    "range": [5, 14, 5, 21],
+                    "message": "Property 'toFixed' does not exist on type 'string'. Did you mean 'fixed'?",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "typescript-lib:lib.es2015.core.d.ts",
+                                "range": [484, 4, 484, 20],
+                                "message": "'fixed' is declared here."
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/04-const-nested-destructure.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [9, 21, 9, 32],
+                    "message": "Property 'toUpperCase' does not exist on type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/05-slot-let.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [5, 16, 5, 27],
+                    "message": "Property 'toUpperCase' does not exist on type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/06-dynamic-component.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [5, 33, 5, 38],
+                    "message": "Type 'number' is not assignable to type 'string'."
+                }
+            ]
+        },
+        {
+            "file": "src/07-event-handler.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [4, 11, 4, 16],
+                    "message": "Type 'string' is not assignable to type 'MouseEventHandler<HTMLButtonElement>'.",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "dependency:svelte/elements.d.ts",
+                                "range": [133, 1, 133, 11],
+                                "message": "The expected type comes from property 'on:click' which is declared here on type 'HTMLProps<\"button\", HTMLAttributes<any>>'"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/_Button.svelte",
+            "diagnostics": []
+        },
+        {
+            "file": "src/_SlotSource.svelte",
+            "diagnostics": []
+        }
+    ]
+}

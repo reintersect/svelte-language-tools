@@ -1,0 +1,8 @@
+{
+    "name": "svelte-check-template-diagnostics-config-transform",
+    "private": true,
+    "type": "module",
+    "dependencies": {
+        "svelte": "4.2.20"
+    }
+}

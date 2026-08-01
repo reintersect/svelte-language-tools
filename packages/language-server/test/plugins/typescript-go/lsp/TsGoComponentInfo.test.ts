@@ -46,6 +46,56 @@ describe('typescript-go TsGoComponentInfo cache invalidation', () => {
         assert.strictEqual(definitionCalls, 2);
     });
 
+    it('re-resolves a component after an unsaved TypeScript barrel retarget', async () => {
+        let target = '/workspace/First.svelte.tsx';
+        let definitionCalls = 0;
+        const checker = {
+            getTypeAtPosition: async (filePath: string) => ({ filePath }),
+            typeToString: async () => 'component',
+            getPropertyOfType: async (type: any, name: string) =>
+                name === '$$prop_def' ? { carrierPath: type.filePath } : undefined,
+            getTypeOfSymbol: async (symbol: any) => ({ filePath: symbol.carrierPath }),
+            getPropertiesOfType: async (type: any) => [
+                { name: type.filePath.includes('First') ? 'firstProp' : 'secondProp' }
+            ],
+            getDocumentationCommentOfSymbol: async () => '',
+            getSignaturesOfType: async () => []
+        };
+        const info = new TsGoComponentInfo(
+            {
+                signatureKind: { Call: 0, Construct: 1 },
+                getProjectForFile: async () => ({ checker })
+            } as any,
+            async () => {
+                definitionCalls++;
+                return { filePath: target, offset: 1 };
+            }
+        );
+
+        const first = await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button');
+        target = '/workspace/Second.svelte.tsx';
+        assert.deepStrictEqual(
+            (await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button')).map(
+                (part) => part.name
+            ),
+            ['firstProp'],
+            'the fixture must demonstrate the cached usage definition before invalidation'
+        );
+
+        info.invalidateResolutionGraph();
+        const second = await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button');
+
+        assert.deepStrictEqual(
+            first.map((part) => part.name),
+            ['firstProp']
+        );
+        assert.deepStrictEqual(
+            second.map((part) => part.name),
+            ['secondProp']
+        );
+        assert.strictEqual(definitionCalls, 2);
+    });
+
     it('invalidates both usage definitions and declaration type information', () => {
         const info = new TsGoComponentInfo({} as any, async () => undefined);
         const cache = (info as any).cache as Map<string, unknown>;

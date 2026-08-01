@@ -115,6 +115,55 @@ test('parses related locations without replacing the primary source span', () =>
     ]);
 });
 
+test('preserves complete multiline primary and related source ranges', () => {
+    const output = [
+        '/work/src/index.ts:1:9 - error TS2352: Conversion may be a mistake.',
+        '',
+        '1 let x = <number>{',
+        '          ~~~~~~~~~',
+        '2  a:1',
+        '  ~~~~',
+        '3 };',
+        '  ~',
+        '',
+        '  src/related.ts:1:9',
+        '    1 let y = <number>{',
+        '              ~~~~~~~~~',
+        '    2  b:2',
+        '      ~~~~',
+        '    3 };',
+        '      ~',
+        '    Multiline related location.',
+        '',
+        '/work/src/index.ts'
+    ].join('\n');
+
+    assert.deepEqual(parseDiagnostics(output, '/work'), [
+        {
+            filePath: '/work/src/index.ts',
+            line: 0,
+            character: 8,
+            length: 1,
+            endLine: 2,
+            endCharacter: 1,
+            severity: DiagnosticSeverity.Error,
+            code: 2352,
+            message: 'Conversion may be a mistake.',
+            relatedInformation: [
+                {
+                    filePath: '/work/src/related.ts',
+                    line: 0,
+                    character: 8,
+                    length: 1,
+                    endLine: 2,
+                    endCharacter: 1,
+                    message: 'Multiline related location.'
+                }
+            ]
+        }
+    ]);
+});
+
 test('retains non-error compiler severity', () => {
     const diagnostics = parseDiagnostics(
         [
@@ -198,6 +247,46 @@ test('streams arbitrary chunks without interleaving stdout and stderr diagnostic
             "    Argument of type 'number' is not assignable to parameter of type 'boolean'."
     );
     assert.deepEqual(result.files, ['/work/src/index.ts']);
+});
+
+test('rejects malformed standalone output even when valid diagnostics and files follow', () => {
+    const collector = new NativeCompilerOutputCollector('/work');
+
+    assert.throws(
+        () =>
+            collector.push(
+                'stdout',
+                [
+                    'garbage',
+                    '/work/src/index.ts:1:1 - error TS9999: valid-looking diagnostic',
+                    '/work/src/index.ts'
+                ].join('\n') + '\n'
+            ),
+        /unrecognized output line: garbage/
+    );
+});
+
+test('accepts the native pretty error-count table but not arbitrary text after it', () => {
+    const collector = new NativeCompilerOutputCollector('/work');
+    collector.push(
+        'stdout',
+        [
+            '/work/src/index.ts',
+            'Found 2 errors in 1 file.',
+            '',
+            'Errors  Files',
+            '     2  src/index.ts:4'
+        ].join('\n') + '\n'
+    );
+    const complete = collector.finish();
+    assert.deepEqual(complete.files, ['/work/src/index.ts']);
+    assert.equal(complete.terminalErrorCount, 2);
+
+    const malformed = new NativeCompilerOutputCollector('/work');
+    assert.throws(
+        () => malformed.push('stdout', 'Errors  Files\nnot a summary row\n'),
+        /unrecognized output line: not a summary row/
+    );
 });
 
 console.log(`\n${passed} passed, 0 failed`);

@@ -16,6 +16,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+    BATCH_MATERIALISE_PHASES,
+    BATCH_CREATION_PHASES,
     ProcessTreeMonitor,
     formatBytes,
     getTsGoStats,
@@ -25,7 +27,10 @@ import {
     snapshotShadowMtimes,
     startLanguageServer,
     summarize,
-    uri
+    summarizeBatchMaterialiseResults,
+    summarizeBatchOverlayCreationTimings,
+    uri,
+    validateCheckerStats
 } from './perf-utils.mjs';
 import { runBurstTrial } from './spikes/typing-burst.mjs';
 
@@ -254,7 +259,10 @@ async function runColdTrial(options, packageName, pair, useTsGo) {
             nativeChecks: stats?.projectChecks ?? 0,
             cacheState: cacheStateFromStats(stats),
             transformedShadows: stats?.transformedShadows ?? 0,
-            reusedShadows: stats?.reusedShadows ?? 0
+            reusedShadows: stats?.reusedShadows ?? 0,
+            materialisationCleanupRuns: stats?.materialisationCleanupRuns ?? 0,
+            materialisationCleanupSkips: stats?.materialisationCleanupSkips ?? 0,
+            phaseTimings: stats?.phaseTimings ?? {}
         };
     } finally {
         if (monitor) {
@@ -284,6 +292,13 @@ async function runColdPairs(options, packageName) {
         cpuMs: summarize(runs.map((run) => run.cpuMs)),
         peakRssBytes: summarize(runs.map((run) => run.peakRssBytes)),
         nativeChecks: summarize(runs.map((run) => run.nativeChecks)),
+        transformedShadows: summarize(runs.map((run) => run.transformedShadows)),
+        reusedShadows: summarize(runs.map((run) => run.reusedShadows)),
+        materialisationCleanupRuns: summarize(runs.map((run) => run.materialisationCleanupRuns)),
+        materialisationCleanupSkips: summarize(runs.map((run) => run.materialisationCleanupSkips)),
+        engineVersions: [
+            ...new Set(runs.map((run) => `${run.engine.packageName}@${run.engine.version}`))
+        ],
         cacheStates: [...new Set(runs.map((run) => run.cacheState))]
     });
     const classicSummary = summaryFor(classic);
@@ -519,6 +534,38 @@ async function runLifecycleAcceptance(options, packageName) {
     }
 }
 
+function isMachinePosition(value) {
+    return (
+        value &&
+        Number.isSafeInteger(value.line) &&
+        value.line >= 0 &&
+        Number.isSafeInteger(value.character) &&
+        value.character >= 0
+    );
+}
+
+function isMachineJsonRecord(record) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
+    if (record.type === 'FILE') return typeof record.filename === 'string';
+    if (record.type !== 'ERROR' && record.type !== 'WARNING') return false;
+    return (
+        typeof record.filename === 'string' &&
+        typeof record.message === 'string' &&
+        isMachinePosition(record.start) &&
+        isMachinePosition(record.end) &&
+        Number.isSafeInteger(record.severity) &&
+        record.severity === (record.type === 'ERROR' ? 1 : 2) &&
+        (record.relatedInformation ?? []).every(
+            (related) =>
+                related &&
+                typeof related.message === 'string' &&
+                typeof related.location?.uri === 'string' &&
+                isMachinePosition(related.location.range?.start) &&
+                isMachinePosition(related.location.range?.end)
+        )
+    );
+}
+
 function parseMachineOutput(stdout, label) {
     const records = [];
     const malformed = [];
@@ -533,7 +580,7 @@ function parseMachineOutput(stdout, label) {
         if (payload.startsWith('{')) {
             try {
                 const record = JSON.parse(payload);
-                if (!record || typeof record.type !== 'string') throw new Error('missing type');
+                if (!isMachineJsonRecord(record)) throw new Error('invalid record shape');
                 records.push(record);
             } catch {
                 malformed.push(line);
@@ -583,15 +630,56 @@ async function runProcess(command, args, { cwd, env, timeoutMs, outputLimit = 25
         let stderr = '';
         let bytes = 0;
         let terminalError;
-        const timer = setTimeout(() => {
-            terminalError = new Error(`process timed out after ${timeoutMs}ms`);
-            child.kill();
-        }, timeoutMs);
+        let settled = false;
+        let forceKill;
+        let monitorStopped = false;
+        const stopMonitor = () => {
+            if (monitorStopped) return undefined;
+            monitorStopped = true;
+            return monitor.stop();
+        };
+        const clearTimers = () => {
+            clearTimeout(timer);
+            if (forceKill) clearTimeout(forceKill);
+        };
+        const rejectOnce = (error) => {
+            if (settled) return;
+            settled = true;
+            clearTimers();
+            try {
+                stopMonitor();
+            } catch {}
+            reject(error);
+        };
+        const terminate = (error) => {
+            if (terminalError || settled) return;
+            terminalError = error;
+            try {
+                child.kill('SIGTERM');
+            } catch {
+                // The close/error path remains authoritative when the process already exited.
+            }
+            forceKill = setTimeout(() => {
+                try {
+                    child.kill('SIGKILL');
+                } catch {
+                    // Reject below even if the operating system already reaped the child.
+                }
+                child.stdout.destroy();
+                child.stderr.destroy();
+                child.unref();
+                rejectOnce(error);
+            }, 1_000);
+        };
+        const timer = setTimeout(
+            () => terminate(new Error(`process timed out after ${timeoutMs}ms`)),
+            timeoutMs
+        );
         const collect = (target, chunk) => {
+            if (terminalError) return;
             bytes += Buffer.byteLength(chunk);
             if (bytes > outputLimit) {
-                terminalError = new Error(`process exceeded ${outputLimit} output bytes`);
-                child.kill();
+                terminate(new Error(`process exceeded ${outputLimit} output bytes`));
                 return;
             }
             if (target === 'stdout') stdout += chunk;
@@ -601,23 +689,27 @@ async function runProcess(command, args, { cwd, env, timeoutMs, outputLimit = 25
         child.stderr.setEncoding('utf8');
         child.stdout.on('data', (chunk) => collect('stdout', chunk));
         child.stderr.on('data', (chunk) => collect('stderr', chunk));
+        child.stdout.on('error', terminate);
+        child.stderr.on('error', terminate);
         child.on('error', (error) => {
-            clearTimeout(timer);
-            reject(error);
+            if (terminalError) rejectOnce(terminalError);
+            else rejectOnce(error);
         });
         child.on('close', (code, signal) => {
-            clearTimeout(timer);
+            if (settled) return;
+            clearTimers();
             let resources;
             try {
-                resources = monitor.stop();
+                resources = stopMonitor();
             } catch (error) {
-                reject(error);
+                rejectOnce(error);
                 return;
             }
             if (terminalError) {
-                reject(terminalError);
+                rejectOnce(terminalError);
                 return;
             }
+            settled = true;
             resolve({ code, signal, stdout, stderr, resources });
         });
     });
@@ -629,6 +721,7 @@ function validateMachineRun(run, label) {
     const failures = run.records.filter((record) => record.type === 'FAILURE');
     const files = run.records.filter((record) => record.type === 'FILE');
     const errors = run.records.filter((record) => record.type === 'ERROR');
+    const warnings = run.records.filter((record) => record.type === 'WARNING');
     const issues = [];
     if (run.signal) issues.push(`terminated by ${run.signal}`);
     if (starts.length !== 1) issues.push(`expected one START, got ${starts.length}`);
@@ -640,8 +733,25 @@ function validateMachineRun(run, label) {
         if (completion.fileCount !== files.length) {
             issues.push(`reported ${completion.fileCount} files but emitted ${files.length}`);
         }
+        if (new Set(files.map((record) => record.filename)).size !== files.length) {
+            issues.push('emitted duplicate FILE records');
+        }
         if (completion.errorCount !== errors.length) {
             issues.push(`reported ${completion.errorCount} errors but emitted ${errors.length}`);
+        }
+        if (completion.warningCount !== warnings.length) {
+            issues.push(
+                `reported ${completion.warningCount} warnings but emitted ${warnings.length}`
+            );
+        }
+        const filesWithProblems = new Set(
+            [...errors, ...warnings].map((record) => record.filename.replace(/\\/g, '/'))
+        );
+        if (completion.fileCountWithProblems !== filesWithProblems.size) {
+            issues.push(
+                `reported ${completion.fileCountWithProblems} files with problems but emitted ` +
+                    `diagnostics for ${filesWithProblems.size}`
+            );
         }
         const expectedExit = completion.errorCount ? 1 : 0;
         if (run.code !== expectedExit)
@@ -703,16 +813,13 @@ async function runCheckerOnce(options, packageName, statsPath) {
     run.records = parseMachineOutput(run.stdout, `${packageName} checker`);
     validateMachineRun(run, `${packageName} checker`);
     if (!fs.existsSync(statsPath)) throw new Error(`${packageName} checker did not write stats`);
-    run.stats = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
-    if (
-        run.stats.schemaVersion !== 1 ||
-        run.stats.engine?.packageName !== packageName ||
-        !Number.isSafeInteger(run.stats.materialise?.transformedCount) ||
-        !Number.isSafeInteger(run.stats.materialise?.writtenCount)
-    ) {
-        throw new Error(
-            `${packageName} checker wrote malformed stats: ${JSON.stringify(run.stats)}`
+    try {
+        run.stats = validateCheckerStats(
+            JSON.parse(fs.readFileSync(statsPath, 'utf8')),
+            packageName
         );
+    } catch (error) {
+        throw new Error(`${packageName} checker wrote malformed stats`, { cause: error });
     }
     return run;
 }
@@ -740,6 +847,9 @@ async function runCheckerWarmAcceptance(options, packageName) {
         if (second.stats.materialise.writtenCount !== 0) {
             problems.push(`warm run wrote ${second.stats.materialise.writtenCount} shadows`);
         }
+        if (!second.stats.materialise.cleanup.skipped) {
+            problems.push('warm run repeated cleanup reconciliation');
+        }
         if (firstProtocol !== secondProtocol) {
             problems.push('warm diagnostics/program records were not field-for-field identical');
         }
@@ -764,11 +874,35 @@ async function runCheckerWarmAcceptance(options, packageName) {
             peakRssBytes: run.resources.peakRssBytes,
             stats: run.stats
         });
+        const compactRuns = [compact(first), compact(second)];
         return {
             packageName,
             workspaceRoot,
-            first: compact(first),
-            warm: compact(second),
+            first: compactRuns[0],
+            warm: compactRuns[1],
+            summary: {
+                durationMs: summarize(compactRuns.map((run) => run.durationMs)),
+                cpuMs: summarize(compactRuns.map((run) => run.cpuMs)),
+                peakRssBytes: summarize(compactRuns.map((run) => run.peakRssBytes)),
+                nativeChecks: {
+                    total: compactRuns.length,
+                    perRun: summarize(compactRuns.map(() => 1))
+                },
+                engineVersions: [
+                    ...new Set(
+                        compactRuns.map(
+                            (run) => `${run.stats.engine.packageName}@${run.stats.engine.version}`
+                        )
+                    )
+                ],
+                cacheStates: [...new Set(compactRuns.map((run) => run.stats.cacheState))],
+                materialise: summarizeBatchMaterialiseResults(
+                    compactRuns.map((run) => run.stats.materialise)
+                ),
+                createOverlay: summarizeBatchOverlayCreationTimings(
+                    compactRuns.map((run) => run.stats.phases.createOverlay)
+                )
+            },
             shadowMtimeCount: afterMtimes.size,
             diagnosticsIdentical: true,
             shadowMtimesStable: true
@@ -831,7 +965,47 @@ function printCold(cold) {
     );
     console.log(
         `  native CPU p50 ${native.cpuMs.p50}ms; RSS p95 ${formatBytes(native.peakRssBytes.p95)}; ` +
-            `checks p50 ${native.nativeChecks.p50}; cache ${native.cacheStates.join(',')}`
+            `checks p50 ${native.nativeChecks.p50}; engine ${native.engineVersions.join(',')}; ` +
+            `cache ${native.cacheStates.join(',')}`
+    );
+    console.log(
+        `  editor shadows transformed/reused p50 ${native.transformedShadows.p50}/${native.reusedShadows.p50}; ` +
+            `cleanup ran/skipped p50 ${native.materialisationCleanupRuns.p50}/${native.materialisationCleanupSkips.p50}`
+    );
+}
+
+function printChecker(checker) {
+    const summary = checker.summary;
+    const materialise = summary.materialise;
+    console.log(
+        `  process p50/p95 ${summary.durationMs.p50}/${summary.durationMs.p95}ms; ` +
+            `CPU ${summary.cpuMs.p50}/${summary.cpuMs.p95}ms; ` +
+            `RSS ${formatBytes(summary.peakRssBytes.p50)}/${formatBytes(summary.peakRssBytes.p95)}; ` +
+            `native checks ${summary.nativeChecks.total}; engine ${summary.engineVersions.join(',')}; ` +
+            `cache ${summary.cacheStates.join(',')}`
+    );
+    console.log(
+        `  materialise p50/p95 ${materialise.durationMs.p50}/${materialise.durationMs.p95}ms; ` +
+            `Svelte transformed ${materialise.svelte.transformedCount.p50}/${materialise.svelte.transformedCount.p95}, ` +
+            `reused ${materialise.svelte.reusedCount.p50}/${materialise.svelte.reusedCount.p95}; ` +
+            `source mirrors transformed ${materialise.sourceMirrors.transformedCount.p50}/${materialise.sourceMirrors.transformedCount.p95}, ` +
+            `reused ${materialise.sourceMirrors.reusedCount.p50}/${materialise.sourceMirrors.reusedCount.p95}; ` +
+            `cleanup skipped ${materialise.cleanup.skippedRuns}, ran ${materialise.cleanup.executedRuns}`
+    );
+    for (const phase of BATCH_MATERIALISE_PHASES) {
+        const timing = materialise.phases[phase];
+        console.log(`    ${phase}: p50/p95 ${timing.p50}/${timing.p95}ms`);
+    }
+    console.log('  overlay creation phases:');
+    for (const phase of BATCH_CREATION_PHASES) {
+        const timing = summary.createOverlay[phase];
+        console.log(`    ${phase}: p50/p95 ${timing.p50}/${timing.p95}ms`);
+    }
+    console.log(
+        `  graph dependency mode ${materialise.graph.dependencyScope.modes.join(',')}; ` +
+            `roots p50/p95 ${materialise.graph.dependencyScope.dependencyRoots.p50}/${materialise.graph.dependencyScope.dependencyRoots.p95}; ` +
+            `reachability fallbacks ${materialise.graph.reachabilityFallbackReasons.length}; ` +
+            `collision fallbacks ${materialise.graph.collisionMirrors.fallbackReasons.length}`
     );
 }
 
@@ -923,7 +1097,9 @@ for (const packageName of options.engines) {
 
     if (options.checker) {
         console.log(`\n=== warm incremental checker: ${packageName} ===`);
-        report.checker.push(await runCheckerWarmAcceptance(options, packageName));
+        const checker = await runCheckerWarmAcceptance(options, packageName);
+        report.checker.push(checker);
+        printChecker(checker);
     }
 }
 

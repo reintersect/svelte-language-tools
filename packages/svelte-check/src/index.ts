@@ -6,7 +6,11 @@ import { watch, FSWatcher } from 'chokidar';
 import * as fs from 'fs';
 import { createRequire } from 'module';
 import * as path from 'path';
-import { SvelteCheck, SvelteCheckOptions } from 'svelte-language-server';
+import {
+    isSvelteConfigLoadDiagnostic,
+    SvelteCheck,
+    SvelteCheckOptions
+} from 'svelte-language-server';
 import ts from 'typescript';
 import { Diagnostic, DiagnosticSeverity } from 'vscode-languageserver-protocol';
 import { URI } from 'vscode-uri';
@@ -578,14 +582,6 @@ async function getSvelteDiagnosticsForIncremental(
     cssDiagnosticsByFile: Map<string, Diagnostic[]>;
 }> {
     const sources = opts.diagnosticSources;
-    if (!sources.includes('svelte') && !sources.includes('css')) {
-        return {
-            diagnostics: [],
-            compilerWarningsByFile: new Map(),
-            cssDiagnosticsByFile: new Map()
-        };
-    }
-
     const diagnosticsByFile = new Map<
         string,
         { filePath: string; text: string; diagnostics: Diagnostic[] }
@@ -595,6 +591,15 @@ async function getSvelteDiagnosticsForIncremental(
     const changedFiles = new Set(emitResult.changedFiles);
     const filesNeedingDiagnostics: string[] = [];
     const enabledSources = sources.filter((source) => source !== 'js');
+    const svelteCheck = new SvelteCheck(opts.workspaceUri.fsPath, {
+        compilerWarnings: opts.compilerWarnings,
+        diagnosticSources: enabledSources,
+        configPath: opts.config,
+        watch: false
+    });
+    const configDiagnosticsPromise = svelteCheck.getConfigLoadDiagnostics(
+        emitResult.entries.map((entry) => entry.sourcePath)
+    );
 
     // Phase 1: Partition files into "needs fresh diagnostics" vs "use cached diagnostics"
     for (const entry of emitResult.entries) {
@@ -630,12 +635,6 @@ async function getSvelteDiagnosticsForIncremental(
 
     // Phase 2: Run fresh diagnostics for changed/uncached files via the language server
     if (enabledSources.length && filesNeedingDiagnostics.length > 0) {
-        const svelteCheck = new SvelteCheck(opts.workspaceUri.fsPath, {
-            compilerWarnings: opts.compilerWarnings,
-            diagnosticSources: enabledSources,
-            configPath: opts.config,
-            watch: false
-        });
         await openDocuments(filesNeedingDiagnostics, svelteCheck);
         const runDiagnostics = await svelteCheck.getDiagnostics();
         for (const entry of runDiagnostics) {
@@ -643,7 +642,9 @@ async function getSvelteDiagnosticsForIncremental(
             if (sources.includes('svelte')) {
                 compilerWarningsByFile.set(
                     entry.filePath,
-                    entry.diagnostics.filter((diag) => diag.source === 'svelte')
+                    entry.diagnostics.filter(
+                        (diag) => diag.source === 'svelte' && !isSvelteConfigLoadDiagnostic(diag)
+                    )
                 );
             }
             if (sources.includes('css')) {
@@ -688,6 +689,21 @@ async function getSvelteDiagnosticsForIncremental(
                 diagnostics: []
             });
         }
+    }
+
+    // A config failure is structural, not a Svelte compiler warning. Resolve it on every run,
+    // merge it after cached feature diagnostics, and never persist it in the incremental warning
+    // cache where a later config fix could leave a stale error behind.
+    for (const configEntry of await configDiagnosticsPromise) {
+        const existing = diagnosticsByFile.get(configEntry.filePath) ?? {
+            filePath: configEntry.filePath,
+            text: configEntry.text,
+            diagnostics: []
+        };
+        if (!existing.diagnostics.some(isSvelteConfigLoadDiagnostic)) {
+            existing.diagnostics.push(...configEntry.diagnostics);
+        }
+        diagnosticsByFile.set(configEntry.filePath, existing);
     }
 
     return {
