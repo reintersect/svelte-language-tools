@@ -97,6 +97,9 @@ importers:
         specifier: ~3.1.0
         version: 3.1.0
     devDependencies:
+      '@reintersect/effect-tsgo':
+        specifier: 0.27.3
+        version: 0.27.3
       '@types/estree':
         specifier: ^0.0.42
         version: 0.0.42
@@ -164,6 +167,9 @@ importers:
         specifier: ^1.7.4
         version: 1.8.1
     devDependencies:
+      '@reintersect/effect-tsgo':
+        specifier: 0.27.3
+        version: 0.27.3
       '@rollup/plugin-commonjs':
         specifier: ^24.0.0
         version: 24.1.0(rollup@3.7.5)
@@ -650,6 +656,45 @@ packages:
   '@pkgjs/parseargs@0.11.0':
     resolution: {integrity: sha512-+1VkjdD0QBLPodGrJUeqarH8VAIvQODIbwh9XpP5Syisf7YoQgsJKPNFoqqLQlu+VQ/tVSshMR6loPMn8U+dPg==}
     engines: {node: '>=14'}
+
+  '@reintersect/effect-tsgo-darwin-arm64@0.27.3':
+    resolution: {integrity: sha512-8RYqwXEpfxDqLmqfZY1emmOtBiFWSxaO6ojbLba1rba0YiIOwq7UmifaZBybgfyaQm/URyhrzIgIQSGi9WFUoQ==}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@reintersect/effect-tsgo-darwin-x64@0.27.3':
+    resolution: {integrity: sha512-qfHqrh1I9w50Dx5tiBXOuGFUfUmI2vHQ2S5gWddnnLYVNDl8T/7yHtHikwyGV+rWiDoeWZCUKZtL3exJ25kQgg==}
+    cpu: [x64]
+    os: [darwin]
+
+  '@reintersect/effect-tsgo-linux-arm64@0.27.3':
+    resolution: {integrity: sha512-SYfGgt9YiiKAHrotwZLI1C+PnksVha5zfJpP4SnfOfb34vJWpnCobrRqxwZ+OFwTKEXGBBtqYvnYttkWZZtG3g==}
+    cpu: [arm64]
+    os: [linux]
+
+  '@reintersect/effect-tsgo-linux-arm@0.27.3':
+    resolution: {integrity: sha512-qOk4HWf7TQlV/rvOUsWZBkUuuoRhCqTs/R9ePQ9uutxMXbdjKAI0CMCSBCwvBot+K7mJIh+d0mPYbrwhMJ7bcg==}
+    cpu: [arm]
+    os: [linux]
+
+  '@reintersect/effect-tsgo-linux-x64@0.27.3':
+    resolution: {integrity: sha512-31rWP52abyVBekCGSjq+jhIlQFH6jLhFQSWxFFSayREsndCFnDzUx8w9ivYQQjD9ktCo8KTcG1WwrEgYIMDBsg==}
+    cpu: [x64]
+    os: [linux]
+
+  '@reintersect/effect-tsgo-win32-arm64@0.27.3':
+    resolution: {integrity: sha512-imn7SGRXDh1DlnSVqXbU4Rz893qiodGC3mn0AX2COpnt/duY4OmRXJT08qxBzuLQHIlrLV1CpUnq+a7pW5TJjQ==}
+    cpu: [arm64]
+    os: [win32]
+
+  '@reintersect/effect-tsgo-win32-x64@0.27.3':
+    resolution: {integrity: sha512-AYyZUaOUkOnXZOZLftuLukp80rBJ8d7+xuOUySjAU8UmjFBA4+rhHTfqxJbg/hEWAAmwN1I2bvtT9ee9lxP+jw==}
+    cpu: [x64]
+    os: [win32]
+
+  '@reintersect/effect-tsgo@0.27.3':
+    resolution: {integrity: sha512-iv1y+BDT9IELR2qCDxHmIvoznkDR2fDaQEUJ48RSjjbfdz9jDrUsHfTFdOHJAir/RamjPSWhHL12K62tbJfjCQ==}
+    hasBin: true
 
   '@rollup/plugin-commonjs@24.1.0':
     resolution: {integrity: sha512-eSL45hjhCWI0jCCXcNtLVqM5N1JlBGvlFfY0m6oOYnLCJ6N0qEXoZql4sY2MOUArzhH4SA/qBpTxvvZp2Sc+DQ==}
@@ -2623,6 +2668,37 @@ snapshots:
 
   '@pkgjs/parseargs@0.11.0':
     optional: true
+
+  '@reintersect/effect-tsgo-darwin-arm64@0.27.3':
+    optional: true
+
+  '@reintersect/effect-tsgo-darwin-x64@0.27.3':
+    optional: true
+
+  '@reintersect/effect-tsgo-linux-arm64@0.27.3':
+    optional: true
+
+  '@reintersect/effect-tsgo-linux-arm@0.27.3':
+    optional: true
+
+  '@reintersect/effect-tsgo-linux-x64@0.27.3':
+    optional: true
+
+  '@reintersect/effect-tsgo-win32-arm64@0.27.3':
+    optional: true
+
+  '@reintersect/effect-tsgo-win32-x64@0.27.3':
+    optional: true
+
+  '@reintersect/effect-tsgo@0.27.3':
+    optionalDependencies:
+      '@reintersect/effect-tsgo-darwin-arm64': 0.27.3
+      '@reintersect/effect-tsgo-darwin-x64': 0.27.3
+      '@reintersect/effect-tsgo-linux-arm': 0.27.3
+      '@reintersect/effect-tsgo-linux-arm64': 0.27.3
+      '@reintersect/effect-tsgo-linux-x64': 0.27.3
+      '@reintersect/effect-tsgo-win32-arm64': 0.27.3
+      '@reintersect/effect-tsgo-win32-x64': 0.27.3
 
   '@rollup/plugin-commonjs@24.1.0(rollup@3.7.5)':
     dependencies:
