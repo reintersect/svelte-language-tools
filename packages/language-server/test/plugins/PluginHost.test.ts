@@ -263,6 +263,87 @@ describe('PluginHost', () => {
             );
         });
 
+        it('suppresses only TypeScript diagnostics overlapping a Svelte parser error', async () => {
+            const item = {
+                ...textDocument,
+                text: [
+                    '<svelte:boundary nope={() => {}}>',
+                    '    <p>{value.missing}</p>',
+                    '</svelte:boundary>'
+                ].join('\n')
+            };
+            const compilerError = {
+                range: Range.create(0, 17, 0, 32),
+                severity: DiagnosticSeverity.Error,
+                source: 'svelte',
+                code: 'svelte_boundary_invalid_attribute',
+                codeDescription: {
+                    href: 'https://svelte.dev/docs/svelte/compiler-errors#svelte_boundary_invalid_attribute'
+                },
+                message: 'Valid attributes on `<svelte:boundary>` are `onerror` and `failed`'
+            };
+            const overlappingGeneratedError = {
+                range: Range.create(0, 17, 0, 21),
+                severity: DiagnosticSeverity.Error,
+                source: 'ts',
+                code: 2353,
+                message: "Object literal may only specify known properties, and 'nope' is invalid."
+            };
+            const unrelatedTemplateError = {
+                range: Range.create(1, 14, 1, 21),
+                severity: DiagnosticSeverity.Error,
+                source: 'ts',
+                code: 2339,
+                message: "Property 'missing' does not exist on type '{}'."
+            };
+            const wholeDocumentError = {
+                range: Range.create(0, 0, 2, '</svelte:boundary>'.length),
+                severity: DiagnosticSeverity.Error,
+                source: 'ts',
+                code: 18003,
+                message: 'No inputs were found in config file.'
+            };
+            const docManager = new DocumentManager(
+                (document) => new Document(document.uri, document.text, true)
+            );
+            const pluginHost = new PluginHost(docManager);
+            pluginHost.initialize({
+                definitionLinkSupport: true,
+                filterIncompleteCompletions: false
+            });
+            pluginHost.register({
+                __name: 'svelte',
+                getDiagnostics: () => [compilerError],
+                getDiagnosticsForPullMode: () => ({
+                    kind: 'full' as const,
+                    resultId: 'svelte-1',
+                    items: [compilerError]
+                })
+            });
+            pluginHost.register({
+                __name: 'ts',
+                getDiagnostics: () => [
+                    overlappingGeneratedError,
+                    unrelatedTemplateError,
+                    wholeDocumentError
+                ],
+                getDiagnosticsForPullMode: () => ({
+                    kind: 'full' as const,
+                    resultId: 'ts-1',
+                    items: [overlappingGeneratedError, unrelatedTemplateError, wholeDocumentError]
+                })
+            });
+            docManager.openClientDocument(item);
+
+            const expected = [compilerError, unrelatedTemplateError, wholeDocumentError];
+            assert.deepStrictEqual(await pluginHost.getDiagnostics(item), expected);
+            assert.deepStrictEqual(await pluginHost.getDiagnosticsForPullMode(item, undefined), {
+                kind: 'full',
+                resultId: JSON.stringify({ svelte: 'svelte-1', ts: 'ts-1' }),
+                items: expected
+            });
+        });
+
         it('retains one clean parser fallback when Svelte diagnostics are disabled', async () => {
             const fallback = markSvelteParserError({
                 range: Range.create(0, 7, 0, 8),

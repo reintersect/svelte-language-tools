@@ -557,6 +557,38 @@ function createTemplateFixtureProject(suite, sveltePackage) {
                 `files: ${JSON.stringify(fixtureFiles)}\nexpected: ${JSON.stringify(expectedFiles)}`
         );
     }
+    const diagnosticCorpus = new Set([
+        'semantic',
+        'parser',
+        'mixed',
+        'svelte4',
+        'svelte4-parser'
+    ]).has(suite);
+    for (const entry of expectations.cases) {
+        if (!Array.isArray(entry.diagnostics)) {
+            throw new Error(`${suite} ${entry.file}: malformed diagnostic expectation`);
+        }
+        if (
+            diagnosticCorpus &&
+            !path.basename(entry.file).startsWith('_') &&
+            entry.diagnostics.length === 0
+        ) {
+            throw new Error(
+                `${suite} ${entry.file}: an exercised template case must pin a diagnostic`
+            );
+        }
+        if (
+            (suite === 'parser' || suite === 'svelte4-parser') &&
+            !entry.diagnostics.every(
+                (diagnostic) =>
+                    diagnostic.source === 'svelte' && typeof diagnostic.code === 'string'
+            )
+        ) {
+            throw new Error(
+                `${suite} ${entry.file}: malformed syntax must pin a Svelte parser diagnostic`
+            );
+        }
+    }
     validateExpectedRanges(root, expectations);
     return { root, expectations, expectedFiles };
 }
@@ -797,6 +829,27 @@ function templateCorpus(name, fixture) {
 
 console.log('svelte-check sanity tests\n');
 
+const noisyConfigProject = createProject(
+    'noisy-config',
+    {
+        'src/Comp.svelte': '<script lang="ts">const value: number = 1;</script>{value}',
+        'svelte.config.cjs': [
+            'console.log("config log must not enter machine stdout");',
+            'console.info("config info must not enter machine stdout");',
+            'console.debug("config debug must not enter machine stdout");',
+            'module.exports = {};'
+        ].join('\n')
+    },
+    {
+        compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+        include: ['src/**/*']
+    }
+);
+parity('config console output stays off the machine protocol', {
+    workspace: noisyConfigProject,
+    tsconfig: './tsconfig.json'
+});
+
 test('clean project', {
     workspace: './test-success',
     tsconfig: './tsconfig.json'
@@ -870,6 +923,13 @@ test('project with errors --tsgo', {
     tsconfig: './tsconfig.json',
     tsgo: true,
     errors
+});
+
+parity('project with errors preserves complete diagnostic records', {
+    workspace: './test-error',
+    tsconfig: './tsconfig.json',
+    requireDiagnostic: true,
+    expectedDiagnosticCount: errors.length
 });
 
 console.log('\nclassic ↔ tsgo parity fixtures\n');
@@ -1360,7 +1420,10 @@ parity('explicit Svelte config affects generated component types', {
 
 const invalidUserConfigProject = createProject(
     'invalid-user-config',
-    { 'src/Comp.svelte': '<p>invalid config</p>' },
+    {
+        'src/Comp.svelte':
+            '<p>invalid config</p>\n<style>.must-not-be-checked { color: red; }</style>'
+    },
     {
         compilerOptions: {
             strict: true,
@@ -1373,7 +1436,56 @@ const invalidUserConfigProject = createProject(
 parity('invalid user TypeScript config', {
     workspace: invalidUserConfigProject,
     tsconfig: './tsconfig.json',
-    requireDiagnostic: true
+    requireDiagnostic: true,
+    expectedDiagnosticCount: 1
+});
+
+const missingTypesProject = createProject(
+    'missing-types-global-diagnostic',
+    {
+        'src/Comp.svelte': [
+            '<script lang="ts">',
+            'let value: number = "wrong";',
+            '</script>',
+            '<p>{value}</p>',
+            '<style>.unused { color: red; }</style>'
+        ].join('\n')
+    },
+    {
+        compilerOptions: {
+            strict: true,
+            module: 'esnext',
+            moduleResolution: 'bundler',
+            types: ['definitely-not-installed']
+        },
+        include: ['src/**/*']
+    }
+);
+parity('fileless missing-types diagnostics do not suppress the program or Svelte/CSS', {
+    workspace: missingTypesProject,
+    tsconfig: './tsconfig.json',
+    requireDiagnostic: true,
+    requireRelatedInformation: true,
+    requiredDiagnosticSubstring: 'not assignable to type'
+});
+
+const nativeOnlyConfigProject = createProject(
+    'native-only-config-option',
+    { 'src/Comp.svelte': '<p>TS7 option</p>' },
+    {
+        compilerOptions: {
+            strict: true,
+            module: 'esnext',
+            moduleResolution: 'bundler',
+            deduplicatePackages: true
+        },
+        include: ['src/**/*']
+    }
+);
+test('TS7-valid options are not rejected by the bundled JavaScript TypeScript', {
+    workspace: nativeOnlyConfigProject,
+    tsconfig: './tsconfig.json',
+    tsgo: true
 });
 
 const invalidSvelteConfigProject = createProject(
@@ -1443,12 +1555,26 @@ test('missing tsgo package is a machine FAILURE', {
 const brokenEngineProject = createProject(
     'broken-engine',
     {
-        'src/Comp.svelte': '<script lang="ts">const value = 1;</script>',
+        'src/Comp.svelte': [
+            '<script lang="ts">',
+            'import data from "./data.json";',
+            'const value = data.value;',
+            '</script>',
+            '<p>{value}</p>',
+            '<style>.unused { color: red; }</style>'
+        ].join('\n'),
+        'src/data.json': '{ "value": 1 }',
         'src/plain.ts': 'const target = 1;\n',
         'src/multiline.ts': 'let x = <number>{\n a:1\n};\n'
     },
     {
-        compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler' },
+        compilerOptions: {
+            strict: true,
+            module: 'esnext',
+            moduleResolution: 'bundler',
+            resolveJsonModule: true,
+            allowSyntheticDefaultImports: true
+        },
         include: ['src/**/*']
     }
 );
@@ -1462,17 +1588,122 @@ fs.writeFileSync(
     path.join(fakePackage, 'bin.js'),
     [
         'const fs = require("fs");',
-        'if (!process.argv.includes("--listFilesOnly") || process.argv.includes("--listFiles")) process.exit(9);',
+        'if (!process.argv.includes("--listFilesOnly") || process.argv.includes("--listFiles") || !process.argv.includes("--diagnostics")) process.exit(9);',
         'const config = JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf("-p") + 1], "utf8"));',
-        'console.log(config.files.find((file) => file.endsWith(".svelte.tsx")));'
+        'for (const file of config.files) console.log(file);',
+        'console.log(`Files: ${config.files.length}`);',
+        'console.log("Total time: 0.001s");'
     ].join('\n')
 );
-test('Svelte-only checks ask tsgo for files without type-checking', {
+test('Svelte-only checks ask tsgo for a complete file list without type-checking', {
     workspace: brokenEngineProject,
     tsconfig: './tsconfig.json',
     diagnosticSources: 'svelte',
     tsgo: true,
     env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo' }
+});
+
+fs.writeFileSync(
+    path.join(fakePackage, 'bin.js'),
+    [
+        'const fs = require("fs");',
+        'const path = require("path");',
+        'const config = JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf("-p") + 1], "utf8"));',
+        'const json = path.join(process.cwd(), "src", "data.json");',
+        'console.log(`${json}:1:1 - error TS9999: imported JSON source failure`);',
+        'for (const file of config.files) console.log(file);',
+        'console.log(json);',
+        'console.log("Found 1 error.");',
+        'process.exitCode = 1;'
+    ].join('\n')
+);
+inspect(
+    'imported JSON diagnostics do not masquerade as tsconfig failures',
+    {
+        workspace: brokenEngineProject,
+        tsconfig: './tsconfig.json',
+        tsgo: true,
+        env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo' },
+        status: 1
+    },
+    (records, issues) => {
+        if (
+            !records.some(
+                (record) =>
+                    record.code === 9999 && normalizeFilename(record.filename) === 'src/data.json'
+            )
+        ) {
+            issues.push('expected the imported JSON source diagnostic');
+        }
+        if (
+            !records.some(
+                (record) =>
+                    record.type === 'FILE' &&
+                    normalizeFilename(record.filename) === 'src/Comp.svelte'
+            )
+        ) {
+            issues.push('JSON diagnostic suppressed the Svelte program member');
+        }
+        if (!records.some((record) => record.code === 'css-unused-selector')) {
+            issues.push('JSON diagnostic suppressed Svelte/CSS diagnostics');
+        }
+    }
+);
+
+fs.writeFileSync(
+    path.join(fakePackage, 'bin.js'),
+    [
+        'const fs = require("fs");',
+        'const config = JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf("-p") + 1], "utf8"));',
+        'for (const file of config.files) console.log(file);'
+    ].join('\n')
+);
+test('successful Svelte-only file list without a terminal summary is a machine FAILURE', {
+    workspace: brokenEngineProject,
+    tsconfig: './tsconfig.json',
+    diagnosticSources: 'svelte',
+    tsgo: true,
+    env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo' },
+    status: 1,
+    expectFailure: true,
+    expectCompleted: false
+});
+
+fs.writeFileSync(
+    path.join(fakePackage, 'bin.js'),
+    [
+        'const fs = require("fs");',
+        'const config = JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf("-p") + 1], "utf8"));',
+        'console.log(config.files.find((file) => /\\.svelte\\.[jt]sx$/.test(file)));',
+        'console.log("Found 0 errors.");'
+    ].join('\n')
+);
+test('successful child with a partial program file list is a machine FAILURE', {
+    workspace: brokenEngineProject,
+    tsconfig: './tsconfig.json',
+    tsgo: true,
+    env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo' },
+    status: 1,
+    expectFailure: true,
+    expectCompleted: false
+});
+
+fs.writeFileSync(
+    path.join(fakePackage, 'bin.js'),
+    [
+        'const fs = require("fs");',
+        'const config = JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf("-p") + 1], "utf8"));',
+        'for (const file of config.files) console.log(file);'
+    ].join('\n')
+);
+test('successful type-check with complete roots but no terminal summary is a machine FAILURE', {
+    workspace: brokenEngineProject,
+    tsconfig: './tsconfig.json',
+    tsgo: true,
+    env: { SVELTE_LS_TSGO_PACKAGE: 'fake-tsgo' },
+    status: 1,
+    expectFailure: true,
+    expectCompleted: false
 });
 
 fs.writeFileSync(path.join(fakePackage, 'bin.js'), 'process.exit(7);');
@@ -1509,7 +1740,10 @@ test('nonzero child exit with only warnings is a machine FAILURE', {
 fs.writeFileSync(
     path.join(fakePackage, 'bin.js'),
     [
+        'const fs = require("fs");',
         'const path = require("path");',
+        'const overlay = process.argv[process.argv.indexOf("-p") + 1];',
+        'const config = JSON.parse(fs.readFileSync(overlay, "utf8"));',
         'const file = path.join(process.cwd(), "src", "plain.ts");',
         'console.log(`${file}:1:7 - error TS2769: No overload matches this call.`);',
         "console.log(`  Overload 1 of 2, '(value: string): void', gave the following error.`);",
@@ -1519,7 +1753,7 @@ fs.writeFileSync(
         'console.log();',
         'console.log("1 const target = 1;");',
         'console.log("      ~~~~~");',
-        'console.log(file);',
+        'for (const root of config.files) console.log(root);',
         'console.log("Found 1 error.");',
         'process.exitCode = 1;'
     ].join('\n')
@@ -1568,7 +1802,10 @@ inspect(
 fs.writeFileSync(
     path.join(fakePackage, 'bin.js'),
     [
+        'const fs = require("fs");',
         'const path = require("path");',
+        'const overlay = process.argv[process.argv.indexOf("-p") + 1];',
+        'const config = JSON.parse(fs.readFileSync(overlay, "utf8"));',
         'const file = path.join(process.cwd(), "src", "multiline.ts");',
         'console.log(`${file}:1:9 - error TS2352: Conversion may be a mistake.`);',
         'console.log();',
@@ -1578,7 +1815,7 @@ fs.writeFileSync(
         'console.log("  ~~~~");',
         'console.log("3 };");',
         'console.log("  ~");',
-        'console.log(file);',
+        'for (const root of config.files) console.log(root);',
         'console.log("Found 1 error.");',
         'process.exitCode = 1;'
     ].join('\n')
@@ -1678,7 +1915,7 @@ fs.writeFileSync(
         'const overlay = process.argv[process.argv.indexOf("-p") + 1];',
         'const config = JSON.parse(fs.readFileSync(overlay, "utf8"));',
         'console.log(`${overlay}:1:1 - error TS5023: Unknown compiler option.`);',
-        'console.log(config.files.find((file) => file.endsWith(".svelte.tsx")));',
+        'console.log(config.files.find((file) => /\\.svelte\\.[jt]sx$/.test(file)));',
         'console.log("Found 1 error.");',
         'process.exitCode = 1;'
     ].join('\n')

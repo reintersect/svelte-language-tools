@@ -115,6 +115,41 @@ function notifications(connection: FakeConnection, type: any) {
 }
 
 describe('typescript-go TsGoServer lifecycle', () => {
+    it('advances diagnostic generations only for the edited document project', async () => {
+        const connection = new FakeConnection();
+        const { server } = setup([connection]);
+        const projectA = '/workspace/a/.svelte-kit/tsconfig.json';
+        const projectB = '/workspace/b/.svelte-kit/tsconfig.json';
+        const initialA = server.projectGeneration(projectA);
+        const initialB = server.projectGeneration(projectB);
+        const changed: string[][] = [];
+        const subscription = server.onProjectGenerationChange((keys) => changed.push([...keys]));
+
+        await server.openDocument(
+            '/workspace/a/source.ts',
+            'export const a = 1;',
+            'typescript',
+            projectA
+        );
+        const openedA = server.projectGeneration(projectA);
+        assert.notStrictEqual(openedA, initialA);
+        assert.strictEqual(server.projectGeneration(projectB), initialB);
+
+        await server.updateDocument(
+            '/workspace/a/source.ts',
+            [{ text: 'export const a = 2;' }],
+            'export const a = 2;',
+            'typescript',
+            projectA
+        );
+        assert.notStrictEqual(server.projectGeneration(projectA), openedA);
+        assert.strictEqual(server.projectGeneration(projectB), initialB);
+        assert.deepStrictEqual(changed, [[projectA], [projectA]]);
+
+        subscription.dispose();
+        server.dispose();
+    });
+
     it('registers standard incremental synchronization for every TS-family language id', async () => {
         let params: any;
         const register = sinon.stub().callsFake(async (registrations: any) => {

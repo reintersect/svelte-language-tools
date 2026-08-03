@@ -63,6 +63,29 @@ function readCorpus(suite) {
         `${suite}: duplicate case file`
     );
 
+    for (const entry of expectations.cases) {
+        assert.ok(
+            Array.isArray(entry.diagnostics),
+            `${suite} ${entry.file}: malformed diagnostics`
+        );
+        const supportFile = path.basename(entry.file).startsWith('_');
+        if (!supportFile) {
+            assert.ok(
+                entry.diagnostics.length > 0,
+                `${suite} ${entry.file}: an exercised template case must pin a diagnostic`
+            );
+        }
+        if (suite === 'parser') {
+            assert.ok(
+                entry.diagnostics.every(
+                    (diagnostic) =>
+                        diagnostic.source === 'svelte' && typeof diagnostic.code === 'string'
+                ),
+                `${suite} ${entry.file}: malformed syntax must pin a Svelte parser diagnostic`
+            );
+        }
+    }
+
     return { sourceRoot, expectations };
 }
 
@@ -326,6 +349,12 @@ function assertDiagnosticReport(report, engine, entry, fixture, label = entry.fi
         `${engine} ${label}: missing result id`
     );
     assert.ok(Array.isArray(report.items), `${engine} ${label}: malformed report`);
+    if (entry.diagnostics.length > 0) {
+        assert.ok(
+            report.items.length > 0,
+            `${engine} ${label}: non-empty template oracle produced no diagnostics`
+        );
+    }
     assert.deepStrictEqual(
         actualSignature(report.items, fixture.project),
         expectedSignature(entry, engine),
@@ -509,7 +538,8 @@ async function assertCorpusThroughLsp(suite, expectedTsGoVersion) {
         );
         assert.deepStrictEqual(baseline.engine, {
             packageName: TSGO_PACKAGE,
-            version: expectedTsGoVersion
+            version: expectedTsGoVersion,
+            apiAvailable: true
         });
 
         for (const entry of corpus.expectations.cases) {

@@ -43,7 +43,7 @@ function tsGoConfiguration(config: any = {}, scopeUri?: string) {
     const scopePath = scopeUri ? urlToPath(scopeUri) : undefined;
     const generatedSvelteScope =
         !!scopePath &&
-        /[/\\]node_modules[/\\]\.cache[/\\]svelte-lsp[/\\]svelte[/\\].*\.svelte\.tsx$/i.test(
+        /[/\\]node_modules[/\\]\.cache[/\\]svelte-lsp[/\\]svelte[/\\].*\.svelte\.[jt]sx$/i.test(
             scopePath
         );
     // Only keys with a `config:` path in tsgo's settings unmarshalling are listed — verified
@@ -53,7 +53,7 @@ function tsGoConfiguration(config: any = {}, scopeUri?: string) {
         preferences: {
             ...(config.preferences ?? {}),
             // 'js' would leak a shadow's own extension into inserted imports
-            // (`./Button.svelte.tsx`). Override only generated Svelte requests; real TS/JS
+            // (`./Button.svelte.jsx`/`.tsx`). Override only generated Svelte requests; real TS/JS
             // buffers must retain the user's configured preference.
             ...(generatedSvelteScope ? { importModuleSpecifierEnding: 'index' } : {})
         },
@@ -106,12 +106,14 @@ interface OpenDocumentState {
     languageId: string;
     text: string;
     revision: number;
+    /** Overlay/configured-project identity supplied by the layer which resolved membership. */
+    projectKey?: string;
 }
 
 /**
  * Owns a child `tsgo --lsp` process and speaks LSP to it.
  *
- * Everything crossing this boundary is in *generated* coordinates (offsets into the `.tsx`
+ * Everything crossing this boundary is in *generated* coordinates (offsets into the JSX/TSX
  * shadow), never original `.svelte` coordinates. Mapping happens above this layer, because
  * several Svelte features — the `$store` rename repair in particular — issue requests at
  * synthesized generated offsets that have no original-file counterpart at all.
@@ -139,6 +141,16 @@ export class TsGoServer {
      * checker API session skips its `updateSnapshot` round trip while this hasn't moved.
      */
     private generationCounter = 0;
+    /**
+     * Diagnostics are project-scoped even though transport/features still use the child-wide
+     * generation above. Values come from one monotonic allocator so a document which moves to a
+     * different tsconfig can never accidentally reuse its previous result id.
+     */
+    private diagnosticGenerationCounter = 0;
+    private readonly diagnosticProjectGenerations = new Map<string, number>();
+    private readonly diagnosticProjectGenerationListeners = new Set<
+        (projectKeys: readonly string[]) => void
+    >();
     /** Ignore duplicate/late termination signals (`error` is commonly followed by `exit`). */
     private readonly failedProcesses = new WeakSet<ChildProcess>();
     /** LSConfigManager updates several setting groups synchronously; send one child refresh. */
@@ -163,11 +175,67 @@ export class TsGoServer {
         return this.generationCounter;
     }
 
+    /** Current diagnostic identity for one configured/inferred project. */
+    projectGeneration(projectKey: string): number {
+        let generation = this.diagnosticProjectGenerations.get(projectKey);
+        if (generation === undefined) {
+            generation = ++this.diagnosticGenerationCounter;
+            this.diagnosticProjectGenerations.set(projectKey, generation);
+        }
+        return generation;
+    }
+
+    /**
+     * Invalidate only projects whose membership/inputs the caller has resolved. The server owns
+     * the monotonic identities; the plugin owns the project-membership decision.
+     */
+    noteProjectChanges(projectKeys: Iterable<string>): void {
+        const changed = [...new Set([...projectKeys].filter(Boolean))];
+        if (!changed.length) {
+            return;
+        }
+        for (const projectKey of changed) {
+            this.diagnosticProjectGenerations.set(projectKey, ++this.diagnosticGenerationCounter);
+        }
+        for (const listener of this.diagnosticProjectGenerationListeners) {
+            listener(changed);
+        }
+    }
+
+    /** Conservative fallback for a structural event whose exact consumers cannot be proven. */
+    noteAllProjectsChanged(): void {
+        this.noteProjectChanges(this.diagnosticProjectGenerations.keys());
+    }
+
+    onProjectGenerationChange(listener: (projectKeys: readonly string[]) => void): {
+        dispose(): void;
+    } {
+        this.diagnosticProjectGenerationListeners.add(listener);
+        return {
+            dispose: () => this.diagnosticProjectGenerationListeners.delete(listener)
+        };
+    }
+
     /** Exact native engine selected for this session; exposed to benchmark telemetry. */
-    get engineInfo(): { packageName: string; version: string } {
+    get engineInfo(): {
+        packageName: string;
+        version: string;
+        compilerVersion?: string;
+        compilerGitHead?: string;
+        channel?: 'tsc' | 'tsc-next';
+        apiAvailable: boolean;
+    } {
         return {
             packageName: this.options.engine.packageName,
-            version: this.options.engine.version
+            version: this.options.engine.version,
+            ...(this.options.engine.compilerVersion
+                ? { compilerVersion: this.options.engine.compilerVersion }
+                : {}),
+            ...(this.options.engine.compilerGitHead
+                ? { compilerGitHead: this.options.engine.compilerGitHead }
+                : {}),
+            ...(this.options.engine.channel ? { channel: this.options.engine.channel } : {}),
+            apiAvailable: !!this.options.engine.apiEntry
         };
     }
 
@@ -187,8 +255,13 @@ export class TsGoServer {
     }
 
     /** Record a change tsgo observed outside the didOpen/didChange flow (watched files). */
-    noteExternalChange() {
+    noteExternalChange(projectKeys?: Iterable<string>) {
         this.generationCounter++;
+        if (projectKeys) {
+            this.noteProjectChanges(projectKeys);
+        } else {
+            this.noteAllProjectsChanged();
+        }
     }
 
     private rebuildRegisteredWatchers(): void {
@@ -618,9 +691,14 @@ export class TsGoServer {
      * `declare module '*.svelte'` silently swallows the failure and every import degrades to
      * `any` with no diagnostic at all.
      */
-    async openDocument(filePath: string, text: string, languageId = 'typescriptreact') {
+    async openDocument(
+        filePath: string,
+        text: string,
+        languageId = 'typescriptreact',
+        projectKey?: string
+    ) {
         const uri = pathToUrl(filePath);
-        const revision = this.recordDesiredDocument(uri, languageId, text);
+        const revision = this.recordDesiredDocument(uri, languageId, text, projectKey);
         await this.start();
         if (this.documentRevisions.get(uri) !== revision) {
             return;
@@ -628,24 +706,25 @@ export class TsGoServer {
         const current = this.openDocuments.get(uri);
         if (current) {
             if (current.text === text && current.languageId === languageId) {
-                this.openDocuments.set(uri, { languageId, text, revision });
+                this.openDocuments.set(uri, { languageId, text, revision, projectKey });
                 return;
             }
             if (current.languageId !== languageId) {
-                this.reopenDocument(uri, { languageId, text, revision });
+                this.reopenDocument(uri, { languageId, text, revision, projectKey });
                 return;
             }
-            this.changeDocument(uri, { languageId, text, revision }, [{ text }]);
+            this.changeDocument(uri, { languageId, text, revision, projectKey }, [{ text }]);
             return;
         }
-        this.sendOpenDocument(uri, { languageId, text, revision });
+        this.sendOpenDocument(uri, { languageId, text, revision, projectKey });
     }
 
     async updateDocument(
         filePath: string,
         changes: TextDocumentContentChangeEvent[],
         text: string,
-        languageId?: string
+        languageId?: string,
+        projectKey?: string
     ) {
         const uri = pathToUrl(filePath);
         const resolvedLanguageId =
@@ -653,7 +732,13 @@ export class TsGoServer {
             this.desiredDocuments.get(uri)?.languageId ??
             this.openDocuments.get(uri)?.languageId ??
             'typescriptreact';
-        const revision = this.recordDesiredDocument(uri, resolvedLanguageId, text);
+        const resolvedProjectKey = projectKey ?? this.desiredDocuments.get(uri)?.projectKey;
+        const revision = this.recordDesiredDocument(
+            uri,
+            resolvedLanguageId,
+            text,
+            resolvedProjectKey
+        );
         await this.start();
         if (this.documentRevisions.get(uri) !== revision) {
             return;
@@ -663,7 +748,8 @@ export class TsGoServer {
             this.sendOpenDocument(uri, {
                 languageId: resolvedLanguageId,
                 text,
-                revision
+                revision,
+                projectKey: resolvedProjectKey
             });
             return;
         }
@@ -674,19 +760,26 @@ export class TsGoServer {
                 this.reopenDocument(uri, {
                     languageId: resolvedLanguageId,
                     text,
-                    revision
+                    revision,
+                    projectKey: resolvedProjectKey
                 });
             } else {
                 this.openDocuments.set(uri, {
                     languageId: resolvedLanguageId,
                     text,
-                    revision
+                    revision,
+                    projectKey: resolvedProjectKey
                 });
             }
             return;
         }
         if (current.languageId !== resolvedLanguageId) {
-            this.reopenDocument(uri, { languageId: resolvedLanguageId, text, revision });
+            this.reopenDocument(uri, {
+                languageId: resolvedLanguageId,
+                text,
+                revision,
+                projectKey: resolvedProjectKey
+            });
             return;
         }
         // If an older update was superseded while start() was pending, this incremental range is
@@ -695,7 +788,7 @@ export class TsGoServer {
             current.revision + 1 === revision && changes.length ? changes : [{ text }];
         this.changeDocument(
             uri,
-            { languageId: resolvedLanguageId, text, revision },
+            { languageId: resolvedLanguageId, text, revision, projectKey: resolvedProjectKey },
             contentChanges
         );
     }
@@ -704,7 +797,11 @@ export class TsGoServer {
         const uri = pathToUrl(filePath);
         const revision = (this.documentRevisions.get(uri) ?? 0) + 1;
         this.documentRevisions.set(uri, revision);
+        const desired = this.desiredDocuments.get(uri);
         const wasDesired = this.desiredDocuments.delete(uri);
+        if (wasDesired && desired?.projectKey) {
+            this.noteProjectChanges([desired.projectKey]);
+        }
         if (!this.openDocuments.delete(uri)) {
             if (wasDesired) {
                 this.generationCounter++;
@@ -722,11 +819,29 @@ export class TsGoServer {
         return this.desiredDocuments.has(pathToUrl(filePath));
     }
 
-    private recordDesiredDocument(uri: string, languageId: string, text: string): number {
+    private recordDesiredDocument(
+        uri: string,
+        languageId: string,
+        text: string,
+        projectKey?: string
+    ): number {
+        const previous = this.desiredDocuments.get(uri);
         const revision = (this.documentRevisions.get(uri) ?? 0) + 1;
-        const state = { languageId, text, revision };
+        const state = { languageId, text, revision, projectKey };
         this.documentRevisions.set(uri, revision);
         this.desiredDocuments.set(uri, state);
+        if (
+            !previous ||
+            previous.languageId !== languageId ||
+            previous.text !== text ||
+            previous.projectKey !== projectKey
+        ) {
+            this.noteProjectChanges(
+                [previous?.projectKey, projectKey].filter(
+                    (key): key is string => typeof key === 'string'
+                )
+            );
+        }
         return revision;
     }
 
@@ -767,13 +882,18 @@ export class TsGoServer {
     }
 
     /** Forward outer workspace file events into tsgo's dynamically registered watcher. */
-    async notifyWatchedFiles(changes: FileEvent[]) {
+    async notifyWatchedFiles(changes: FileEvent[], projectKeys?: Iterable<string>) {
         const matching = changes.filter((change) => this.matchesRegisteredWatcher(change));
         if (!matching.length) {
             return;
         }
         await this.start();
         this.generationCounter++;
+        if (projectKeys) {
+            this.noteProjectChanges(projectKeys);
+        } else {
+            this.noteAllProjectsChanged();
+        }
         this.conn.sendNotification(DidChangeWatchedFilesNotification.type, {
             changes: matching
         });
@@ -872,6 +992,8 @@ export class TsGoServer {
         this.versions.clear();
         this.desiredDocuments.clear();
         this.documentRevisions.clear();
+        this.diagnosticProjectGenerations.clear();
+        this.diagnosticProjectGenerationListeners.clear();
     }
 }
 

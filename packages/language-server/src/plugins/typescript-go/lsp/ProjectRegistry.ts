@@ -29,6 +29,8 @@ export interface ProjectRegistryOptions {
         tsconfigPath: string | undefined,
         writeConfig: boolean
     ) => ShadowManager;
+    /** Publish a manager's completed graph to the shared checker/editor plan boundary. */
+    onProjectGraphInputs?: (manager: ShadowManager, inputs: ProjectGraphInputs) => void;
     /**
      * The directories the editor is opened on. Project resolution never leaves them: a tsconfig
      * above the workspace describes someone else's project, and following it once wrote a
@@ -40,10 +42,14 @@ export interface ProjectRegistryOptions {
 }
 
 export interface ProjectGraphInputs {
+    /** Present for a complete serializable BatchGraphPlan, omitted by narrow test doubles. */
+    signature?: string;
     /** Root and extended TypeScript configuration files read for this manager. */
     configInputs: readonly string[];
     /** Existing or absent package manifests consulted while resolving this manager's graph. */
     manifestInputs: readonly string[];
+    /** Ordinary/Svelte sources read while proving the manager's reachable program graph. */
+    sourceInputs?: readonly { path: string }[];
 }
 
 /**
@@ -63,7 +69,12 @@ export class ProjectRegistry implements ShadowLookup {
     private readonly byProjectRoot = new Map<string, ShadowManager>();
     private readonly projectMetadata = new Map<
         ShadowManager,
-        { key: string; projectRoot: string; tsconfigPath: string | undefined }
+        {
+            key: string;
+            projectRoot: string;
+            tsconfigPath: string | undefined;
+            writesConfig: boolean;
+        }
     >();
     /** Resolved tsconfig per containing directory, since the walk hits the filesystem. */
     private readonly tsconfigByDir = new Map<string, string | undefined>();
@@ -81,10 +92,12 @@ export class ProjectRegistry implements ShadowLookup {
     /** Exact graph inputs let watcher invalidation replace consumers, not merely file owners. */
     private readonly graphInputsByManager = new Map<
         ShadowManager,
-        { configInputs: Set<string>; manifestInputs: Set<string> }
+        { configInputs: Set<string>; manifestInputs: Set<string>; sourceInputs: Set<string> }
     >();
     private readonly managersByConfigInput = new Map<string, Set<ShadowManager>>();
     private readonly managersByManifestInput = new Map<string, Set<ShadowManager>>();
+    /** Reachable program ownership, including shared TS/JS sources consumed across packages. */
+    private readonly managersBySourceInput = new Map<string, Set<ShadowManager>>();
 
     constructor(private readonly options: ProjectRegistryOptions) {
         this.workspaceRoots = options.workspaceRoots.map((root) => normalizePath(root));
@@ -93,6 +106,12 @@ export class ProjectRegistry implements ShadowLookup {
     /** Every project opened so far. */
     all(): ShadowManager[] {
         return [...this.byProjectRoot.values()];
+    }
+
+    /** True only while this exact manager generation still owns its project key. */
+    isLive(manager: ShadowManager): boolean {
+        const metadata = this.projectMetadata.get(manager);
+        return !!metadata && this.byProjectRoot.get(metadata.key) === manager;
     }
 
     /**
@@ -135,11 +154,8 @@ export class ProjectRegistry implements ShadowLookup {
                 tsconfigPath ? '' : inferred ? ' (inferred)' : ' (mapping fallback)'
             }`
         );
-        const shadows = this.options.createShadows(
-            projectRoot,
-            tsconfigPath,
-            !!tsconfigPath || inferred
-        );
+        const writesConfig = !!tsconfigPath || inferred;
+        const shadows = this.options.createShadows(projectRoot, tsconfigPath, writesConfig);
         shadows.setReverseIndexRegistrar((shadowPath, originalPath) => {
             const shadow = normalizePath(shadowPath);
             const original = normalizePath(originalPath);
@@ -149,7 +165,7 @@ export class ProjectRegistry implements ShadowLookup {
             this.managersByOriginalPath.set(original, managers);
         });
         this.byProjectRoot.set(key, shadows);
-        this.projectMetadata.set(shadows, { key, projectRoot, tsconfigPath });
+        this.projectMetadata.set(shadows, { key, projectRoot, tsconfigPath, writesConfig });
         return shadows;
     }
 
@@ -182,13 +198,51 @@ export class ProjectRegistry implements ShadowLookup {
         this.forgetProjectGraphInputs(manager);
         const configInputs = new Set(inputs.configInputs.map(normalizePath));
         const manifestInputs = new Set(inputs.manifestInputs.map(normalizePath));
-        this.graphInputsByManager.set(manager, { configInputs, manifestInputs });
+        const sourceInputs = new Set(
+            (inputs.sourceInputs ?? []).map((input) => normalizePath(input.path))
+        );
+        this.graphInputsByManager.set(manager, { configInputs, manifestInputs, sourceInputs });
         for (const input of configInputs) {
             addIndexedManager(this.managersByConfigInput, input, manager);
         }
         for (const input of manifestInputs) {
             addIndexedManager(this.managersByManifestInput, input, manager);
         }
+        for (const input of sourceInputs) {
+            addIndexedManager(this.managersBySourceInput, input, manager);
+        }
+        this.options.onProjectGraphInputs?.(manager, inputs);
+    }
+
+    /**
+     * Every live project whose completed reachability graph consumed this source.
+     *
+     * `undefined` means at least one real configured/inferred project has not published its graph,
+     * so absence from the reverse index is not proof of non-ownership and callers must invalidate
+     * conservatively. Mapping-only fallback managers do not describe a native program and are
+     * deliberately excluded from that completeness check.
+     */
+    consumersForSourceChange(filePath: string): ShadowManager[] | undefined {
+        const exact = [...(this.managersBySourceInput.get(normalizePath(filePath)) ?? [])].filter(
+            (manager) => this.isLive(manager)
+        );
+        // A published edge is already authoritative for every project which could have a stale
+        // diagnostic result. A newly-created owner manager may not have published yet, but it has
+        // not served diagnostics either and the lifecycle path invalidates that nearest owner
+        // independently.
+        if (exact.length) {
+            return exact;
+        }
+        for (const [manager, metadata] of this.projectMetadata) {
+            if (
+                metadata.writesConfig &&
+                this.isLive(manager) &&
+                !this.graphInputsByManager.has(manager)
+            ) {
+                return undefined;
+            }
+        }
+        return exact;
     }
 
     /** Whether this exact path was read as a structural input by a live manager. */
@@ -385,6 +439,9 @@ export class ProjectRegistry implements ShadowLookup {
         }
         for (const input of previous.manifestInputs) {
             removeIndexedManager(this.managersByManifestInput, input, manager);
+        }
+        for (const input of previous.sourceInputs) {
+            removeIndexedManager(this.managersBySourceInput, input, manager);
         }
     }
 

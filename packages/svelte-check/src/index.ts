@@ -501,6 +501,27 @@ function instantiateWriter(opts: SvelteCheckCliOptions): Writer {
     }
 }
 
+/**
+ * Machine output is a line protocol written directly by {@link MachineFriendlyWriter}. Config
+ * modules and framework plugins are ordinary user code, though, and some of them call the global
+ * console while they are imported. Keep those messages observable without letting them become
+ * malformed protocol records on stdout.
+ *
+ * This process is dedicated to one checker invocation (or one watch session), so the routing can
+ * remain installed for its lifetime. Direct writes to stdout are deliberately untouched because
+ * the machine writer owns that stream.
+ */
+export function routeConsoleAwayFromMachineOutput(opts: SvelteCheckCliOptions): void {
+    if (opts.outputFormat !== 'machine' && opts.outputFormat !== 'machine-verbose') {
+        return;
+    }
+
+    const stderr = console.error.bind(console);
+    console.log = stderr;
+    console.info = stderr;
+    console.debug = stderr;
+}
+
 function writeDiagnostics(
     workspaceUri: URI,
     writer: Writer,
@@ -966,6 +987,7 @@ function exitAfterFlush(code: number): void {
 }
 
 parseOptions(async (opts) => {
+    routeConsoleAwayFromMachineOutput(opts);
     const writer = instantiateWriter(opts);
     try {
         const svelteCheckOptions: SvelteCheckOptions = {

@@ -289,4 +289,97 @@ test('accepts the native pretty error-count table but not arbitrary text after i
     );
 });
 
+test('accepts a complete native compiler-diagnostics footer as an exit-0 completion marker', () => {
+    const collector = new NativeCompilerOutputCollector('/work');
+    collector.push(
+        'stdout',
+        [
+            '/work/src/index.ts',
+            'Files:              1',
+            'Lines:           1234',
+            'Memory used:    31157K',
+            'Config time:    0.000s',
+            'Check time:     0.002s',
+            'Total time:     0.020s'
+        ].join('\n') + '\n'
+    );
+
+    const complete = collector.finish();
+    assert.equal(complete.terminalCompletionSeen, true);
+    assert.equal(complete.terminalErrorCount, undefined);
+    assert.deepEqual(complete.files, ['/work/src/index.ts']);
+    assert.equal(complete.terminalFileCount, 1);
+});
+
+test('counts exact bundled standard-library members without exposing them as source files', () => {
+    const collector = new NativeCompilerOutputCollector('/work');
+    collector.push(
+        'stdout',
+        [
+            '/work/src/index.ts:1:1 - error TS9999: complete diagnostic',
+            'bundled:///libs/lib.es5.d.ts',
+            'bundled:///libs/lib.decorators.d.ts',
+            // A repeated virtual member is the same program member, just like a repeated path.
+            'bundled:///libs/lib.es5.d.ts',
+            '/work/src/index.ts',
+            'Files: 3',
+            'Total time: 0.020s'
+        ].join('\n') + '\n'
+    );
+
+    const complete = collector.finish();
+    assert.equal(complete.diagnostics.length, 1, 'virtual members leaked into a diagnostic block');
+    assert.equal(complete.diagnostics[0].message, 'complete diagnostic');
+    assert.deepEqual(complete.files, ['/work/src/index.ts']);
+    assert.deepEqual(complete.bundledFiles, [
+        'bundled:///libs/lib.es5.d.ts',
+        'bundled:///libs/lib.decorators.d.ts'
+    ]);
+    assert.equal(complete.terminalFileCount, 3);
+    assert.equal(complete.terminalCompletionSeen, true);
+});
+
+test('rejects arbitrary bundled URIs and counts missing bundled members as truncation', () => {
+    const malformed = new NativeCompilerOutputCollector('/work');
+    assert.throws(
+        () => malformed.push('stdout', 'bundled:///src/injected.d.ts\n'),
+        /unrecognized output line: bundled:\/\/\/src\/injected\.d\.ts/
+    );
+
+    const truncated = new NativeCompilerOutputCollector('/work');
+    truncated.push(
+        'stdout',
+        [
+            'bundled:///libs/lib.es5.d.ts',
+            '/work/src/index.ts',
+            'Files: 3',
+            'Total time: 0.020s'
+        ].join('\n') + '\n'
+    );
+    assert.throws(
+        () => truncated.finish(),
+        /reported 3 files but 2 complete program members were parsed/
+    );
+});
+
+test('rejects a compiler-diagnostics footer whose file count does not match the list', () => {
+    const collector = new NativeCompilerOutputCollector('/work');
+    collector.push(
+        'stdout',
+        ['/work/src/index.ts', 'Files: 12', 'Total time: 0.020s'].join('\n') + '\n'
+    );
+
+    assert.throws(() => collector.finish(), /reported 12 files but 1 .* were parsed/);
+});
+
+test('rejects a truncated compiler-diagnostics footer', () => {
+    const collector = new NativeCompilerOutputCollector('/work');
+    collector.push(
+        'stdout',
+        ['/work/src/index.ts', 'Files: 12', 'Memory used: 31157K'].join('\n') + '\n'
+    );
+
+    assert.throws(() => collector.finish(), /incomplete compiler-diagnostics footer/);
+});
+
 console.log(`\n${passed} passed, 0 failed`);

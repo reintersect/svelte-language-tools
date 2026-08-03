@@ -17,11 +17,11 @@
 > | editor: keystroke → diagnostics       | 948ms    | **420ms** |
 >
 > These figures predate the current correctness and lifecycle hardening and are historical context,
-> not current performance claims. The post-fix 1 August 2026 acceptance run found editor
-> fresh-process p50/p95 of 6.41s/7.97s classic versus 4.59s/5.40s stock tsgo. A separate strict
-> whole-project checker oracle completed in 17.3s classic versus 6.7s stock. Fail-fast dependency
-> discovery reduced the native adapter phase from roughly 13-17s to 1.45s; a warm checker reused all
-> 663 Svelte shadows in 148ms with zero transforms or writes.
+> not current performance claims. The validated 2 August 2026 Reintersect checker run found an
+> explicit cold-cache tradeoff: after deleting materialisation state, classic took 14.304s, stock
+> tsgo 33.058s, and Effect tsgo 35.044s. The immediate warm rerun took 13.299s classic, 8.205s stock,
+> and 8.240s Effect. Both native warm runs reused 675 shadows with zero transforms or writes, stable
+> shadow mtimes, and diagnostics identical to their corresponding cold run.
 >
 > Focused fixtures are diffed against the classic engine including code, message, severity and full
 > range. That is a tested invariant rather than a universal promise: TypeScript 6 and the evolving
@@ -49,7 +49,7 @@ the flag it behaves exactly like upstream.
 same for every package at once):
 
 ```bash
-pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.6 @reintersect/effect-tsgo
+pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.7 @reintersect/effect-tsgo
 ```
 
 **2. Add `--tsgo` to your check script.** It requires an explicit tsconfig:
@@ -62,11 +62,33 @@ pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.6 @reintersect/effec
 }
 ```
 
-Generated `.tsx` twins land in `node_modules/.cache/svelte-lsp/` in each package that has
-components — already ignored by git and search tools and safe to delete. The implementation uses a
+Generated `.tsx` twins for TypeScript components and `.jsx` twins for JavaScript components land in
+`node_modules/.cache/svelte-lsp/` in each package that has components — already ignored by git and
+search tools and safe to delete. The implementation uses a
 transform/config fingerprint plus source freshness to reuse proven unchanged twins and regenerates
 stale or unproven entries. Treat zero-transform/zero-write warm runs as an acceptance result to
 measure on your project, not a blanket cache guarantee.
+
+### Validated Reintersect checker timings
+
+The 2 August 2026 acceptance measured both a genuinely clean disk cache and its immediate warm
+rerun. Lower is better:
+
+| Checker state                    | Classic TypeScript | Stock tsgo | Effect tsgo |
+| -------------------------------- | -----------------: | ---------: | ----------: |
+| Clean-disk first materialisation |            14.304s |    33.058s |     35.044s |
+| Immediate warm rerun             |            13.299s |     8.205s |      8.240s |
+
+The clean native run is currently substantially slower than classic because it must discover and
+publish the shared project graph as well as materialise shadows. On the warm run, both native
+engines reused all 675 Svelte shadows, performed zero transforms and zero writes, preserved every
+shadow mtime, and returned field-for-field identical diagnostics to their own cold run.
+
+Warm materialisation itself was still about 1.62s. The profile recorded roughly 0.90s for persisted
+plan lookup across 20,510 stat inputs, 0.57s for SvelteKit loading, 0.185s for config loading and
+0.099s for plan restore. Those rounded timings are nested rather than additive; actual source
+freshness checks took only 7-8ms. The next useful optimisation target is therefore project/config
+and plan setup, not retransformation of unchanged components.
 
 **Requirements:** a tsconfig/jsconfig, and `@reintersect/effect-tsgo`, `@typescript/native` or
 `@typescript/native-preview` in the workspace. Commit the lockfile to pin the exact engine you have

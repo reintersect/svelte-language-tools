@@ -1,7 +1,9 @@
 import assert from 'assert';
+import { createHash } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import ts from 'typescript';
 import {
     CallHierarchyItem,
     CancellationTokenSource,
@@ -14,13 +16,205 @@ import { pathToUrl } from '../../../../src/utils';
 import { stub } from 'sinon';
 import {
     findDefaultExportIdentifierOffset,
+    isComponentAttributeNamePosition,
+    isMemberAccessCompletion,
+    nativeSvelteModuleSpecifierAt7016,
     sourceModuleGraphSignature,
     TsGoPlugin
 } from '../../../../src/plugins/typescript-go/lsp/TsGoPlugin';
+import { TsGoServer } from '../../../../src/plugins/typescript-go/lsp/TsGoServer';
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
+function textOffsetAt(source: string, position: { line: number; character: number }): number {
+    let offset = 0;
+    for (let line = 0; line < position.line; line++) {
+        const next = source.indexOf('\n', offset);
+        if (next < 0) {
+            throw new Error(`line ${position.line} is outside test source`);
+        }
+        offset = next + 1;
+    }
+    return offset + position.character;
+}
+
+function applyCompletionEdits(source: string, completion: any): string {
+    const edits = [
+        ...(completion.additionalTextEdits ?? []),
+        ...(completion.textEdit ? [completion.textEdit] : [])
+    ].map((edit: any) => ({ ...edit, range: edit.range ?? edit.replace }));
+    const withOffsets = edits
+        .map((edit: any) => ({
+            ...edit,
+            start: textOffsetAt(source, edit.range.start),
+            end: textOffsetAt(source, edit.range.end)
+        }))
+        .sort((left: any, right: any) => right.start - left.start || right.end - left.end);
+    let result = source;
+    for (const edit of withOffsets) {
+        result = result.slice(0, edit.start) + edit.newText + result.slice(edit.end);
+    }
+    return result;
+}
+
+function nativeCompletionOwner(document: Document, nativeGeneration?: number) {
+    return {
+        __tsgoCompletionOwner: {
+            uri: document.uri,
+            documentVersion: document.version,
+            sourceFingerprint: createHash('sha256')
+                .update(document.getText(), 'utf8')
+                .digest('base64url'),
+            nativeGeneration
+        }
+    };
+}
 
 describe('typescript-go TsGoPlugin helpers', () => {
+    it('classifies real member completions without matching strings, comments or spread syntax', () => {
+        for (const source of ['model.', 'model.va', 'model?.va']) {
+            const text = `<script>${source}</script>`;
+            const document = new Document(
+                pathToUrl('/workspace/Component.svelte'),
+                text,
+                /*skipConfigLoading*/ true
+            );
+            const offset = text.indexOf('</script>');
+            assert.strictEqual(isMemberAccessCompletion(document, text, offset), true, source);
+        }
+        for (const source of [
+            '...',
+            '...rest',
+            '.',
+            '1.',
+            'const value = "model."',
+            '// model.',
+            '/* model. */',
+            'const pattern = /model.va/;',
+            'const pattern = /model.va/u;',
+            'const pattern = /x[}]{1}model.va/;'
+        ]) {
+            const text = `<script>${source}</script>`;
+            const document = new Document(
+                pathToUrl('/workspace/Component.svelte'),
+                text,
+                /*skipConfigLoading*/ true
+            );
+            const lexicalCaret = source.includes('model.')
+                ? text.indexOf('model.') + 'model.'.length
+                : text.indexOf('</script>');
+            assert.strictEqual(
+                isMemberAccessCompletion(document, text, lexicalCaret),
+                false,
+                source
+            );
+        }
+        const template = '<p>{model.va}</p>';
+        const templateDocument = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            template,
+            /*skipConfigLoading*/ true
+        );
+        assert.strictEqual(
+            isMemberAccessCompletion(
+                templateDocument,
+                template,
+                template.indexOf('model.va') + 'model.va'.length
+            ),
+            true
+        );
+        for (const rawMarkup of [
+            '<div title="model.va"></div>',
+            '<Button title="model.va" />',
+            '<!-- model.va -->',
+            '<!-- { model.va -->',
+            '<div title=model.va></div>',
+            '<p>{"{"}</p><div title="model.va"></div>'
+        ]) {
+            const document = new Document(
+                pathToUrl('/workspace/Component.svelte'),
+                rawMarkup,
+                /*skipConfigLoading*/ true
+            );
+            const caret = rawMarkup.indexOf('model.va') + 'model.va'.length;
+            assert.strictEqual(
+                isMemberAccessCompletion(document, rawMarkup, caret),
+                false,
+                rawMarkup
+            );
+        }
+        const nestedTemplate = '<p>{items.map((item) => ({ value: item.va }).value)}</p>';
+        const nestedDocument = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            nestedTemplate,
+            /*skipConfigLoading*/ true
+        );
+        assert.strictEqual(
+            isMemberAccessCompletion(
+                nestedDocument,
+                nestedTemplate,
+                nestedTemplate.indexOf('item.va') + 'item.va'.length
+            ),
+            true
+        );
+        const interpolatedAttribute = '<div title="prefix {model.va}"></div>';
+        const interpolatedDocument = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            interpolatedAttribute,
+            /*skipConfigLoading*/ true
+        );
+        assert.strictEqual(
+            isMemberAccessCompletion(
+                interpolatedDocument,
+                interpolatedAttribute,
+                interpolatedAttribute.indexOf('model.va') + 'model.va'.length
+            ),
+            true,
+            'Svelte expressions inside quoted attributes still need member suggestions'
+        );
+    });
+
+    it('gives component props only attribute-name positions, not attribute expressions', () => {
+        const cases = [
+            { text: '<Button |>', expected: true },
+            { text: '<Button onSel|>', expected: true },
+            { text: '<Button foo= |>', expected: false },
+            { text: '<Button foo = |>', expected: false },
+            { text: '<Button value={model.|}>', expected: false },
+            { text: '<Button value="model.|">', expected: false },
+            { text: '<Button {...model.|}>', expected: false },
+            { text: '<Button value={model} |>', expected: true },
+            { text: '<Button value="model" |>', expected: true },
+            { text: '<Button value=model |>', expected: true },
+            { text: '<Button /|>', expected: false },
+            { text: '<But|>', expected: false }
+        ];
+        for (const testCase of cases) {
+            const offset = testCase.text.indexOf('|');
+            const text = testCase.text.replace('|', '');
+            assert.strictEqual(
+                isComponentAttributeNamePosition(
+                    text,
+                    { start: 0, tag: text.slice(1).match(/^\w+/)![0] },
+                    offset
+                ),
+                testCase.expected,
+                testCase.text
+            );
+        }
+    });
+
     it('finds the Svelte 4 generated default class', () => {
         const text = `
             function $$render() {}
@@ -54,6 +248,109 @@ describe('typescript-go TsGoPlugin helpers', () => {
             findDefaultExportIdentifierOffset('export default createComponent();'),
             undefined
         );
+    });
+
+    it('drops only the native LSP TS7016 for an owned generated JSX module', () => {
+        const generated = [
+            `import Button from './Button.svelte';`,
+            `import plain from './plain.js';`,
+            `const label = './Other.svelte';`
+        ].join('\n');
+        const sourceFile = ts.createSourceFile(
+            'Component.svelte.jsx',
+            generated,
+            ts.ScriptTarget.Latest,
+            true,
+            ts.ScriptKind.JSX
+        );
+        const span = (text: string) => ({ start: generated.indexOf(text), length: text.length });
+        const svelteSpan = span(`'./Button.svelte'`);
+        const jsSpan = span(`'./plain.js'`);
+        const stringSpan = span(`'./Other.svelte'`);
+
+        assert.strictEqual(
+            nativeSvelteModuleSpecifierAt7016(
+                sourceFile,
+                svelteSpan.start,
+                svelteSpan.length,
+                7016
+            ),
+            './Button.svelte'
+        );
+        assert.strictEqual(
+            nativeSvelteModuleSpecifierAt7016(sourceFile, jsSpan.start, jsSpan.length, 7016),
+            undefined,
+            'ordinary JavaScript imports must retain TS7016'
+        );
+        assert.strictEqual(
+            nativeSvelteModuleSpecifierAt7016(
+                sourceFile,
+                stringSpan.start,
+                stringSpan.length,
+                7016
+            ),
+            undefined,
+            'a coincidental .svelte string is not a module specifier'
+        );
+
+        const originalPath = '/workspace/Button.svelte';
+        const shadowPath = '/workspace/node_modules/.cache/svelte-lsp/svelte/src/Button.svelte.jsx';
+        const manager = {};
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {
+                getOriginalPath: (filePath: string) =>
+                    filePath === shadowPath ? originalPath : undefined
+            } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                dispose: () => undefined
+            } as any
+        });
+        (plugin as any).materializedShadowsBySource.set(
+            originalPath,
+            new Map([[manager, new Set([shadowPath])]])
+        );
+        const nativeMessage =
+            `Could not find a declaration file for module './Button.svelte'. ` +
+            `'${shadowPath}' implicitly has an 'any' type.`;
+
+        assert.strictEqual(
+            (plugin as any).isNativeOnlyMaterializedSvelteJs7016(
+                sourceFile,
+                svelteSpan.start,
+                svelteSpan.length,
+                7016,
+                nativeMessage
+            ),
+            true
+        );
+        assert.strictEqual(
+            (plugin as any).isNativeOnlyMaterializedSvelteJs7016(
+                sourceFile,
+                jsSpan.start,
+                jsSpan.length,
+                7016,
+                `Could not find a declaration file for module './plain.js'. ` +
+                    `'/workspace/node_modules/plain/index.js' implicitly has an 'any' type.`
+            ),
+            false
+        );
+        (plugin as any).materializedShadowsBySource.clear();
+        assert.strictEqual(
+            (plugin as any).isNativeOnlyMaterializedSvelteJs7016(
+                sourceFile,
+                svelteSpan.start,
+                svelteSpan.length,
+                7016,
+                nativeMessage
+            ),
+            false,
+            'a stale or foreign generated file must retain TS7016'
+        );
+        plugin.dispose();
     });
 
     it('maps only generated Svelte default-export definitions to the source anchor', () => {
@@ -106,6 +403,52 @@ describe('typescript-go TsGoPlugin helpers', () => {
                 undefined
             );
         }
+    });
+
+    it('deduplicates Svelte 5 component definitions which map to one source anchor', async () => {
+        const sourceRange = {
+            start: { line: 0, character: 1 },
+            end: { line: 0, character: 1 }
+        };
+        const generatedRange = {
+            start: { line: 4, character: 10 },
+            end: { line: 4, character: 34 }
+        };
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {} as any,
+            server: { updateConfiguration: async () => undefined } as any
+        });
+        (plugin as any).requestAt = async () => ({
+            result: [
+                {
+                    targetUri: 'file:///workspace/Child.svelte.tsx',
+                    targetSelectionRange: generatedRange
+                },
+                {
+                    targetUri: 'file:///workspace/Child.svelte.tsx',
+                    targetSelectionRange: generatedRange
+                }
+            ],
+            snapshot: {}
+        });
+        (plugin as any).mapDefinitionTarget = () => ({
+            uri: 'file:///workspace/Child.svelte',
+            range: sourceRange
+        });
+
+        const definitions = await plugin.getDefinitions({} as Document, { line: 0, character: 1 });
+
+        assert.deepStrictEqual(definitions, [
+            {
+                targetUri: 'file:///workspace/Child.svelte',
+                targetRange: sourceRange,
+                targetSelectionRange: sourceRange,
+                originSelectionRange: undefined
+            }
+        ]);
     });
 
     it('closes and evicts a Svelte overlay when the client document closes', async () => {
@@ -178,6 +521,387 @@ describe('typescript-go TsGoPlugin helpers', () => {
         assert.strictEqual(resolvedProject, false);
     });
 
+    it('preserves list-time mapped completion edits through native resolve', async () => {
+        const document = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            '<script>\nconst answer = targ;\n</script>',
+            /*skipConfigLoading*/ true
+        );
+        const position = document.positionAt(document.getText().indexOf('targ') + 4);
+        const textRange = {
+            start: document.positionAt(document.getText().indexOf('targ')),
+            end: position
+        };
+        const importPosition = { line: 1, character: 0 };
+        const snapshot = {
+            scriptInfo: document.scriptInfo,
+            moduleScriptInfo: document.moduleScriptInfo,
+            svelteNodeAt: () => undefined,
+            getGeneratedPosition: () => ({ line: 30, character: 0 }),
+            getOriginalPosition: (generated: { line: number; character: number }) => {
+                if (generated.line === 20) {
+                    return generated.character === 0 ? textRange.start : textRange.end;
+                }
+                if (generated.line === 21) {
+                    return importPosition;
+                }
+                return { line: -1, character: -1 };
+            }
+        };
+        let resolvePayload: any;
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: { ensureSnapshot: () => snapshot } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                sendRequest: async (method: string, payload: any) => {
+                    if (method === 'textDocument/completion') {
+                        return {
+                            isIncomplete: false,
+                            items: [
+                                {
+                                    label: 'target',
+                                    data: { native: 'target' },
+                                    textEdit: {
+                                        range: {
+                                            start: { line: 20, character: 0 },
+                                            end: { line: 20, character: 4 }
+                                        },
+                                        newText: 'target'
+                                    },
+                                    additionalTextEdits: [
+                                        {
+                                            range: {
+                                                start: { line: 21, character: 0 },
+                                                end: { line: 21, character: 0 }
+                                            },
+                                            newText: 'import { helper } from "./helper";\n'
+                                        }
+                                    ]
+                                }
+                            ]
+                        };
+                    }
+                    resolvePayload = payload;
+                    return { documentation: { kind: 'markdown', value: 'resolved' } };
+                }
+            } as any
+        });
+        (plugin as any).syncDocument = async () => ({
+            shadowPath: '/workspace/.overlay/Component.svelte.tsx',
+            snapshot
+        });
+
+        const listed = await plugin.getCompletions(document, position, {
+            triggerKind: CompletionTriggerKind.Invoked
+        });
+        const item = listed!.items[0];
+        assert.deepStrictEqual((item.textEdit as any).range, textRange);
+        assert.deepStrictEqual(item.additionalTextEdits, [
+            {
+                range: { start: importPosition, end: importPosition },
+                newText: 'import { helper } from "./helper";\n'
+            }
+        ]);
+
+        const resolved = await plugin.resolveCompletion(document, item);
+        assert.strictEqual(resolvePayload.data.native, 'target');
+        assert.strictEqual(resolvePayload.textEdit, undefined);
+        assert.strictEqual(resolvePayload.additionalTextEdits, undefined);
+        assert.deepStrictEqual(resolved.textEdit, item.textEdit);
+        assert.deepStrictEqual(resolved.additionalTextEdits, item.additionalTextEdits);
+        assert.strictEqual((resolved.documentation as any).value, 'resolved');
+    });
+
+    it('does not map completion resolve edits after the source changes', async () => {
+        const uri = pathToUrl('/workspace/StaleCompletion.svelte');
+        const documents = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        const document = documents.openClientDocument({
+            uri,
+            text: '<script>const answer = targ;</script>'
+        });
+        const position = document.positionAt(document.getText().indexOf('targ') + 4);
+        const resolveNative = deferred<any>();
+        let resolveStarted = false;
+        let outputMappings = 0;
+        const snapshot = {
+            scriptInfo: document.scriptInfo,
+            moduleScriptInfo: document.moduleScriptInfo,
+            svelteNodeAt: () => undefined,
+            getGeneratedPosition: () => ({ line: 20, character: 4 }),
+            getOriginalPosition: (generated: { line: number; character: number }) => {
+                outputMappings++;
+                return generated;
+            }
+        };
+        const plugin = new TsGoPlugin({
+            docManager: documents,
+            backgroundSyncDelayMs: 60_000,
+            projects: {
+                ensureSnapshot: () => snapshot
+            } as any,
+            server: {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                sendRequest: async (method: string) => {
+                    if (method === 'textDocument/completion') {
+                        return { items: [{ label: 'target', data: { native: true } }] };
+                    }
+                    resolveStarted = true;
+                    return resolveNative.promise;
+                },
+                dispose: () => undefined
+            } as any
+        });
+        (plugin as any).syncDocument = async () => ({
+            document,
+            shadowPath: '/workspace/.overlay/StaleCompletion.svelte.tsx',
+            projectKey: '/workspace/.overlay/tsconfig.json',
+            snapshot
+        });
+
+        const listed = await plugin.getCompletions(document, position, {
+            triggerKind: CompletionTriggerKind.Invoked
+        });
+        const item = listed!.items[0];
+        const pending = plugin.resolveCompletion(document, item);
+        await tick();
+        assert.strictEqual(resolveStarted, true);
+        documents.updateDocument({ uri, version: 2 }, [
+            { text: '<script>const changed = target;</script>' }
+        ]);
+        resolveNative.resolve({
+            textEdit: {
+                range: {
+                    start: { line: 20, character: 0 },
+                    end: { line: 20, character: 4 }
+                },
+                newText: 'target'
+            },
+            additionalTextEdits: [
+                {
+                    range: {
+                        start: { line: 0, character: 0 },
+                        end: { line: 0, character: 0 }
+                    },
+                    newText: 'import { target } from "./target";\n'
+                }
+            ]
+        });
+
+        assert.strictEqual(await pending, item);
+        assert.strictEqual(outputMappings, 0, 'stale resolve reached generated edit mapping');
+        plugin.dispose();
+    });
+
+    it('does not map completion resolve edits after a native restart', async () => {
+        const document = new Document(
+            pathToUrl('/workspace/RestartedCompletion.svelte'),
+            '<script>const answer = targ;</script>',
+            /*skipConfigLoading*/ true
+        );
+        const position = document.positionAt(document.getText().indexOf('targ') + 4);
+        const resolveNative = deferred<any>();
+        let resolveStarted = false;
+        let outputMappings = 0;
+        const snapshot = {
+            scriptInfo: document.scriptInfo,
+            moduleScriptInfo: document.moduleScriptInfo,
+            svelteNodeAt: () => undefined,
+            getGeneratedPosition: () => ({ line: 20, character: 4 }),
+            getOriginalPosition: (position: any) => {
+                outputMappings++;
+                return position;
+            }
+        };
+        const server = {
+            generation: 1,
+            updateConfiguration: async () => undefined,
+            sendRequest: async (method: string) => {
+                if (method === 'textDocument/completion') {
+                    return { items: [{ label: 'target', data: { native: true } }] };
+                }
+                resolveStarted = true;
+                return resolveNative.promise;
+            },
+            dispose: () => undefined
+        };
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: { ensureSnapshot: () => snapshot } as any,
+            server: server as any
+        });
+        (plugin as any).syncDocument = async () => ({
+            document,
+            shadowPath: '/workspace/.overlay/RestartedCompletion.svelte.tsx',
+            projectKey: '/workspace/.overlay/tsconfig.json',
+            snapshot
+        });
+
+        const listed = await plugin.getCompletions(document, position, {
+            triggerKind: CompletionTriggerKind.Invoked
+        });
+        const item = listed!.items[0];
+        const pending = plugin.resolveCompletion(document, item);
+        await tick();
+        assert.strictEqual(resolveStarted, true);
+        server.generation++;
+        resolveNative.resolve({
+            textEdit: {
+                range: {
+                    start: { line: 20, character: 0 },
+                    end: { line: 20, character: 4 }
+                },
+                newText: 'target'
+            }
+        });
+
+        assert.strictEqual(await pending, item);
+        assert.strictEqual(outputMappings, 0);
+        plugin.dispose();
+    });
+
+    it('maps resolved auto-import and replacement edits into an existing script', async () => {
+        const document = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            '<script>\nconst store = writ;\n</script>',
+            /*skipConfigLoading*/ true
+        );
+        const wordStart = document.getText().indexOf('writ');
+        const triggerPosition = document.positionAt(wordStart + 4);
+        const snapshot = {
+            scriptInfo: document.scriptInfo,
+            moduleScriptInfo: document.moduleScriptInfo,
+            getOriginalPosition: (generated: { line: number; character: number }) => {
+                if (generated.line === 20) {
+                    return document.positionAt(wordStart + generated.character);
+                }
+                return { line: -1, character: -1 };
+            }
+        };
+        let resolvePayload: any;
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: { ensureSnapshot: () => snapshot } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                sendRequest: async (_method: string, payload: any) => {
+                    resolvePayload = payload;
+                    return {
+                        textEdit: {
+                            range: {
+                                start: { line: 20, character: 0 },
+                                end: { line: 20, character: 4 }
+                            },
+                            newText: 'writable'
+                        },
+                        additionalTextEdits: [
+                            {
+                                range: {
+                                    start: { line: 0, character: 0 },
+                                    end: { line: 0, character: 0 }
+                                },
+                                newText: 'import { writable } from "svelte/store";\n\n'
+                            }
+                        ]
+                    };
+                }
+            } as any
+        });
+
+        const resolved = await plugin.resolveCompletion(document, {
+            label: 'writable',
+            data: {
+                uri: document.uri,
+                __tsgoData: { native: 'writable' },
+                __tsgoCompletionPosition: triggerPosition,
+                ...nativeCompletionOwner(document)
+            }
+        });
+
+        assert.deepStrictEqual(resolvePayload.data, { native: 'writable' });
+        assert.strictEqual(resolvePayload.textEdit, undefined);
+        const applied = applyCompletionEdits(document.getText(), resolved);
+        assert.strictEqual(
+            applied,
+            '<script>\nimport { writable } from "svelte/store";\n\nconst store = writable;\n</script>'
+        );
+    });
+
+    it('creates the configured script for a resolved template component auto-import', async () => {
+        const document = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            '<But />',
+            /*skipConfigLoading*/ true
+        );
+        const configManager = new LSConfigManager();
+        configManager.update({ svelte: { defaultScriptLanguage: 'ts' } });
+        const triggerPosition = document.positionAt('<But'.length);
+        const snapshot = {
+            scriptInfo: document.scriptInfo,
+            moduleScriptInfo: document.moduleScriptInfo,
+            getOriginalPosition: (generated: { line: number; character: number }) => {
+                if (generated.line === 20) {
+                    return { line: 0, character: generated.character + 1 };
+                }
+                return { line: -1, character: -1 };
+            }
+        };
+        const plugin = new TsGoPlugin({
+            configManager,
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: { ensureSnapshot: () => snapshot } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                sendRequest: async () => ({
+                    textEdit: {
+                        range: {
+                            start: { line: 20, character: 0 },
+                            end: { line: 20, character: 3 }
+                        },
+                        newText: 'Button__SvelteComponent_'
+                    },
+                    additionalTextEdits: [
+                        {
+                            range: {
+                                start: { line: 0, character: 0 },
+                                end: { line: 0, character: 0 }
+                            },
+                            newText:
+                                'import type Button__SvelteComponent_ from "./Button.svelte";\n\n'
+                        }
+                    ]
+                })
+            } as any
+        });
+
+        const resolved = await plugin.resolveCompletion(document, {
+            label: 'Button',
+            data: {
+                uri: document.uri,
+                __tsgoData: { native: 'Button' },
+                __tsgoCompletionPosition: triggerPosition,
+                ...nativeCompletionOwner(document)
+            }
+        });
+        const applied = applyCompletionEdits(document.getText(), resolved);
+
+        assert.strictEqual(
+            applied,
+            '<script lang="ts">\nimport Button from "./Button.svelte";\n\n</script>\n<Button />'
+        );
+    });
+
     it('restarts once for the latest runtime native preference change', async () => {
         const configManager = new LSConfigManager();
         configManager.updateTsJsUserPreferences({
@@ -216,6 +940,45 @@ describe('typescript-go TsGoPlugin helpers', () => {
             1,
             'wrapper-only feature gates must not restart the native child'
         );
+    });
+
+    it('releases document and configuration subscriptions exactly once on dispose', async () => {
+        const uri = pathToUrl('/workspace/Disposed.svelte');
+        const documents = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        const configManager = new LSConfigManager();
+        let restarts = 0;
+        let serverDisposals = 0;
+        let scheduledSynchronizations = 0;
+        const plugin = new TsGoPlugin({
+            configManager,
+            docManager: documents,
+            projects: {} as any,
+            server: {
+                processId: 123,
+                restart: async () => void restarts++,
+                updateConfiguration: async () => undefined,
+                dispose: () => void serverDisposals++
+            } as any
+        });
+        (plugin as any).scheduleBackgroundSvelteSync = () => scheduledSynchronizations++;
+
+        plugin.dispose();
+        plugin.dispose();
+        const document = documents.openClientDocument({ uri, text: '<p>one</p>' });
+        documents.updateDocument({ uri, version: 2 }, [{ text: '<p>two</p>' }]);
+        documents.closeDocument(document.uri);
+        configManager.updateTsJsUserPreferences({
+            typescript: { inlayHints: { parameterNames: { enabled: 'all' } } }
+        } as any);
+        await tick();
+        await (plugin as any).configurationWork;
+
+        assert.strictEqual(scheduledSynchronizations, 0);
+        assert.strictEqual(restarts, 0);
+        assert.strictEqual(serverDisposals, 1);
+        assert.deepStrictEqual((plugin as any).subscriptions, []);
     });
 
     it('routes code-action data through resolve and preserves documentChanges', async () => {
@@ -293,6 +1056,92 @@ describe('typescript-go TsGoPlugin helpers', () => {
         assert.strictEqual(resolved.edit?.changes, undefined);
     });
 
+    it('drops code-action responses when the document changes without cancellation', async () => {
+        const fetchNative = deferred<any[]>();
+        const fetchUri = pathToUrl('/workspace/CodeActionFetch.svelte');
+        const fetchDocuments = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        let fetchStarted = false;
+        const fetchPlugin = new TsGoPlugin({
+            docManager: fetchDocuments,
+            projects: {} as any,
+            server: {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                sendRequest: async () => {
+                    fetchStarted = true;
+                    return fetchNative.promise;
+                },
+                dispose: () => undefined
+            } as any
+        });
+        (fetchPlugin as any).syncDocument = async (document: Document) => ({
+            document,
+            shadowPath: '/workspace/.overlay/CodeActionFetch.svelte.tsx',
+            projectKey: '/workspace/.overlay/tsconfig.json',
+            snapshot: { getGeneratedPosition: (position: any) => position }
+        });
+        const fetchDocument = fetchDocuments.openClientDocument({
+            uri: fetchUri,
+            text: '<script>const value = missing;</script>'
+        });
+        const range = {
+            start: { line: 0, character: 22 },
+            end: { line: 0, character: 29 }
+        };
+
+        const pendingFetch = fetchPlugin.getCodeActions(fetchDocument, range, {
+            diagnostics: []
+        });
+        await tick();
+        assert.strictEqual(fetchStarted, true);
+        fetchDocuments.updateDocument({ uri: fetchUri, version: 2 }, [
+            { text: '<script>const value = fixed;</script>' }
+        ]);
+        fetchNative.resolve([{ title: 'Stale fix', data: { fixId: 'stale' } }]);
+        assert.deepStrictEqual(await pendingFetch, []);
+        fetchPlugin.dispose();
+
+        const resolveNative = deferred<any>();
+        const resolveUri = pathToUrl('/workspace/CodeActionResolve.svelte');
+        const resolveDocuments = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        let resolveStarted = false;
+        const resolvePlugin = new TsGoPlugin({
+            docManager: resolveDocuments,
+            projects: {} as any,
+            server: {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                sendRequest: async () => {
+                    resolveStarted = true;
+                    return resolveNative.promise;
+                },
+                dispose: () => undefined
+            } as any
+        });
+        const resolveDocument = resolveDocuments.openClientDocument({
+            uri: resolveUri,
+            text: '<script>const value = missing;</script>'
+        });
+        const staleAction = {
+            title: 'Resolve me',
+            data: { uri: resolveUri, __tsgoData: { fixId: 'stale' } }
+        } as any;
+
+        const pendingResolve = resolvePlugin.resolveCodeAction(resolveDocument, staleAction);
+        await tick();
+        assert.strictEqual(resolveStarted, true);
+        resolveDocuments.updateDocument({ uri: resolveUri, version: 2 }, [
+            { text: '<script>const value = fixed;</script>' }
+        ]);
+        resolveNative.resolve({ title: 'Stale resolved fix' });
+        assert.strictEqual(await pendingResolve, staleAction);
+        resolvePlugin.dispose();
+    });
+
     it('does not send unsupported markup completion triggers to tsgo', async () => {
         const plugin = new TsGoPlugin({
             docManager: new DocumentManager(
@@ -352,6 +1201,78 @@ describe('typescript-go TsGoPlugin helpers', () => {
         );
     });
 
+    it('does not synchronise quoted markup or comments for invoked completion', async () => {
+        for (const source of [
+            '<div title="foo|"></div>',
+            '<div class="foo|"></div>',
+            '<div title=foo|></div>',
+            '<!-- foo| -->'
+        ]) {
+            const plugin = new TsGoPlugin({
+                docManager: new DocumentManager(
+                    (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+                ),
+                projects: {} as any,
+                server: { updateConfiguration: async () => undefined } as any
+            });
+            let syncs = 0;
+            (plugin as any).syncDocument = async () => {
+                syncs++;
+                return null;
+            };
+            const offset = source.indexOf('|');
+            const text = source.replace('|', '');
+            const document = new Document(
+                pathToUrl('/workspace/Component.svelte'),
+                text,
+                /*skipConfigLoading*/ true
+            );
+
+            assert.strictEqual(
+                await plugin.getCompletions(document, document.positionAt(offset), {
+                    triggerKind: CompletionTriggerKind.Invoked
+                }),
+                null
+            );
+            assert.strictEqual(syncs, 0, source);
+        }
+    });
+
+    it('does not mistake comparison or arrow syntax for plain template markup', async () => {
+        for (const testCase of [
+            { text: '<p>{foo > ba}</p>', caret: 'ba}' },
+            { text: '<p>{items.map((item) => item.va)}</p>', caret: 'va)' },
+            { text: '<div title="prefix {model.va}"></div>', caret: 'va}' }
+        ]) {
+            const plugin = new TsGoPlugin({
+                docManager: new DocumentManager(
+                    (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+                ),
+                projects: {} as any,
+                server: { updateConfiguration: async () => undefined } as any
+            });
+            let syncs = 0;
+            (plugin as any).syncDocument = async () => {
+                syncs++;
+                return null;
+            };
+            const document = new Document(
+                pathToUrl('/workspace/Component.svelte'),
+                testCase.text,
+                /*skipConfigLoading*/ true
+            );
+            const caret = testCase.text.indexOf(testCase.caret) + 2;
+
+            assert.strictEqual(
+                await plugin.getCompletions(document, document.positionAt(caret), {
+                    triggerKind: CompletionTriggerKind.Invoked
+                }),
+                null
+            );
+            assert.strictEqual(syncs, 1, testCase.text);
+        }
+    });
+
     it('does not start tsgo for completion inside a style block', async () => {
         const plugin = new TsGoPlugin({
             docManager: new DocumentManager(
@@ -379,6 +1300,720 @@ describe('typescript-go TsGoPlugin helpers', () => {
         );
     });
 
+    it('serves member completions through the attached checker without an LSP request', async () => {
+        const document = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            '<script>const model = { value: 1 }; model.va</script>',
+            /*skipConfigLoading*/ true
+        );
+        const position = document.positionAt(document.getText().indexOf('model.va') + 8);
+        let apiOffset: number | undefined;
+        const nativeMethods: string[] = [];
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {} as any,
+            apiSession: {
+                available: true,
+                getCompletionsAtPosition: async (_fileName: string, offset: number) => {
+                    apiOffset = offset;
+                    return {
+                        isIncomplete: false,
+                        entries: [
+                            {
+                                name: 'value',
+                                kind: 10,
+                                sortText: '11',
+                                detail: '(property) value: number'
+                            }
+                        ]
+                    };
+                }
+            } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                sendRequest: async (method: string) => {
+                    nativeMethods.push(method);
+                    if (method === 'textDocument/completion') {
+                        return {
+                            isIncomplete: false,
+                            items: [
+                                {
+                                    label: 'value',
+                                    kind: 10,
+                                    sortText: '11',
+                                    data: { native: true }
+                                }
+                            ]
+                        };
+                    }
+                    if (method === 'completionItem/resolve') {
+                        return {
+                            label: 'value',
+                            kind: 10,
+                            documentation: { kind: 'markdown', value: 'Resolved docs' }
+                        };
+                    }
+                    throw new Error(`unexpected native request: ${method}`);
+                }
+            } as any
+        });
+        (plugin as any).syncDocument = async () => ({
+            shadowPath: '/workspace/.overlay/Component.svelte.tsx',
+            snapshot: {
+                scriptInfo: document.scriptInfo,
+                moduleScriptInfo: document.moduleScriptInfo,
+                svelteNodeAt: () => undefined,
+                getGeneratedPosition: () => position,
+                offsetAt: () => 42
+            }
+        });
+
+        const result = await plugin.getCompletions(document, position, {
+            triggerKind: CompletionTriggerKind.Invoked
+        });
+
+        assert.strictEqual(apiOffset, 42);
+        assert.deepStrictEqual(
+            result?.items.map((item) => item.label),
+            ['value']
+        );
+        assert.deepStrictEqual(result?.items[0].commitCharacters, ['.', ',', ';', '(']);
+        assert.strictEqual(plugin.stats.completionApiHits, 1);
+        assert.deepStrictEqual(nativeMethods, []);
+        const resolved = await plugin.resolveCompletion(document, result!.items[0]);
+        assert.strictEqual(resolved.detail, '(property) value: number');
+        assert.deepStrictEqual(nativeMethods, []);
+    });
+
+    it('drops checker member completions when another file advances the native generation', async () => {
+        const document = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            '<script>const model = { value: 1 }; model.va</script>',
+            /*skipConfigLoading*/ true
+        );
+        const position = document.positionAt(document.getText().indexOf('model.va') + 8);
+        const checkerStarted = deferred<void>();
+        const checkerResult = deferred<any>();
+        let generation = 1;
+        let nativeRequests = 0;
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {} as any,
+            apiSession: {
+                available: true,
+                getCompletionsAtPosition: async () => {
+                    checkerStarted.resolve();
+                    return checkerResult.promise;
+                }
+            } as any,
+            server: {
+                get generation() {
+                    return generation;
+                },
+                updateConfiguration: async () => undefined,
+                dispose: () => undefined,
+                sendRequest: async () => {
+                    nativeRequests++;
+                    return { isIncomplete: false, items: [{ label: 'new-generation' }] };
+                }
+            } as any
+        });
+        (plugin as any).syncDocument = async () => ({
+            shadowPath: '/workspace/.overlay/Component.svelte.tsx',
+            snapshot: {
+                scriptInfo: document.scriptInfo,
+                moduleScriptInfo: document.moduleScriptInfo,
+                svelteNodeAt: () => undefined,
+                getGeneratedPosition: () => position,
+                offsetAt: () => 42
+            }
+        });
+
+        const pending = plugin.getCompletions(document, position, {
+            triggerKind: CompletionTriggerKind.Invoked
+        });
+        await checkerStarted.promise;
+        // Models an imported TS/Svelte edit: the requesting buffer is unchanged, but its member
+        // type can have changed and the leased checker snapshot is no longer authoritative.
+        generation = 2;
+        checkerResult.resolve({
+            isIncomplete: false,
+            entries: [{ name: 'value', kind: 10, sortText: '11' }],
+            timings: { projectMs: 1, checkerMs: 1 }
+        });
+
+        assert.strictEqual(await pending, null);
+        assert.strictEqual(nativeRequests, 0, 'must not continue with the old mapped snapshot');
+        assert.strictEqual(plugin.stats.completionApiHits, 0);
+        plugin.dispose();
+    });
+
+    it('falls back to LSP when the checker has no member completions', async () => {
+        const document = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            '<script>value.missing</script>',
+            /*skipConfigLoading*/ true
+        );
+        const position = document.positionAt(document.getText().indexOf('missing') + 7);
+        let nativeRequests = 0;
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {} as any,
+            apiSession: {
+                available: true,
+                getCompletionsAtPosition: async () => ({ isIncomplete: false, entries: [] })
+            } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                sendRequest: async () => {
+                    nativeRequests++;
+                    return { isIncomplete: false, items: [{ label: 'fallback' }] };
+                }
+            } as any
+        });
+        (plugin as any).syncDocument = async () => ({
+            shadowPath: '/workspace/.overlay/Component.svelte.tsx',
+            snapshot: {
+                scriptInfo: document.scriptInfo,
+                moduleScriptInfo: document.moduleScriptInfo,
+                svelteNodeAt: () => undefined,
+                getGeneratedPosition: () => position,
+                offsetAt: () => 42
+            }
+        });
+
+        const result = await plugin.getCompletions(document, position, {
+            triggerKind: CompletionTriggerKind.Invoked
+        });
+
+        assert.deepStrictEqual(
+            result?.items.map((item) => item.label),
+            ['fallback']
+        );
+        assert.strictEqual(plugin.stats.completionApiFallbacks, 1);
+        assert.strictEqual(nativeRequests, 1);
+    });
+
+    it('filters huge component globals only at attribute-name whitespace', async () => {
+        const cases = [
+            { text: '<But>', caret: '<But'.length, filtered: false },
+            {
+                text: '<Unknown value={glob}>',
+                caret: '<Unknown value={glob'.length,
+                filtered: false
+            },
+            { text: '<Unknown  >', caret: '<Unknown '.length, filtered: true }
+        ];
+        for (const testCase of cases) {
+            const document = new Document(
+                pathToUrl('/workspace/Component.svelte'),
+                testCase.text,
+                /*skipConfigLoading*/ true
+            );
+            const position = document.positionAt(testCase.caret);
+            const plugin = new TsGoPlugin({
+                docManager: new DocumentManager(
+                    (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+                ),
+                projects: {} as any,
+                componentInfo: { getProps: async () => [] } as any,
+                server: {
+                    updateConfiguration: async () => undefined,
+                    sendRequest: async () => ({
+                        isIncomplete: false,
+                        items: Array.from({ length: 501 }, (_, index) => ({
+                            label: `global${index}`,
+                            kind: 3
+                        }))
+                    })
+                } as any
+            });
+            (plugin as any).componentOffsetAt = () => ({ offset: 1, tag: 'Unknown' });
+            (plugin as any).syncDocument = async () => ({
+                shadowPath: '/workspace/.overlay/Component.svelte.tsx',
+                snapshot: {
+                    svelteNodeAt: () => ({ type: 'InlineComponent' }),
+                    getGeneratedPosition: () => position,
+                    offsetAt: () => 1
+                }
+            });
+
+            const result = await plugin.getCompletions(document, position, {
+                triggerKind: CompletionTriggerKind.Invoked
+            });
+            assert.strictEqual(
+                result === null,
+                testCase.filtered,
+                `unexpected filtering for ${testCase.text}`
+            );
+        }
+    });
+
+    it('holds background work until every concurrent completion lease releases', async () => {
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {} as any,
+            server: { updateConfiguration: async () => undefined, dispose: () => undefined } as any
+        });
+        const releaseFirst = plugin.acquireCompletionPriority();
+        const releaseSecond = plugin.acquireCompletionPriority();
+        let permitted = false;
+        const waiting = (plugin as any).awaitBackgroundPermit().then(() => void (permitted = true));
+
+        await tick();
+        assert.strictEqual(permitted, false);
+        releaseFirst();
+        await tick();
+        assert.strictEqual(permitted, false);
+        releaseSecond();
+        await waiting;
+        assert.strictEqual(permitted, true);
+        plugin.dispose();
+    });
+
+    it('lets completion priority preempt a newly dirty first overlay', async () => {
+        const uri = pathToUrl('/workspace/DirtyPriority.svelte');
+        const filePath = '/workspace/DirtyPriority.svelte';
+        const documents = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        let synchronizations = 0;
+        const plugin = new TsGoPlugin({
+            docManager: documents,
+            backgroundSyncDelayMs: 60_000,
+            projects: {} as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                dispose: () => undefined
+            } as any
+        });
+        (plugin as any).syncDocumentNow = async () => {
+            synchronizations++;
+            return null;
+        };
+
+        const document = documents.openClientDocument({ uri, text: '<p>saved</p>' });
+        documents.updateDocument({ uri, version: 2 }, [{ text: '<p>dirty</p>' }]);
+        const release = plugin.acquireCompletionPriority(document);
+        await tick();
+        await tick();
+        assert.strictEqual(synchronizations, 0, 'dirty overlay overtook foreground completion');
+
+        release();
+        await (plugin as any).svelteLifecycle.get(filePath);
+        assert.strictEqual(synchronizations, 1);
+        plugin.dispose();
+    });
+
+    it('lets an immediate completion outrun delayed first-project synchronization', async () => {
+        const uri = pathToUrl('/workspace/Component.svelte');
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        const plugin = new TsGoPlugin({
+            docManager,
+            backgroundSyncDelayMs: 10,
+            projects: {} as any,
+            server: { updateConfiguration: async () => undefined, dispose: () => undefined } as any
+        });
+        let syncs = 0;
+        (plugin as any).syncDocument = async () => {
+            syncs++;
+            return null;
+        };
+
+        const document = docManager.openClientDocument({ uri, text: '<p>{model.va}</p>' });
+        const release = plugin.acquireCompletionPriority(document);
+        await wait(25);
+        assert.strictEqual(syncs, 0, 'didOpen graph work overtook the completion');
+        release();
+        await wait(10);
+        assert.strictEqual(syncs, 1);
+        plugin.dispose();
+    });
+
+    it('cancels a delayed first-project synchronization when the document closes', async () => {
+        const uri = pathToUrl('/workspace/Component.svelte');
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        const plugin = new TsGoPlugin({
+            docManager,
+            backgroundSyncDelayMs: 10,
+            projects: {} as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                closeDocument: async () => undefined,
+                dispose: () => undefined
+            } as any
+        });
+        let syncs = 0;
+        (plugin as any).syncDocument = async () => {
+            syncs++;
+            return null;
+        };
+
+        docManager.openClientDocument({ uri, text: '<p />' });
+        docManager.closeDocument(uri);
+        await wait(25);
+        assert.strictEqual(syncs, 0);
+        plugin.dispose();
+    });
+
+    it('pauses a materialization pass at its next time-budget yield for completion', async () => {
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        const plugin = new TsGoPlugin({
+            docManager,
+            projects: {} as any,
+            server: { updateConfiguration: async () => undefined, dispose: () => undefined } as any
+        });
+        let release!: () => void;
+        let freshnessChecks = 0;
+        const manager = {
+            sourceRoot: '/workspace',
+            findProjectSvelteFiles: () => ['/workspace/First.svelte', '/workspace/Second.svelte'],
+            findDependencySvelteFiles: () => [],
+            getShadowPath: (filePath: string) => `${filePath}.tsx`,
+            isShadowFresh: () => {
+                freshnessChecks++;
+                if (freshnessChecks === 1) {
+                    release = plugin.acquireCompletionPriority();
+                }
+                return true;
+            },
+            deleteSnapshot: () => undefined,
+            pruneOrphanedShadows: () => undefined,
+            commitFingerprints: () => undefined
+        };
+        let settled = false;
+        const materializing = (plugin as any)
+            .materializeProject(manager, () => undefined)
+            .finally(() => void (settled = true));
+
+        await tick();
+        await tick();
+        assert.strictEqual(freshnessChecks, 1);
+        assert.strictEqual(settled, false);
+        release();
+        await materializing;
+        assert.strictEqual(freshnessChecks, 2);
+        plugin.dispose();
+    });
+
+    it('coalesces eager and feature sync for the same Svelte buffer revision', async () => {
+        const uri = pathToUrl('/workspace/Component.svelte');
+        const shadowPath = '/workspace/.overlay/Component.svelte.tsx';
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        let releaseProject!: () => void;
+        const projectReady = new Promise<void>((resolve) => (releaseProject = resolve));
+        let transforms = 0;
+        let openText: string | undefined;
+        const shadows = {
+            overlayTsconfigPath: '/workspace/.overlay/tsconfig.json',
+            getShadowPath: () => shadowPath,
+            transform: (current: Document) => {
+                transforms++;
+                return { getFullText: () => `generated:${current.getText()}` };
+            },
+            ensureShadowDirectory: () => undefined
+        };
+        const plugin = new TsGoPlugin({
+            docManager,
+            backgroundSyncDelayMs: 0,
+            projects: { forFile: () => shadows } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                getOpenText: () => openText,
+                isOpen: () => openText !== undefined,
+                openDocument: async (_fileName: string, text: string) => void (openText = text),
+                updateDocument: async (_fileName: string, _changes: any, text: string) =>
+                    void (openText = text)
+            } as any
+        });
+        (plugin as any).ensureProjectOpened = async () => projectReady;
+
+        const document = docManager.openClientDocument({ uri, text: '<p>{value}</p>' });
+        const featureSync = (plugin as any).syncDocument(document);
+        releaseProject();
+        await featureSync;
+        await (plugin as any).svelteLifecycle.get('/workspace/Component.svelte');
+        await (plugin as any).syncDocument(document);
+
+        assert.strictEqual(transforms, 1);
+        assert.ok(plugin.stats.syncCoalesced >= 1);
+        assert.ok(plugin.stats.syncReused >= 1);
+    });
+
+    it('warms the checker only after the first pull response has reached an idle turn', async () => {
+        const uri = pathToUrl('/workspace/Component.svelte');
+        const filePath = '/workspace/Component.svelte';
+        const shadowPath = '/workspace/.overlay/Component.svelte.tsx';
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        let openText: string | undefined;
+        let warmCalls = 0;
+        let releaseWarm!: () => void;
+        const warmBlocked = new Promise<void>((resolve) => (releaseWarm = resolve));
+        let diagnosticsStarted!: () => void;
+        const diagnosticRunning = new Promise<void>((resolve) => (diagnosticsStarted = resolve));
+        let releaseDiagnostics!: () => void;
+        const diagnosticsBlocked = new Promise<void>((resolve) => (releaseDiagnostics = resolve));
+        const shadows = {
+            overlayTsconfigPath: '/workspace/.overlay/tsconfig.json',
+            getShadowPath: () => shadowPath,
+            transform: (current: Document) => ({
+                getFullText: () => `generated:${current.getText()}`
+            }),
+            ensureShadowDirectory: () => undefined,
+            pinSnapshot: () => undefined,
+            unpinSnapshot: () => undefined,
+            deleteSnapshot: () => undefined
+        };
+        const plugin = new TsGoPlugin({
+            docManager,
+            backgroundSyncDelayMs: 0,
+            projects: { forFile: () => shadows } as any,
+            apiSession: {
+                available: true,
+                warmProjectForFile: async (fileName: string) => {
+                    assert.strictEqual(fileName, shadowPath);
+                    warmCalls++;
+                    await warmBlocked;
+                    return true;
+                }
+            } as any,
+            server: {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                getOpenText: () => openText,
+                isOpen: () => openText !== undefined,
+                openDocument: async (_fileName: string, value: string) => void (openText = value),
+                updateDocument: async (_fileName: string, _changes: any, value: string) =>
+                    void (openText = value),
+                closeDocument: async () => void (openText = undefined)
+            } as any
+        });
+        (plugin as any).ensureProjectOpened = async () => undefined;
+        (plugin as any).collectDiagnosticsSingleFlight = async () => {
+            diagnosticsStarted();
+            await diagnosticsBlocked;
+            return [];
+        };
+
+        const document = docManager.openClientDocument({ uri, text: '<p>{value}</p>' });
+        await (plugin as any).svelteLifecycle.get(filePath);
+        await tick();
+        assert.strictEqual(warmCalls, 0, 'didOpen started checker API warmup');
+
+        const firstPull = plugin.getDiagnosticsForPullMode(document);
+        await diagnosticRunning;
+        assert.strictEqual(warmCalls, 0, 'checker API warmup contended with first diagnostics');
+        releaseDiagnostics();
+        assert.deepStrictEqual(await firstPull, { kind: 'full', resultId: 'g1', items: [] });
+        assert.strictEqual(
+            warmCalls,
+            0,
+            'checker API warmup ran before the pull response returned'
+        );
+        await tick();
+        assert.strictEqual(warmCalls, 1, 'post-response idle did not warm the checker API');
+
+        docManager.closeDocument(uri);
+        await (plugin as any).svelteLifecycle.get(filePath);
+        assert.strictEqual(openText, undefined, 'close waited for the background checker warmup');
+
+        const reopened = docManager.openClientDocument({ uri, text: '<p>{next}</p>' });
+        await (plugin as any).svelteLifecycle.get(filePath);
+        await plugin.getDiagnosticsForPullMode(reopened);
+        await tick();
+        assert.strictEqual(warmCalls, 1, 'same project was warmed more than once');
+        releaseWarm();
+        await tick();
+    });
+
+    it('does not start a stale checker warmup after the document closes', async () => {
+        const uri = pathToUrl('/workspace/Component.svelte');
+        const filePath = '/workspace/Component.svelte';
+        const shadowPath = '/workspace/.overlay/Component.svelte.tsx';
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        let openText: string | undefined;
+        let warmCalls = 0;
+        const shadows = {
+            overlayTsconfigPath: '/workspace/.overlay/tsconfig.json',
+            getShadowPath: () => shadowPath,
+            transform: (current: Document) => ({
+                getFullText: () => `generated:${current.getText()}`
+            }),
+            ensureShadowDirectory: () => undefined,
+            unpinSnapshot: () => undefined,
+            deleteSnapshot: () => undefined
+        };
+        const plugin = new TsGoPlugin({
+            docManager,
+            backgroundSyncDelayMs: 0,
+            projects: { forFile: () => shadows } as any,
+            apiSession: {
+                available: true,
+                warmProjectForFile: async () => {
+                    warmCalls++;
+                    return true;
+                }
+            } as any,
+            server: {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                getOpenText: () => openText,
+                isOpen: () => openText !== undefined,
+                openDocument: async (_fileName: string, value: string) => void (openText = value),
+                updateDocument: async (_fileName: string, _changes: any, value: string) =>
+                    void (openText = value),
+                closeDocument: async () => void (openText = undefined)
+            } as any
+        });
+        (plugin as any).ensureProjectOpened = async () => undefined;
+        (plugin as any).collectDiagnosticsSingleFlight = async () => [];
+
+        const document = docManager.openClientDocument({ uri, text: '<p>{value}</p>' });
+        await (plugin as any).svelteLifecycle.get(filePath);
+        await plugin.getDiagnosticsForPullMode(document);
+        assert.strictEqual(warmCalls, 0, 'warmup ran before the pull response returned');
+        docManager.closeDocument(uri);
+        await tick();
+        await (plugin as any).svelteLifecycle.get(filePath);
+        await tick();
+
+        assert.strictEqual(warmCalls, 0);
+    });
+
+    it('serves an immediate component feature before any diagnostic-triggered warmup', async () => {
+        const document = new Document(
+            pathToUrl('/workspace/Component.svelte'),
+            '<Button >',
+            /*skipConfigLoading*/ true
+        );
+        const position = document.positionAt('<Button '.length);
+        let propsCalls = 0;
+        let backgroundWarmCalls = 0;
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {} as any,
+            apiSession: {
+                available: true,
+                warmProjectForFile: async () => {
+                    backgroundWarmCalls++;
+                    return true;
+                }
+            } as any,
+            componentInfo: {
+                getProps: async () => {
+                    propsCalls++;
+                    return [{ name: 'label', type: 'string' }];
+                }
+            } as any,
+            server: {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                sendRequest: async () => {
+                    throw new Error('component props should not fall back to the child LSP');
+                }
+            } as any
+        });
+        (plugin as any).componentOffsetAt = () => ({ offset: 7, tag: 'Button' });
+        (plugin as any).syncDocument = async () => ({
+            document,
+            shadowPath: '/workspace/.overlay/Component.svelte.tsx',
+            projectKey: '/workspace/.overlay/tsconfig.json',
+            snapshot: { svelteNodeAt: () => undefined }
+        });
+
+        const result = await plugin.getCompletions(document, position, {
+            triggerKind: CompletionTriggerKind.Invoked
+        });
+
+        assert.strictEqual(propsCalls, 1);
+        assert.strictEqual(backgroundWarmCalls, 0);
+        assert.deepStrictEqual(
+            result?.items.map((item) => item.label),
+            ['label']
+        );
+    });
+
+    it('does not reuse an older cache while an edit-and-undo sync is publishing', async () => {
+        const uri = pathToUrl('/workspace/Component.svelte');
+        const filePath = '/workspace/Component.svelte';
+        const shadowPath = '/workspace/.overlay/Component.svelte.tsx';
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        let openText: string | undefined;
+        let releaseB!: () => void;
+        let startedB!: () => void;
+        const bStarted = new Promise<void>((resolve) => (startedB = resolve));
+        const bBlocked = new Promise<void>((resolve) => (releaseB = resolve));
+        const shadows = {
+            overlayTsconfigPath: '/workspace/.overlay/tsconfig.json',
+            getShadowPath: () => shadowPath,
+            transform: (current: Document) => ({
+                getFullText: () => `generated:${current.getText()}`
+            }),
+            ensureShadowDirectory: () => undefined
+        };
+        const plugin = new TsGoPlugin({
+            docManager,
+            projects: { forFile: () => shadows } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                getOpenText: () => openText,
+                isOpen: () => openText !== undefined,
+                openDocument: async (_fileName: string, text: string) => void (openText = text),
+                updateDocument: async (_fileName: string, _changes: any, text: string) => {
+                    if (text === 'generated:B') {
+                        startedB();
+                        await bBlocked;
+                    }
+                    openText = text;
+                }
+            } as any
+        });
+        (plugin as any).ensureProjectOpened = async () => undefined;
+
+        const document = docManager.openClientDocument({ uri, text: 'A' });
+        await (plugin as any).svelteLifecycle.get(filePath);
+        await (plugin as any).syncDocument(document);
+
+        docManager.updateDocument({ uri, version: 2 }, [{ text: 'B' }]);
+        await bStarted;
+        docManager.updateDocument({ uri, version: 3 }, [{ text: 'A' }]);
+        let featureSettled = false;
+        const featureSync = (plugin as any)
+            .syncDocument(document)
+            .finally(() => (featureSettled = true));
+        await tick();
+        assert.strictEqual(featureSettled, false, 'A cache bypassed the in-flight B revision');
+
+        releaseB();
+        await featureSync;
+        await (plugin as any).svelteLifecycle.get(filePath);
+        assert.strictEqual(openText, 'generated:A');
+    });
+
     it('eagerly forwards dirty Svelte changes before a cross-file request', async () => {
         const uri = pathToUrl('/workspace/Component.svelte');
         const shadowPath = '/workspace/.overlay/Component.svelte.tsx';
@@ -398,6 +2033,7 @@ describe('typescript-go TsGoPlugin helpers', () => {
         };
         const plugin = new TsGoPlugin({
             docManager,
+            backgroundSyncDelayMs: 0,
             projects: { forFile: () => shadows } as any,
             server: {
                 updateConfiguration: async () => undefined,
@@ -424,6 +2060,79 @@ describe('typescript-go TsGoPlugin helpers', () => {
         await (plugin as any).svelteLifecycle.get('/workspace/Component.svelte');
 
         assert.deepStrictEqual(sent, ['rewritten:<p>saved</p>', 'rewritten:<p>dirty</p>']);
+    });
+
+    it('flushes a newly dirty component before another document asks for semantics', async () => {
+        const aPath = '/workspace/A.svelte';
+        const bPath = '/workspace/B.svelte';
+        const aUri = pathToUrl(aPath);
+        const bUri = pathToUrl(bPath);
+        const documents = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        const openText = new Map<string, string>();
+        const shadowPath = (filePath: string) =>
+            `/workspace/.overlay/${path.basename(filePath)}.tsx`;
+        const shadows = {
+            overlayTsconfigPath: '/workspace/.overlay/tsconfig.json',
+            getShadowPath: shadowPath,
+            transform: (document: Document) => ({
+                getFullText: () => `generated:${document.getText()}`,
+                getGeneratedPosition: (position: any) => position,
+                getOriginalPosition: (position: any) => position
+            }),
+            ensureShadowDirectory: () => undefined,
+            pinSnapshot: () => undefined
+        };
+        let semanticRequests = 0;
+        const plugin = new TsGoPlugin({
+            docManager: documents,
+            // This reproduces the cold-open grace period which previously hid A's first edit.
+            backgroundSyncDelayMs: 60_000,
+            projects: {
+                forFile: () => shadows,
+                getOriginalPath: () => undefined
+            } as any,
+            server: {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                getOpenText: (fileName: string) => openText.get(fileName),
+                isOpen: (fileName: string) => openText.has(fileName),
+                openDocument: async (fileName: string, text: string) => {
+                    openText.set(fileName, text);
+                },
+                updateDocument: async (_fileName: string, _changes: any, text: string) => {
+                    openText.set(_fileName, text);
+                },
+                sendRequest: async () => {
+                    semanticRequests++;
+                    assert.strictEqual(
+                        openText.get(shadowPath(aPath)),
+                        `generated:${documents.get(aUri)!.getText()}`,
+                        "cross-file request observed A's saved shadow"
+                    );
+                    return [];
+                },
+                dispose: () => undefined
+            } as any
+        });
+        (plugin as any).ensureProjectOpened = async () => undefined;
+
+        const b = documents.openClientDocument({
+            uri: bUri,
+            text: '<script>const value = 1;</script>'
+        });
+        await (plugin as any).syncDocument(b);
+        documents.openClientDocument({ uri: aUri, text: '<p>saved</p>' });
+        documents.updateDocument({ uri: aUri, version: 2 }, [{ text: '<p>dirty one</p>' }]);
+
+        await plugin.getDefinitions(b, { line: 0, character: 15 });
+
+        documents.updateDocument({ uri: aUri, version: 3 }, [{ text: '<p>dirty two</p>' }]);
+        await plugin.findReferences(b, { line: 0, character: 15 }, { includeDeclaration: true });
+
+        assert.strictEqual(semanticRequests, 2);
+        plugin.dispose();
     });
 
     it('rewrites watched Svelte saves with each materialising manager collision map', async () => {
@@ -959,6 +2668,87 @@ describe('typescript-go TsGoPlugin helpers', () => {
 
         assert.deepStrictEqual(opened, []);
         assert.deepStrictEqual(closed, [shadowPath]);
+        assert.strictEqual((plugin as any).syncedSvelte.size, 0);
+        assert.strictEqual((plugin as any).svelteSyncs.size, 0);
+    });
+
+    it('does not let a delayed close evict a newly reopened Svelte overlay', async () => {
+        const uri = pathToUrl('/workspace/Component.svelte');
+        const filePath = '/workspace/Component.svelte';
+        const shadowPath = '/workspace/.overlay/Component.svelte.tsx';
+        const deleted: string[] = [];
+        const unpinned: string[] = [];
+        const closed: string[] = [];
+        let openText: string | undefined;
+        let transforms = 0;
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        const shadows = {
+            overlayTsconfigPath: '/workspace/.overlay/tsconfig.json',
+            getShadowPath: () => shadowPath,
+            transform: (document: Document) => {
+                transforms++;
+                return { getFullText: () => `generated:${document.getText()}` };
+            },
+            ensureShadowDirectory: () => undefined,
+            pinSnapshot: () => undefined,
+            unpinSnapshot: (source: string) => void unpinned.push(source),
+            deleteSnapshot: (source: string) => void deleted.push(source)
+        };
+        const plugin = new TsGoPlugin({
+            docManager,
+            backgroundSyncDelayMs: 0,
+            projects: { forFile: () => shadows } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                getOpenText: () => openText,
+                isOpen: () => openText !== undefined,
+                openDocument: async (_fileName: string, text: string) => void (openText = text),
+                updateDocument: async (_fileName: string, _changes: any, text: string) =>
+                    void (openText = text),
+                closeDocument: async (fileName: string) => {
+                    closed.push(fileName);
+                    openText = undefined;
+                }
+            } as any
+        });
+        (plugin as any).ensureProjectOpened = async () => undefined;
+
+        docManager.openClientDocument({ uri, text: '<p>first</p>' });
+        await (plugin as any).svelteLifecycle.get(filePath);
+        assert.strictEqual(openText, 'generated:<p>first</p>');
+
+        let releaseLifecycle!: () => void;
+        const lifecycleBlocked = new Promise<void>((resolve) => (releaseLifecycle = resolve));
+        (plugin as any).svelteLifecycle.set(filePath, lifecycleBlocked);
+
+        docManager.closeDocument(uri);
+        const reopened = docManager.openClientDocument({ uri, text: '<p>reopened</p>' });
+        let featureSettled = false;
+        const featureSync = (plugin as any)
+            .syncDocument(reopened)
+            .finally(() => void (featureSettled = true));
+
+        await tick();
+        assert.strictEqual(
+            featureSettled,
+            false,
+            'feature bypassed the lifecycle close/reopen tail'
+        );
+        assert.strictEqual(openText, 'generated:<p>first</p>');
+
+        releaseLifecycle();
+        const synced = await featureSync;
+        await (plugin as any).svelteLifecycle.get(filePath);
+
+        assert.strictEqual(synced?.document, reopened);
+        assert.strictEqual(openText, 'generated:<p>reopened</p>');
+        assert.deepStrictEqual(closed, []);
+        assert.deepStrictEqual(unpinned, []);
+        assert.deepStrictEqual(deleted, []);
+        assert.strictEqual(transforms, 2);
+        assert.strictEqual((plugin as any).svelteOverlayBySource.get(filePath), shadowPath);
     });
 
     it('replaces project state on TS source creation but keeps content saves incremental', async () => {
@@ -1001,10 +2791,19 @@ describe('typescript-go TsGoPlugin helpers', () => {
             text: '<p>app</p>'
         });
         docManager.openClientDocument({ uri: pathToUrl(uiPath), text: '<p>ui</p>' });
-        const appManager = { invalidateStructuralCaches: () => undefined };
-        const uiManager = { invalidateStructuralCaches: () => undefined };
+        const appProjectKey = '/workspace/apps/app/.overlay/tsconfig.json';
+        const uiProjectKey = '/workspace/packages/ui/.overlay/tsconfig.json';
+        const appManager = {
+            overlayTsconfigPath: appProjectKey,
+            invalidateStructuralCaches: () => undefined
+        };
+        const uiManager = {
+            overlayTsconfigPath: uiProjectKey,
+            invalidateStructuralCaches: () => undefined
+        };
         const closed: string[] = [];
         const synced: Document[] = [];
+        const changedDiagnosticProjects: string[][] = [];
         let restarts = 0;
         const plugin = new TsGoPlugin({
             docManager,
@@ -1017,7 +2816,9 @@ describe('typescript-go TsGoPlugin helpers', () => {
                 updateConfiguration: async () => undefined,
                 closeDocument: async (fileName: string) => void closed.push(fileName),
                 restart: async () => void restarts++,
-                notifyWatchedFiles: async () => undefined
+                notifyWatchedFiles: async () => undefined,
+                noteProjectChanges: (keys: Iterable<string>) =>
+                    changedDiagnosticProjects.push([...keys])
             } as any
         });
         (plugin as any).desiredOpenSvelte.add(appPath);
@@ -1041,8 +2842,55 @@ describe('typescript-go TsGoPlugin helpers', () => {
         assert.strictEqual(restarts, 1);
         assert.deepStrictEqual(closed, [`${appPath}.tsx`]);
         assert.deepStrictEqual(synced, [appDocument]);
+        assert.deepStrictEqual(changedDiagnosticProjects, [[appProjectKey]]);
         assert.strictEqual((plugin as any).svelteOverlayBySource.has(appPath), false);
         assert.strictEqual((plugin as any).svelteOverlayBySource.get(uiPath), `${uiPath}.tsx`);
+    });
+
+    it('includes known reverse consumers in structural diagnostic invalidation', async () => {
+        const sourceProject = {
+            overlayTsconfigPath: '/workspace/packages/ui/.overlay/tsconfig.json',
+            invalidateStructuralCaches: () => undefined
+        };
+        const consumerProject = {
+            overlayTsconfigPath: '/workspace/apps/app/.overlay/tsconfig.json',
+            invalidateStructuralCaches: () => undefined
+        };
+        const unrelatedProjectKey = '/workspace/apps/other/.overlay/tsconfig.json';
+        const changedDiagnosticProjects: string[][] = [];
+        let invalidatedAll = false;
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {
+                invalidateForStructuralChanges: () => [sourceProject, consumerProject]
+            } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                restart: async () => undefined,
+                notifyWatchedFiles: async () => undefined,
+                noteProjectChanges: (keys: Iterable<string>) =>
+                    changedDiagnosticProjects.push([...keys]),
+                noteAllProjectsChanged: () => void (invalidatedAll = true),
+                projectGeneration: (key: string) => (key === unrelatedProjectKey ? 99 : 1)
+            } as any
+        });
+
+        plugin.onWatchFileChanges([
+            { fileName: '/workspace/packages/ui/package.json', changeType: 2 /* Changed */ }
+        ]);
+        await (plugin as any).watchWork;
+
+        assert.deepStrictEqual(changedDiagnosticProjects, [
+            [sourceProject.overlayTsconfigPath, consumerProject.overlayTsconfigPath]
+        ]);
+        assert.strictEqual(invalidatedAll, false);
+        assert.strictEqual(
+            (plugin as any).diagnosticProjectGeneration(unrelatedProjectKey),
+            99,
+            'an unrelated configured project was invalidated'
+        );
     });
 
     it('rebuilds a tracked extended-config consumer only after a semantic change', async () => {
@@ -1454,6 +3302,237 @@ describe('typescript-go TsGoPlugin helpers', () => {
         secondToken.dispose();
     });
 
+    it('keeps an independent project result id and native check stable after editing a sibling', async () => {
+        const projectA = '/workspace/a/.svelte-kit/tsconfig.json';
+        const projectB = '/workspace/b/.svelte-kit/tsconfig.json';
+        const documentA = { project: 'a' } as unknown as Document;
+        const documentB = { project: 'b' } as unknown as Document;
+        const server = new TsGoServer({
+            engine: {
+                packageName: '@test/tsgo',
+                version: '1.2.3',
+                packageRoot: '/test/tsgo',
+                binPath: '/test/tsgo/bin.js',
+                command: '/test/node',
+                argsPrefix: ['/test/tsgo/bin.js']
+            },
+            workspacePath: '/workspace'
+        });
+        const checks = new Map<string, number>();
+        (server as any).sendRequest = async (_method: string, params: any) => {
+            const uri = params.textDocument.uri as string;
+            const project = uri.includes('/a/') ? projectA : projectB;
+            checks.set(project, (checks.get(project) ?? 0) + 1);
+            return { items: [] };
+        };
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {} as any,
+            server
+        });
+        (plugin as any).syncDocument = async (document: Document) => {
+            const a = document === documentA;
+            return {
+                document,
+                shadowPath: `/workspace/${a ? 'a' : 'b'}/.overlay/Component.svelte.tsx`,
+                projectKey: a ? projectA : projectB,
+                snapshot: {
+                    filePath: `/workspace/${a ? 'a' : 'b'}/Component.svelte`,
+                    getFullText: () => ''
+                }
+            };
+        };
+
+        const firstA = await plugin.getDiagnosticsForPullMode(documentA);
+        const firstB = await plugin.getDiagnosticsForPullMode(documentB);
+        const firstAResultId = (firstA as any).resultId as string;
+        const firstBResultId = (firstB as any).resultId as string;
+        assert.strictEqual(checks.get(projectA), 1);
+        assert.strictEqual(checks.get(projectB), 1);
+
+        // The TS/Svelte lifecycle calls this same server boundary when project A is edited.
+        server.noteProjectChanges([projectA]);
+
+        assert.deepStrictEqual(await plugin.getDiagnosticsForPullMode(documentB, firstBResultId), {
+            kind: 'unchanged',
+            resultId: firstBResultId
+        });
+        assert.strictEqual(checks.get(projectB), 1, 'project B paid for an unrelated native check');
+
+        const secondA = await plugin.getDiagnosticsForPullMode(documentA, firstAResultId);
+        assert.strictEqual((secondA as any).kind, 'full');
+        assert.notStrictEqual((secondA as any).resultId, firstAResultId);
+        assert.strictEqual(checks.get(projectA), 2);
+        assert.strictEqual(plugin.stats.projectChecks, 3);
+        plugin.dispose();
+    });
+
+    it('invalidates every proven TS/JS consumer across open, update, and close', async () => {
+        const source = '/workspace/shared/state.ts';
+        const projectA = '/workspace/a/.overlay/tsconfig.json';
+        const projectB = '/workspace/b/.overlay/tsconfig.json';
+        const managerA = { overlayTsconfigPath: projectA };
+        const managerB = { overlayTsconfigPath: projectB };
+
+        for (const lifecycle of ['open', 'update', 'close'] as const) {
+            const generations = new Map([
+                [projectA, 0],
+                [projectB, 0]
+            ]);
+            const noteProjectChanges = (keys: Iterable<string>) => {
+                for (const key of keys) {
+                    generations.set(key, (generations.get(key) ?? 0) + 1);
+                }
+            };
+            const server = {
+                updateConfiguration: async () => undefined,
+                noteProjectChanges,
+                noteAllProjectsChanged: () => {
+                    throw new Error(
+                        'exact source ownership unexpectedly fell back to all projects'
+                    );
+                },
+                isOpen: () => true,
+                openDocument: async (
+                    _fileName: string,
+                    _text: string,
+                    _languageId: string,
+                    projectKey: string
+                ) => noteProjectChanges([projectKey]),
+                updateDocument: async (
+                    _fileName: string,
+                    _changes: any,
+                    _text: string,
+                    _languageId: string,
+                    projectKey: string
+                ) => noteProjectChanges([projectKey]),
+                closeDocument: async () => noteProjectChanges([projectA]),
+                dispose: () => undefined
+            };
+            const plugin = new TsGoPlugin({
+                docManager: new DocumentManager(
+                    (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+                ),
+                projects: {
+                    forFile: () => managerA,
+                    consumersForSourceChange: () => [managerA, managerB],
+                    all: () => [managerA, managerB]
+                } as any,
+                server: server as any
+            });
+
+            if (lifecycle === 'open') {
+                plugin.openTsOrJsFile(source, 'export const value = 1;', 'typescript');
+            } else if (lifecycle === 'update') {
+                plugin.updateTsOrJsFile(
+                    source,
+                    [{ text: 'export const value = 2;' }],
+                    'export const value = 2;',
+                    2,
+                    'typescript'
+                );
+            } else {
+                plugin.closeTsOrJsFile(source);
+            }
+            await tick();
+
+            assert.deepStrictEqual(
+                Object.fromEntries(generations),
+                { [projectA]: 1, [projectB]: 1 },
+                lifecycle
+            );
+            plugin.dispose();
+        }
+    });
+
+    it('invalidates all known TS/JS projects when source ownership is incomplete', async () => {
+        const projectA = { overlayTsconfigPath: '/workspace/a/.overlay/tsconfig.json' };
+        const projectB = { overlayTsconfigPath: '/workspace/b/.overlay/tsconfig.json' };
+        const projectC = { overlayTsconfigPath: '/workspace/c/.overlay/tsconfig.json' };
+        const changed = new Set<string>();
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {
+                forFile: () => projectA,
+                consumersForSourceChange: () => undefined,
+                all: () => [projectA, projectB, projectC]
+            } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                isOpen: () => true,
+                updateDocument: async (
+                    _fileName: string,
+                    _changes: any,
+                    _text: string,
+                    _languageId: string,
+                    projectKey: string
+                ) => void changed.add(projectKey),
+                noteProjectChanges: (keys: Iterable<string>) => {
+                    for (const key of keys) {
+                        changed.add(key);
+                    }
+                },
+                dispose: () => undefined
+            } as any
+        });
+
+        plugin.updateTsOrJsFile(
+            '/workspace/shared/state.ts',
+            [{ text: 'export const value = 2;' }],
+            'export const value = 2;',
+            2,
+            'typescript'
+        );
+        await tick();
+
+        assert.deepStrictEqual(
+            changed,
+            new Set([
+                projectA.overlayTsconfigPath,
+                projectB.overlayTsconfigPath,
+                projectC.overlayTsconfigPath
+            ])
+        );
+        plugin.dispose();
+    });
+
+    it('forwards watched TS/JS saves with every proven consumer generation', async () => {
+        const projectA = { overlayTsconfigPath: '/workspace/a/.overlay/tsconfig.json' };
+        const projectB = { overlayTsconfigPath: '/workspace/b/.overlay/tsconfig.json' };
+        let notifiedProjects: string[] | undefined;
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {
+                consumersForSourceChange: () => [projectA, projectB]
+            } as any,
+            server: {
+                updateConfiguration: async () => undefined,
+                notifyWatchedFiles: async (_changes: any, projects?: Iterable<string>) => {
+                    notifiedProjects = projects ? [...projects] : undefined;
+                },
+                dispose: () => undefined
+            } as any
+        });
+        (plugin as any).isStructuralWatchChange = () => false;
+
+        plugin.onWatchFileChanges([
+            { fileName: '/workspace/shared/state.ts', changeType: 2 /* Changed */ }
+        ]);
+        await (plugin as any).watchWork;
+
+        assert.deepStrictEqual(
+            new Set(notifiedProjects),
+            new Set([projectA.overlayTsconfigPath, projectB.overlayTsconfigPath])
+        );
+        plugin.dispose();
+    });
+
     it('serializes different shadow diagnostics in the same project', async () => {
         let finishFirst!: () => void;
         const firstNative = new Promise<void>((resolve) => (finishFirst = resolve));
@@ -1766,6 +3845,373 @@ describe('typescript-go TsGoPlugin helpers', () => {
         cancellation.dispose();
     });
 
+    it('drops a requestAt response when the document changes without cancellation', async () => {
+        const native = deferred<any[]>();
+        const uri = pathToUrl('/workspace/Current.svelte');
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        let nativeStarted = false;
+        let mappingLookups = 0;
+        const plugin = new TsGoPlugin({
+            docManager,
+            projects: {
+                getOriginalPath: () => {
+                    mappingLookups++;
+                    return undefined;
+                }
+            } as any,
+            server: {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                sendRequest: async () => {
+                    nativeStarted = true;
+                    return native.promise;
+                },
+                dispose: () => undefined
+            } as any
+        });
+        (plugin as any).syncDocument = async (document: Document) => ({
+            document,
+            shadowPath: '/workspace/.overlay/Current.svelte.tsx',
+            projectKey: '/workspace/.overlay/tsconfig.json',
+            snapshot: { getGeneratedPosition: () => ({ line: 0, character: 0 }) }
+        });
+        const document = docManager.openClientDocument({
+            uri,
+            text: '<script>const value = 1;</script>'
+        });
+
+        const pending = plugin.findReferences(
+            document,
+            { line: 0, character: 15 },
+            { includeDeclaration: true }
+        );
+        await tick();
+        assert.strictEqual(nativeStarted, true);
+        docManager.updateDocument({ uri, version: 2 }, [
+            { text: '<script>const changed = 2;</script>' }
+        ]);
+        native.resolve([
+            {
+                uri: pathToUrl('/workspace/target.ts'),
+                range: {
+                    start: { line: 0, character: 0 },
+                    end: { line: 0, character: 1 }
+                }
+            }
+        ]);
+
+        assert.strictEqual(await pending, null);
+        assert.strictEqual(mappingLookups, 0, 'stale requestAt response reached location mapping');
+        plugin.dispose();
+    });
+
+    it('drops direct feature responses when the document changes without cancellation', async () => {
+        const range = {
+            start: { line: 0, character: 0 },
+            end: { line: 0, character: 1 }
+        };
+        const cases: Array<{
+            name: string;
+            response: any;
+            invoke: (plugin: TsGoPlugin, document: Document) => Promise<any>;
+            expected: any;
+        }> = [
+            {
+                name: 'hover',
+                response: { contents: 'stale', range },
+                invoke: (plugin, document) => plugin.doHover(document, range.start),
+                expected: null
+            },
+            {
+                name: 'selection range',
+                response: [{ range }],
+                invoke: (plugin, document) => plugin.getSelectionRange(document, range.start),
+                expected: null
+            },
+            {
+                name: 'semantic tokens',
+                response: { data: [0, 0, 1, 0, 0] },
+                invoke: (plugin, document) => plugin.getSemanticTokens(document),
+                expected: null
+            },
+            {
+                name: 'document symbols',
+                response: [{ name: 'value', kind: 13, range, selectionRange: range }],
+                invoke: (plugin, document) => plugin.getDocumentSymbols(document),
+                expected: []
+            },
+            {
+                name: 'inlay hints',
+                response: [{ position: range.start, label: 'stale' }],
+                invoke: (plugin, document) => plugin.getInlayHints(document, range),
+                expected: null
+            },
+            {
+                name: 'folding ranges',
+                response: [
+                    {
+                        startLine: 0,
+                        startCharacter: 0,
+                        endLine: 1,
+                        endCharacter: 0
+                    }
+                ],
+                invoke: (plugin, document) => plugin.getFoldingRanges(document),
+                expected: []
+            }
+        ];
+
+        for (const testCase of cases) {
+            const native = deferred<any>();
+            const uri = pathToUrl(`/workspace/${testCase.name.replaceAll(' ', '-')}.svelte`);
+            const docManager = new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            );
+            let nativeStarted = false;
+            let outputMappings = 0;
+            const snapshot = {
+                getGeneratedPosition: (position: any) => position,
+                getOriginalPosition: (position: any) => {
+                    outputMappings++;
+                    return position;
+                },
+                positionAt: () => ({ line: 0, character: 0 }),
+                offsetAt: () => 0,
+                getLength: () => 32,
+                getFullText: () => 'const value = 1;',
+                svelteNodeAt: () => undefined
+            };
+            const plugin = new TsGoPlugin({
+                docManager,
+                projects: {} as any,
+                server: {
+                    generation: 1,
+                    updateConfiguration: async () => undefined,
+                    sendRequest: async () => {
+                        nativeStarted = true;
+                        return native.promise;
+                    },
+                    dispose: () => undefined
+                } as any
+            });
+            (plugin as any).syncDocument = async (document: Document) => ({
+                document,
+                shadowPath: '/workspace/.overlay/Current.svelte.tsx',
+                projectKey: '/workspace/.overlay/tsconfig.json',
+                snapshot
+            });
+            const document = docManager.openClientDocument({
+                uri,
+                text: '<script>const value = 1;</script>'
+            });
+
+            const pending = testCase.invoke(plugin, document);
+            await tick();
+            assert.strictEqual(nativeStarted, true, `${testCase.name} did not reach native`);
+            docManager.updateDocument({ uri, version: 2 }, [
+                { text: '<script>const changed = 2;</script>' }
+            ]);
+            native.resolve(testCase.response);
+
+            assert.deepStrictEqual(await pending, testCase.expected, testCase.name);
+            assert.strictEqual(
+                outputMappings,
+                0,
+                `${testCase.name} mapped a stale native response`
+            );
+            plugin.dispose();
+        }
+    });
+
+    it('drops component-reference responses after an edit or native restart', async () => {
+        for (const invalidation of ['document', 'native'] as const) {
+            const native = deferred<any[]>();
+            const uri = pathToUrl(`/workspace/Component-${invalidation}.svelte`);
+            const documents = new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            );
+            let nativeStarted = false;
+            let mappingLookups = 0;
+            const snapshot = {
+                getFullText: () => 'const Component = {}; export default Component;',
+                positionAt: () => ({ line: 0, character: 6 })
+            };
+            const server = {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                sendRequest: async () => {
+                    nativeStarted = true;
+                    return native.promise;
+                },
+                dispose: () => undefined
+            };
+            const plugin = new TsGoPlugin({
+                docManager: documents,
+                backgroundSyncDelayMs: 60_000,
+                projects: {
+                    getOriginalPath: () => {
+                        mappingLookups++;
+                        return undefined;
+                    }
+                } as any,
+                server: server as any
+            });
+            (plugin as any).syncDocument = async (document: Document) => ({
+                document,
+                shadowPath: '/workspace/.overlay/Component.svelte.tsx',
+                projectKey: '/workspace/.overlay/tsconfig.json',
+                snapshot
+            });
+            const document = documents.openClientDocument({
+                uri,
+                text: '<script>export let value;</script>'
+            });
+
+            const pending = plugin.findComponentReferences(uri);
+            await tick();
+            assert.strictEqual(nativeStarted, true);
+            if (invalidation === 'document') {
+                documents.updateDocument({ uri, version: 2 }, [
+                    { text: '<script>export let changed;</script>' }
+                ]);
+            } else {
+                server.generation++;
+            }
+            native.resolve([
+                {
+                    uri: pathToUrl('/workspace/Use.svelte.tsx'),
+                    range: {
+                        start: { line: 0, character: 0 },
+                        end: { line: 0, character: 1 }
+                    }
+                }
+            ]);
+
+            assert.strictEqual(await pending, null, invalidation);
+            assert.strictEqual(mappingLookups, 0, `${invalidation} reached location mapping`);
+            assert.strictEqual(document.openedByClient, true);
+            plugin.dispose();
+        }
+    });
+
+    it('drops folding ranges when the native generation restarts', async () => {
+        const native = deferred<any[]>();
+        const document = new Document(
+            pathToUrl('/workspace/FoldingRestart.svelte'),
+            '<script>\nif (true) {\n}\n</script>',
+            /*skipConfigLoading*/ true
+        );
+        let outputMappings = 0;
+        const server = {
+            generation: 1,
+            updateConfiguration: async () => undefined,
+            sendRequest: async () => native.promise,
+            dispose: () => undefined
+        };
+        const plugin = new TsGoPlugin({
+            docManager: new DocumentManager(
+                (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+            ),
+            projects: {} as any,
+            server: server as any
+        });
+        (plugin as any).syncDocument = async () => ({
+            document,
+            shadowPath: '/workspace/.overlay/FoldingRestart.svelte.tsx',
+            projectKey: '/workspace/.overlay/tsconfig.json',
+            snapshot: {
+                getOriginalPosition: (position: any) => {
+                    outputMappings++;
+                    return position;
+                }
+            }
+        });
+
+        const pending = plugin.getFoldingRanges(document);
+        await tick();
+        server.generation++;
+        native.resolve([
+            {
+                startLine: 0,
+                startCharacter: 0,
+                endLine: 2,
+                endCharacter: 1
+            }
+        ]);
+
+        assert.deepStrictEqual(await pending, []);
+        assert.strictEqual(outputMappings, 0);
+        plugin.dispose();
+    });
+
+    it('drops call-hierarchy responses when their open Svelte item changes', async () => {
+        const native = deferred<any[]>();
+        const uri = pathToUrl('/workspace/Caller.svelte');
+        const docManager = new DocumentManager(
+            (item) => new Document(item.uri, item.text, /*skipConfigLoading*/ true)
+        );
+        const range = {
+            start: { line: 0, character: 0 },
+            end: { line: 0, character: 1 }
+        };
+        let mappingLookups = 0;
+        const snapshot = {
+            getGeneratedPosition: (position: any) => position,
+            getOriginalPosition: (position: any) => position
+        };
+        const plugin = new TsGoPlugin({
+            docManager,
+            projects: {
+                ensureSnapshot: () => snapshot,
+                forFile: () => ({
+                    getShadowPath: () => '/workspace/.overlay/Caller.svelte.tsx'
+                }),
+                getOriginalPath: () => {
+                    mappingLookups++;
+                    return undefined;
+                }
+            } as any,
+            server: {
+                generation: 1,
+                updateConfiguration: async () => undefined,
+                sendRequest: async () => native.promise,
+                dispose: () => undefined
+            } as any
+        });
+        docManager.openClientDocument({ uri, text: '<script>function caller() {}</script>' });
+        const item = {
+            name: 'caller',
+            kind: 12,
+            uri,
+            range,
+            selectionRange: range
+        } as CallHierarchyItem;
+
+        const pending = plugin.getOutgoingCalls(item);
+        await tick();
+        docManager.updateDocument({ uri, version: 2 }, [
+            { text: '<script>function changed() {}</script>' }
+        ]);
+        native.resolve([
+            {
+                to: {
+                    name: 'callee',
+                    kind: 12,
+                    uri: pathToUrl('/workspace/callee.ts'),
+                    range,
+                    selectionRange: range
+                },
+                fromRanges: [range]
+            }
+        ]);
+
+        assert.strictEqual(await pending, null);
+        assert.strictEqual(mappingLookups, 0, 'stale call hierarchy response reached mapping');
+        plugin.dispose();
+    });
+
     it('does not map a direct feature response cancelled while the child is running', async () => {
         let finishChild!: (value: any) => void;
         const child = new Promise<any>((resolve) => (finishChild = resolve));
@@ -1794,11 +4240,11 @@ describe('typescript-go TsGoPlugin helpers', () => {
             }
         });
         const cancellation = new CancellationTokenSource();
-        const pending = plugin.doHover(
-            {} as Document,
-            { line: 0, character: 0 },
-            cancellation.token
-        );
+        const document = {
+            version: 0,
+            getText: () => '<h1 />'
+        } as Document;
+        const pending = plugin.doHover(document, { line: 0, character: 0 }, cancellation.token);
         await tick();
         cancellation.cancel();
         finishChild({

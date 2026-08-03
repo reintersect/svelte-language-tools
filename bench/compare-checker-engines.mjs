@@ -13,6 +13,7 @@ import { performance } from 'node:perf_hooks';
 import { createRequire } from 'node:module';
 import { runBoundedProcess } from './bounded-process.mjs';
 import { normalizeCheckerProgramMembership } from './checker-program-membership.mjs';
+import { diagnosticMultisetDifference } from './diagnostic-equivalence.mjs';
 
 if (process.argv.includes('--help')) {
     console.log(
@@ -253,8 +254,11 @@ function validateRun(run) {
             issues.push(`expected exit ${expectedExit}, got ${run.code}`);
     }
     if (issues.length) {
+        const malformed = run.malformed.length
+            ? `\nmalformed stdout:\n${run.malformed.slice(0, 8).join('\n')}`
+            : '';
         throw new Error(
-            `${run.label} machine protocol failed:\n- ${issues.join('\n- ')}\n${run.stderr.slice(-4000)}`
+            `${run.label} machine protocol failed:\n- ${issues.join('\n- ')}${malformed}\n${run.stderr.slice(-4000)}`
         );
     }
 }
@@ -362,6 +366,23 @@ function printDifference(label, left, right) {
     return false;
 }
 
+function printDiagnosticDifference(label, left, right) {
+    const { onlyLeft, onlyRight } = diagnosticMultisetDifference(left, right);
+    if (!onlyLeft.length && !onlyRight.length) {
+        const exactOnlyLeft = multisetDifference(left, right);
+        const detail = exactOnlyLeft.length
+            ? ` (${exactOnlyLeft.length} native type expansion(s) matched classic { ...; } elision)`
+            : '';
+        console.log(`PASS ${label}${detail}`);
+        return true;
+    }
+    console.error(`FAIL ${label}: only-left=${onlyLeft.length}, only-right=${onlyRight.length}`);
+    if (onlyLeft.length) console.error('only left:', JSON.stringify(onlyLeft.slice(0, 8), null, 2));
+    if (onlyRight.length)
+        console.error('only right:', JSON.stringify(onlyRight.slice(0, 8), null, 2));
+    return false;
+}
+
 function printProgramAliases(run, membership) {
     if (!membership.aliases.length) {
         console.log(`PASS ${run.label} source program has no real/shadow aliases`);
@@ -397,7 +418,7 @@ for (const run of runs) {
     passed = printProgramAliases(run, programByRun.get(run)) && passed;
 }
 passed =
-    printDifference(
+    printDiagnosticDifference(
         'classic vs stock diagnostics',
         diagnostics(classic, opts),
         diagnostics(stock, opts)

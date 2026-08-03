@@ -112,6 +112,7 @@ enum TsconfigSvelteDiagnostics {
 
 const maxProgramSizeForNonTsFiles = 20 * 1024 * 1024; // 20 MB
 const services = new FileMap<Promise<LanguageServiceContainer>>();
+const serviceSnapshotOwners = new FileMap<GlobalSnapshotsManager>();
 const serviceSizeMap = new FileMap<number>();
 const configWatchers = new FileMap<ts.FileWatcher>();
 const dependedConfigWatchers = new FileMap<ts.FileWatcher>();
@@ -130,9 +131,37 @@ const parsedTsConfigInfo = new FileMap<TsConfigInfo | null>();
  */
 export function __resetCache() {
     services.clear();
+    serviceSnapshotOwners.clear();
     parsedTsConfigInfo.clear();
     serviceSizeMap.clear();
     configFileForOpenFiles.clear();
+}
+
+/**
+ * Dispose only the classic services created by a particular resolver. Completion-only fallback
+ * resolvers are short-lived, while the process-wide service cache predates disposable plugins.
+ */
+export function disposeServicesForSnapshotManager(manager: GlobalSnapshotsManager): void {
+    for (const [key, owner] of serviceSnapshotOwners.entries()) {
+        if (owner !== manager) {
+            continue;
+        }
+        const service = services.get(key);
+        services.delete(key);
+        serviceSnapshotOwners.delete(key);
+        void service
+            ?.then((container) => container.dispose())
+            .catch((error) => Logger.error(`Failed to dispose TypeScript service ${key}`, error));
+    }
+
+    // Referenced configs cache their own snapshot managers outside the primary service map.
+    // Drop only entries belonging to this resolver so another classic plugin remains untouched.
+    for (const [configPath, info] of parsedTsConfigInfo.entries()) {
+        if (info?.snapshotManager.usesGlobalSnapshotsManager(manager)) {
+            info.snapshotManager.dispose();
+            parsedTsConfigInfo.delete(configPath);
+        }
+    }
 }
 
 export interface LanguageServiceDocumentContext {
@@ -317,6 +346,7 @@ export async function getServiceForTsconfig(
         pendingReloads.delete(tsconfigPath);
         const newService = createLanguageService(tsconfigPath, workspacePath, docContext);
         services.set(tsconfigPathOrWorkspacePath, newService);
+        serviceSnapshotOwners.set(tsconfigPathOrWorkspacePath, docContext.globalSnapshotsManager);
         service = await newService;
     } else {
         service = await services.get(tsconfigPathOrWorkspacePath)!;
@@ -1016,6 +1046,7 @@ async function createLanguageService(
             scheduleReload(fileName);
         } else if (kind === ts.FileWatcherEventKind.Deleted) {
             services.delete(fileName);
+            serviceSnapshotOwners.delete(fileName);
             configFileForOpenFiles.clear();
         }
 

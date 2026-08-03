@@ -400,6 +400,34 @@ describe('Svelte Plugin', () => {
         assert.deepStrictEqual(await completionsPromise, null);
     });
 
+    it('skips Svelte compilation for completions inside script', async () => {
+        const { plugin, document } = setup('<script>const model = { value: 1 }; model.va</script>');
+        const compile = sinon
+            .stub(plugin as any, 'getSvelteDoc')
+            .throws(new Error('script completion must not compile Svelte'));
+        const offset = document.getText().indexOf('model.va') + 'model.va'.length;
+
+        assert.strictEqual(
+            await plugin.getCompletions(document, document.positionAt(offset)),
+            null
+        );
+        assert.strictEqual(compile.callCount, 0);
+    });
+
+    it('skips Svelte compilation for ordinary template expressions', async () => {
+        const { plugin, document } = setup('<p>{model.va}</p>');
+        const compile = sinon
+            .stub(plugin as any, 'getSvelteDoc')
+            .throws(new Error('ordinary expression completion must not compile Svelte'));
+        const offset = document.getText().indexOf('model.va') + 'model.va'.length;
+
+        assert.strictEqual(
+            await plugin.getCompletions(document, document.positionAt(offset)),
+            null
+        );
+        assert.strictEqual(compile.callCount, 0);
+    });
+
     it('can cancel code action before promise resolved', async () => {
         const { plugin, document } = setup('<a></a>');
         const cancellationTokenSource = new CancellationTokenSource();

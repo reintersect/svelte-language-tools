@@ -27,25 +27,60 @@ file path for a stable JSON document, or to `stderr`/`1` for one prefixed JSON l
 Machine protocol stdout is never mixed with telemetry. The report includes materialised,
 transformed, reused, and written shadow counts plus phase timings and the exact native version.
 
-## Reintersect acceptance, 1 August 2026
+## Reintersect acceptance, 2 August 2026
 
-The post-fix full uncontended run used warm disk state, 10 alternating fresh-process pairs, 20 edit
-rounds at each required gap, and 200 open/change/close cycles with stock
-`@typescript/native-preview@7.0.0-dev.20260703.1`.
+The final uncontended run used 10 alternating fresh editor processes per engine over
+already-materialised disk state, 20 edit rounds at each required gap, and 200 open/change/close
+cycles. Stock was `@typescript/native-preview@7.0.0-dev.20260703.1`; Effect was measured separately
+and compared against stock with only its intentional Effect diagnostics allowlisted.
 
--   Editor cold p50/p95 was 6.41s/7.97s classic versus 4.59s/5.40s native (1.4x at p50).
--   A separate strict whole-project checker oracle completed in 17.3s classic versus 6.7s stock,
-    with field-identical diagnostics and normalized source-program membership.
--   Dependency discovery fell from roughly 13-17s to 1.45s by stopping at the first ambiguity and
-    immediately taking the same conservative declared-package fallback.
--   The warm incremental checker reused 663 Svelte shadows in 148ms with zero transforms or writes,
-    identical diagnostics, and stable shadow mtimes.
--   After 200 lifecycle cycles, open overlays returned 0 -> 0 and plateau RSS grew 3.9%.
--   The 80ms candidate failed the resource gate: p50/p95 improved 10.2%/11.6%, but CPU rose 31.4%
-    and native checks rose 46.7%. The default therefore remains 150ms.
--   The Effect engine passed the separate source-program comparison with only diagnostic codes
-    377021 and 377025 explicitly allowlisted as its intentional Effect checks.
+### Editor fresh-process pulls
 
-The native compiler phase is roughly 1.0-1.2s on this corpus. The remaining adapter cost is mainly
-project/config graph setup and the bounded dependency proof before fallback, not shadow
-transformation or native TypeScript execution.
+| Engine             |    p50 |    p95 |
+| ------------------ | -----: | -----: |
+| Classic TypeScript | 5407ms | 6490ms |
+| Stock tsgo         | 2960ms | 3655ms |
+| Effect tsgo        | 2926ms | 3648ms |
+
+These are fresh processes with warm materialisation state, not clean-disk first-project numbers.
+
+### Completion latency
+
+| Measurement         | Stock tsgo | Effect tsgo |
+| ------------------- | ---------: | ----------: |
+| First dropdown      |    179.3ms |     233.4ms |
+| Script member p95   |      ~15ms |        16ms |
+| Template member p95 |     14.2ms |      13.5ms |
+| Auto-import p95     |    190.4ms |     196.3ms |
+
+The member-completion fast path does not wait for full project synchronisation. Unsupported
+contexts also remain subject to the zero-child-request acceptance check.
+
+### Checker cold-cache cost and warm reuse
+
+| Checker state                    | Classic TypeScript | Stock tsgo | Effect tsgo |
+| -------------------------------- | -----------------: | ---------: | ----------: |
+| Clean-disk first materialisation |            14.304s |    33.058s |     35.044s |
+| Immediate warm rerun             |            13.299s |     8.205s |      8.240s |
+
+The clean native path is currently slower than classic. It includes first-time graph discovery,
+plan publication and shadow materialisation; the warm result must not be presented as cold-start
+performance. On the immediate warm run, both native engines reused 675 Svelte shadows, transformed
+and wrote zero, kept every shadow mtime stable, and returned field-for-field identical diagnostics
+to their corresponding cold run.
+
+Warm materialisation was still about 1.62s. The profile recorded roughly 0.90s for plan lookup
+across 20,510 stat inputs, 0.57s for `loadKit`, 0.185s for config loading and 0.099s for restore.
+These rounded phase timings are nested rather than additive. Actual source freshness checks cost
+only 7-8ms, so the remaining target is project/config and persisted-plan setup, not unchanged Svelte
+transforms.
+
+### 80ms versus 150ms quiescence gate
+
+| Engine      |  p50 at 80ms |  p95 at 80ms |        CPU | Native checks |
+| ----------- | -----------: | -----------: | ---------: | ------------: |
+| Stock tsgo  | 14.6% better | 12.8% better | 24.1% more |    33.3% more |
+| Effect tsgo | 14.4% better |  59.2% worse | 27.3% more |    29.8% more |
+
+The 80ms candidate failed the resource gate for both engines, and Effect also regressed p95
+materially. The tested default therefore remains 150ms.

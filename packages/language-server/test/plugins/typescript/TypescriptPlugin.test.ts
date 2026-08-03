@@ -25,6 +25,47 @@ const testDir = path.join(__dirname, 'testfiles');
 describe('TypescriptPlugin', function () {
     serviceWarmup(this, testDir);
 
+    it('releases resolver document and configuration subscriptions on dispose', () => {
+        const docManager = new DocumentManager((item) => new Document(item.uri, item.text));
+        const configManager = new LSConfigManager();
+        const originalDocumentOn = docManager.on.bind(docManager);
+        const originalConfigOnChange = configManager.onChange.bind(configManager);
+        let activeDocumentSubscriptions = 0;
+        let activeConfigSubscriptions = 0;
+
+        docManager.on = ((...args: Parameters<typeof docManager.on>) => {
+            const subscription = originalDocumentOn(...args);
+            activeDocumentSubscriptions++;
+            return {
+                dispose() {
+                    activeDocumentSubscriptions--;
+                    subscription.dispose();
+                }
+            };
+        }) as typeof docManager.on;
+        configManager.onChange = ((...args: Parameters<typeof configManager.onChange>) => {
+            const subscription = originalConfigOnChange(...args);
+            activeConfigSubscriptions++;
+            return {
+                dispose() {
+                    activeConfigSubscriptions--;
+                    subscription.dispose();
+                }
+            };
+        }) as typeof configManager.onChange;
+
+        const workspaceUris = [pathToUrl(testDir)];
+        const resolver = new LSAndTSDocResolver(docManager, workspaceUris, configManager);
+        const plugin = new TypeScriptPlugin(configManager, resolver, workspaceUris, docManager);
+        assert.strictEqual(activeDocumentSubscriptions, 2);
+        assert.strictEqual(activeConfigSubscriptions, 1);
+
+        plugin.dispose();
+        plugin.dispose();
+        assert.strictEqual(activeDocumentSubscriptions, 0);
+        assert.strictEqual(activeConfigSubscriptions, 0);
+    });
+
     function getUri(filename: string) {
         const filePath = path.join(__dirname, 'testfiles', filename);
         return pathToUrl(filePath);

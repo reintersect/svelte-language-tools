@@ -8,13 +8,17 @@
                 {
                     "source": "svelte",
                     "code": "block_unclosed",
-                    "range": [0, 0, 0, 1],
+                    "range": [4, 0, 4, 1],
                     "message": "Block was left open\nhttps://svelte.dev/e/block_unclosed",
                     "codeDescription": {
                         "href": "https://svelte.dev/docs/svelte/compiler-errors#block_unclosed"
                     }
                 }
             ]
+        },
+        {
+            "file": "src/_Button.svelte",
+            "diagnostics": []
         },
         {
             "file": "src/01-broken-each-destructure.svelte",
@@ -124,6 +128,34 @@
                     "message": "`<svelte:component>` must have a 'this' attribute\nhttps://svelte.dev/e/svelte_component_missing_this",
                     "codeDescription": {
                         "href": "https://svelte.dev/docs/svelte/compiler-errors#svelte_component_missing_this"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/09-debug-member-expression.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "debug_tag_invalid_arguments",
+                    "range": [4, 8, 4, 8],
+                    "message": "{@debug ...} arguments must be identifiers, not arbitrary expressions\nhttps://svelte.dev/e/debug_tag_invalid_arguments",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#debug_tag_invalid_arguments"
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/10-boundary-invalid-attribute.svelte",
+            "diagnostics": [
+                {
+                    "source": "svelte",
+                    "code": "svelte_boundary_invalid_attribute",
+                    "range": [0, 17, 0, 32],
+                    "message": "Valid attributes on `<svelte:boundary>` are `onerror` and `failed`\nhttps://svelte.dev/e/svelte_boundary_invalid_attribute",
+                    "codeDescription": {
+                        "href": "https://svelte.dev/docs/svelte/compiler-errors#svelte_boundary_invalid_attribute"
                     }
                 }
             ]

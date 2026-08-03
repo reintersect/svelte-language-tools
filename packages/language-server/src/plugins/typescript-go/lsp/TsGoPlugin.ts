@@ -48,6 +48,7 @@ import {
     DocumentManager,
     getLineOffsets,
     getNodeIfIsInComponentStartTag,
+    isInsideMoustacheTag,
     isInTag,
     mapRangeToGenerated,
     mapRangeToOriginal,
@@ -55,14 +56,32 @@ import {
     positionAt
 } from '../../../lib/documents';
 import { configLoader } from '../../../lib/documents/configLoader';
+import { getAttributeContextAtPosition } from '../../../lib/documents/parseHtml';
 import { getSemanticTokenLegends, TokenType } from '../../../lib/semanticToken/semanticTokenLegend';
 import { LSConfigManager, LSTypescriptConfig } from '../../../ls-config';
 import { Logger } from '../../../logger';
-import { isNotNullOrUndefined, isZeroLengthRange, pathToUrl, urlToPath } from '../../../utils';
-import { computeChangeRange, SvelteDocumentSnapshot } from '../../typescript/DocumentSnapshot';
+import {
+    isNotNullOrUndefined,
+    isZeroLengthRange,
+    normalizePath,
+    pathToUrl,
+    urlToPath
+} from '../../../utils';
+import {
+    computeChangeRange,
+    DocumentSnapshot,
+    SvelteDocumentSnapshot,
+    SvelteSnapshotOptions
+} from '../../typescript/DocumentSnapshot';
 import { mapAndFilterDiagnostics } from '../../typescript/features/DiagnosticsProvider';
 import { findContainingNode } from '../../typescript/features/utils';
-import { isGeneratedSvelteComponentName, isInScript } from '../../typescript/utils';
+import {
+    changeSvelteComponentName,
+    isGeneratedSvelteComponentName,
+    isInScript,
+    scriptElementKindToCompletionItemKind
+} from '../../typescript/utils';
+import { getNewScriptStartTag } from '../../typescript/features/utils';
 import {
     AppCompletionItem,
     AppCompletionList,
@@ -82,8 +101,13 @@ import {
 } from './mapping';
 import { computeBatchGraphSourceSignature, ShadowManager } from './ShadowManager';
 import { ProjectRegistry } from './ProjectRegistry';
+import { TsGoApiSession } from './TsGoApiSession';
 import { TsGoComponentInfo } from './TsGoComponentInfo';
 import { TsGoServer } from './TsGoServer';
+import {
+    IsolatedMemberCompletionProvider,
+    resolveIsolatedCompilerOptions
+} from './IsolatedMemberCompletion';
 
 /** How the request was served, so a "green" test run that silently fell back is detectable. */
 export interface TsGoStats {
@@ -98,6 +122,12 @@ export interface TsGoStats {
     cancellations: number;
     diagnosticCoalesced: number;
     diagnosticSuperseded: number;
+    completionApiHits: number;
+    completionApiFallbacks: number;
+    completionIsolatedHits: number;
+    completionIsolatedFallbacks: number;
+    syncCoalesced: number;
+    syncReused: number;
     materialisationCleanupRuns: number;
     materialisationCleanupSkips: number;
     phaseTimings: Map<string, { count: number; totalMs: number }>;
@@ -120,19 +150,73 @@ interface DiagnosticFlight {
     cancelled: boolean;
 }
 
+interface SvelteSyncIdentity {
+    document: Document;
+    documentVersion: number;
+    sourceText: string;
+    configPromise: Document['configPromise'];
+    structuralEpoch: number;
+    syncGeneration: number;
+    lifecycleRevision: number;
+}
+
+interface SvelteSyncFlight extends SvelteSyncIdentity {
+    promise: Promise<SyncedDocument | null>;
+}
+
+/**
+ * Source/program identity captured around a feature request. LSP cancellation is advisory: clients
+ * are allowed to edit a document without cancelling the outstanding request, so every response
+ * which is mapped through a Svelte snapshot must independently prove that snapshot is still current.
+ */
+interface FeatureRequestIdentity {
+    document?: Document;
+    documentVersion?: number;
+    sourceText?: string;
+    openedByClient: boolean;
+    filePath?: string;
+    lifecycleRevision?: number;
+    structuralEpoch: number;
+    syncGeneration: number;
+}
+
+interface NativeFeatureRequestIdentity extends FeatureRequestIdentity {
+    nativeGeneration: number | undefined;
+}
+
+interface CompletionRequestOwner {
+    uri: string;
+    documentVersion: number;
+    sourceFingerprint: string;
+    nativeGeneration: number | undefined;
+}
+
 interface TsGoPluginOptions {
     server: TsGoServer;
     projects: ProjectRegistry;
     docManager: DocumentManager;
     componentInfo?: TsGoComponentInfo;
+    apiSession?: TsGoApiSession;
     /** Optional for direct tests; editor setup always supplies it. */
     configManager?: LSConfigManager;
     /** Clears setup-level compiler/shim resolution after package graph changes. */
     invalidateEngineCaches?: () => void;
+    /** Fast current-file member completion while the full native project is still cold. */
+    isolatedMemberCompletions?: IsolatedMemberCompletionProvider;
+    resolveIsolatedSnapshotOptions?: (filePath: string) => SvelteSnapshotOptions;
+    /**
+     * Idle window before an editor-open buffer starts the full project graph in the background.
+     * Tests which need the old eager lifecycle can set this to zero.
+     */
+    backgroundSyncDelayMs?: number;
 }
 
 /** Internal control flow: an obsolete materialisation exits quietly instead of becoming a failure. */
 const MATERIALIZATION_INVALIDATED = Symbol('tsgo-materialization-invalidated');
+/** Internal hybrid-plugin signal: syntax is supported, but this buffer is still materialising. */
+export const TSGO_COMPLETION_DEFERRED = Symbol('tsgo-completion-deferred');
+const DEFAULT_BACKGROUND_SYNC_DELAY_MS = 500;
+const MATERIALISATION_EVENT_LOOP_BUDGET_MS = 8;
 
 /**
  * Serves TypeScript language features for `.svelte` files by proxying a child `tsgo --lsp`
@@ -151,8 +235,13 @@ export class TsGoPlugin implements Plugin {
     private readonly projects: ProjectRegistry;
     private readonly docManager: DocumentManager;
     private readonly componentInfo: TsGoComponentInfo | undefined;
+    private readonly apiSession: TsGoApiSession | undefined;
     private readonly configManager: LSConfigManager | undefined;
     private readonly invalidateEngineCaches: (() => void) | undefined;
+    private readonly isolatedMemberCompletions: IsolatedMemberCompletionProvider | undefined;
+    private readonly resolveIsolatedSnapshotOptions:
+        | ((filePath: string) => SvelteSnapshotOptions)
+        | undefined;
     /** Materialisation is per project: opening a second app must not skip its own shadows. */
     private readonly opened = new Map<ShadowManager, Promise<void>>();
     /** Manager-dependent shadow paths already materialised for each source. */
@@ -191,10 +280,36 @@ export class TsGoPlugin implements Plugin {
     private readonly diagnosticsInFlight = new Map<string, DiagnosticFlight>();
     /** At most one native diagnostic check executes per project at a time. */
     private readonly diagnosticProjectTails = new Map<string, Promise<void>>();
+    /** Project-generation listener is optional only for narrow test doubles. */
+    private readonly diagnosticProjectGenerationListener: { dispose(): void } | undefined;
     /** Complete Svelte-buffer lifecycle, serialized per source URI. */
     private readonly svelteLifecycle = new Map<string, Promise<void>>();
+    /** Close transitions which feature sync must not overtake after a reopen. */
+    private readonly svelteCloseLifecycle = new Map<string, Promise<void>>();
+    /** Invalidates work which crossed a close/reopen boundary for the same URI. */
+    private readonly svelteLifecycleRevisions = new Map<string, number>();
+    /** Same-buffer feature/lifecycle syncs share one transform and one child update. */
+    private readonly svelteSyncs = new Map<string, SvelteSyncFlight>();
+    /** Last fully-published sync, reused by every feature request for the same buffer revision. */
+    private readonly syncedSvelte = new Map<
+        string,
+        SvelteSyncIdentity & { result: SyncedDocument }
+    >();
+    /** One idle checker/API warmup per project; feature calls share its snapshot single-flight. */
+    private readonly initialApiWarmProjects = new Set<string>();
+    /** Changes on child/project replacement even when source text and structural epoch do not. */
+    private syncGeneration = 0;
     /** Client intent, updated synchronously so a close wins over a slow first materialisation. */
     private readonly desiredOpenSvelte = new Set<string>();
+    /** Coalesced idle warmup; completion requests push it back instead of racing it. */
+    private readonly backgroundSvelteSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    /** Dirty/closing buffers which must settle before cross-file semantic work. */
+    private readonly pendingSvelteSemanticSyncs = new Map<string, Promise<void>>();
+    private readonly backgroundSyncDelayMs: number;
+    /** Completion dropdowns have strict priority over graph discovery/materialisation. */
+    private foregroundCompletionLeases = 0;
+    private backgroundPermit: Promise<void> = Promise.resolve();
+    private releaseBackgroundPermit: (() => void) | undefined;
     /** Watched changes are processed in order; feature requests wait for the latest rebuild. */
     private watchWork: Promise<void> = Promise.resolve();
     /** Suppress duplicate notifications produced by overlapping outer watcher registrations. */
@@ -214,14 +329,22 @@ export class TsGoPlugin implements Plugin {
     /** null once we've looked and found no legend to translate through. */
     private legendMap: number[] | null | undefined;
     private legendModifierMap: number[] | null | undefined;
+    /** Every external listener owned by this plugin, released atomically on shutdown. */
+    private readonly subscriptions: Array<{ dispose(): void }> = [];
+    private disposed = false;
 
     constructor(options: TsGoPluginOptions) {
         this.server = options.server;
         this.projects = options.projects;
         this.docManager = options.docManager;
         this.componentInfo = options.componentInfo;
+        this.apiSession = options.apiSession;
         this.configManager = options.configManager;
         this.invalidateEngineCaches = options.invalidateEngineCaches;
+        this.isolatedMemberCompletions = options.isolatedMemberCompletions;
+        this.resolveIsolatedSnapshotOptions = options.resolveIsolatedSnapshotOptions;
+        this.backgroundSyncDelayMs =
+            options.backgroundSyncDelayMs ?? DEFAULT_BACKGROUND_SYNC_DELAY_MS;
         this.stats = {
             served: 0,
             fellBack: 0,
@@ -234,6 +357,12 @@ export class TsGoPlugin implements Plugin {
             cancellations: 0,
             diagnosticCoalesced: 0,
             diagnosticSuperseded: 0,
+            completionApiHits: 0,
+            completionApiFallbacks: 0,
+            completionIsolatedHits: 0,
+            completionIsolatedFallbacks: 0,
+            syncCoalesced: 0,
+            syncReused: 0,
             materialisationCleanupRuns: 0,
             materialisationCleanupSkips: 0,
             phaseTimings: new Map()
@@ -246,64 +375,105 @@ export class TsGoPlugin implements Plugin {
             enumerable: true,
             get: () => this.server.childOpenDocumentCount
         });
+        this.diagnosticProjectGenerationListener = (
+            this.server as TsGoServer & {
+                onProjectGenerationChange?: TsGoServer['onProjectGenerationChange'];
+            }
+        ).onProjectGenerationChange?.((projectKeys) =>
+            this.cancelSupersededProjectDiagnostics(projectKeys)
+        );
         this.tsGoConfigurationSignature = this.currentTsGoConfigurationSignature();
 
-        // Warm the project as soon as a file is opened, instead of making the first completion
-        // pay for materialising it. `ensureProjectOpened` memoises its promise, so the request
-        // that does come in awaits the already-running pass rather than starting another.
-        this.docManager.on('documentOpen', (document: Document) => {
-            const filePath = document.getFilePath();
-            if (!document.openedByClient || !filePath || !filePath.endsWith('.svelte')) {
-                return;
-            }
-            this.recordSavedSourceGraphBaseline(filePath, document.getText());
-            this.desiredOpenSvelte.add(filePath);
-            this.enqueueSvelteLifecycle(filePath, async () => {
-                await this.syncDocument(document);
-            });
-        });
+        // Warm after a short idle window. Starting this from the didOpen microtask used to run
+        // ProjectRegistry.forFile before the next JSON-RPC message could be dispatched, turning
+        // the first completion dropdown into a multi-second graph/cache operation.
+        this.subscriptions.push(
+            this.docManager.on('documentOpen', (document: Document) => {
+                const filePath = document.getFilePath();
+                if (!document.openedByClient || !filePath || !filePath.endsWith('.svelte')) {
+                    return;
+                }
+                this.recordSavedSourceGraphBaseline(filePath, document.getText());
+                this.advanceSvelteLifecycleRevision(filePath);
+                this.desiredOpenSvelte.add(filePath);
+                this.scheduleBackgroundSvelteSync(document);
+            })
+        );
 
         // Cross-file features must observe a dirty component even before a request is made in
         // that component. Eagerly forwarding changes keeps tsgo's project graph aligned with
         // the editor buffer while the on-disk shadow remains the saved baseline.
-        this.docManager.on('documentChange', (document: Document) => {
-            const filePath = document.getFilePath();
-            if (!document.openedByClient || !filePath || !filePath.endsWith('.svelte')) {
-                return;
-            }
-            this.desiredOpenSvelte.add(filePath);
-            this.enqueueSvelteLifecycle(filePath, async () => {
-                await this.syncDocument(document);
-            });
-        });
+        this.subscriptions.push(
+            this.docManager.on('documentChange', (document: Document) => {
+                const filePath = document.getFilePath();
+                if (!document.openedByClient || !filePath || !filePath.endsWith('.svelte')) {
+                    return;
+                }
+                this.desiredOpenSvelte.add(filePath);
+                this.scheduleBackgroundSvelteSync(document, true);
+            })
+        );
 
         // A client close must close the generated overlay too. Without this, tsgo and the
         // wrapper both retained every Svelte document ever opened for the lifetime of the
         // editor process.
-        this.docManager.on('documentClose', (document: Document) => {
-            const filePath = document.getFilePath();
-            if (!document.openedByClient || !filePath || !filePath.endsWith('.svelte')) {
+        this.subscriptions.push(
+            this.docManager.on('documentClose', (document: Document) => {
+                const filePath = document.getFilePath();
+                if (!document.openedByClient || !filePath || !filePath.endsWith('.svelte')) {
+                    return;
+                }
+                this.cancelBackgroundSvelteSync(filePath);
+                const closeRevision = this.advanceSvelteLifecycleRevision(filePath);
+                const closeGeneration = this.syncGeneration;
+                this.desiredOpenSvelte.delete(filePath);
+                this.syncedSvelte.delete(filePath);
+                const closeWork = this.enqueueSvelteLifecycle(filePath, async () => {
+                    try {
+                        const isCurrentClose = () =>
+                            (this.svelteLifecycleRevisions.get(filePath) ?? 0) === closeRevision &&
+                            this.syncGeneration === closeGeneration &&
+                            !this.desiredOpenSvelte.has(filePath);
+                        if (!isCurrentClose()) {
+                            return;
+                        }
+                        const shadows = this.projects.forFile(filePath);
+                        const shadowPath =
+                            this.svelteOverlayBySource.get(filePath) ??
+                            shadows.getShadowPath(filePath);
+                        if (!isCurrentClose()) {
+                            return;
+                        }
+                        this.svelteOverlayBySource.delete(filePath);
+                        shadows.unpinSnapshot?.(filePath);
+                        shadows.deleteSnapshot(filePath);
+                        this.componentInfo?.invalidateFile(shadowPath);
+                        await this.server.closeDocument(shadowPath);
+                        // A feature sync may have completed between the synchronous close intent and
+                        // this serialized child close. Never retain that now-unpinned snapshot.
+                        if (isCurrentClose()) {
+                            this.syncedSvelte.delete(filePath);
+                        }
+                    } catch (e) {
+                        Logger.debug('[tsgo] could not close Svelte overlay', e);
+                    }
+                });
+                this.svelteCloseLifecycle.set(filePath, closeWork);
+                this.trackPendingSvelteSemanticSync(filePath, closeWork);
+                void closeWork.finally(() => {
+                    if (this.svelteCloseLifecycle.get(filePath) === closeWork) {
+                        this.svelteCloseLifecycle.delete(filePath);
+                    }
+                });
+            })
+        );
+
+        const configSubscription = this.configManager?.onChange(() => {
+            if (this.disposed) {
                 return;
             }
-            this.desiredOpenSvelte.delete(filePath);
-            this.enqueueSvelteLifecycle(filePath, async () => {
-                try {
-                    const shadows = this.projects.forFile(filePath);
-                    const shadowPath =
-                        this.svelteOverlayBySource.get(filePath) ?? shadows.getShadowPath(filePath);
-                    this.svelteOverlayBySource.delete(filePath);
-                    shadows.unpinSnapshot?.(filePath);
-                    shadows.deleteSnapshot(filePath);
-                    this.componentInfo?.invalidateFile(shadowPath);
-                    await this.server.closeDocument(shadowPath);
-                } catch (e) {
-                    Logger.debug('[tsgo] could not close Svelte overlay', e);
-                }
-            });
-        });
-
-        this.configManager?.onChange(() => {
             this.componentInfo?.clearCache();
+            this.isolatedMemberCompletions?.invalidate();
             const signature = this.currentTsGoConfigurationSignature();
             if (signature === this.tsGoConfigurationSignature) {
                 return;
@@ -313,7 +483,7 @@ export class TsGoPlugin implements Plugin {
             this.configurationWork = this.configurationWork
                 .catch(() => undefined)
                 .then(async () => {
-                    if (generation !== this.configurationGeneration) {
+                    if (this.disposed || generation !== this.configurationGeneration) {
                         return;
                     }
                     // The pinned native preview accepts didChangeConfiguration but does not
@@ -330,6 +500,9 @@ export class TsGoPlugin implements Plugin {
                 Logger.debug('[tsgo] could not apply runtime TypeScript configuration', e)
             );
         });
+        if (configSubscription) {
+            this.subscriptions.push(configSubscription);
+        }
     }
 
     private currentTsGoConfigurationSignature(): string | undefined {
@@ -342,7 +515,10 @@ export class TsGoPlugin implements Plugin {
         });
     }
 
-    private enqueueSvelteLifecycle(filePath: string, operation: () => Promise<void>): void {
+    private enqueueSvelteLifecycle(
+        filePath: string,
+        operation: () => Promise<void>
+    ): Promise<void> {
         const previous = this.svelteLifecycle.get(filePath) ?? Promise.resolve();
         const next = previous
             .catch(() => undefined)
@@ -356,6 +532,114 @@ export class TsGoPlugin implements Plugin {
                 this.svelteLifecycle.delete(filePath);
             }
         });
+        return next;
+    }
+
+    private scheduleBackgroundSvelteSync(document: Document, dirty = false): void {
+        const filePath = document.getFilePath();
+        if (!filePath || !filePath.endsWith('.svelte')) {
+            return;
+        }
+        this.cancelBackgroundSvelteSync(filePath);
+        const run = () => {
+            this.backgroundSvelteSyncTimers.delete(filePath);
+            const work = this.enqueueSvelteLifecycle(filePath, async () => {
+                if (!this.svelteOverlayBySource.has(filePath)) {
+                    await this.awaitBackgroundPermit(true);
+                }
+                if (
+                    !document.openedByClient ||
+                    this.docManager.get(document.uri) !== document ||
+                    !this.desiredOpenSvelte.has(filePath)
+                ) {
+                    return;
+                }
+                await this.syncDocument(document, true);
+            });
+            if (dirty) {
+                this.trackPendingSvelteSemanticSync(filePath, work);
+            }
+        };
+        // Once this document has a native overlay, changes are incremental and cheap. Only the
+        // first graph/project publication needs the idle grace period.
+        if (dirty || this.backgroundSyncDelayMs <= 0 || this.svelteOverlayBySource.has(filePath)) {
+            run();
+            return;
+        }
+        const timer = setTimeout(run, this.backgroundSyncDelayMs);
+        timer.unref?.();
+        this.backgroundSvelteSyncTimers.set(filePath, timer);
+    }
+
+    private cancelBackgroundSvelteSync(filePath: string): void {
+        const timer = this.backgroundSvelteSyncTimers.get(filePath);
+        if (timer) {
+            clearTimeout(timer);
+            this.backgroundSvelteSyncTimers.delete(filePath);
+        }
+    }
+
+    private trackPendingSvelteSemanticSync(filePath: string, work: Promise<void>): void {
+        this.pendingSvelteSemanticSyncs.set(filePath, work);
+        void work.finally(() => {
+            if (this.pendingSvelteSemanticSyncs.get(filePath) === work) {
+                this.pendingSvelteSemanticSyncs.delete(filePath);
+            }
+        });
+    }
+
+    /**
+     * Keep project discovery and materialisation out of the completion dropdown's critical path.
+     * The returned release is idempotent so cancellation/error paths can safely share cleanup.
+     */
+    acquireCompletionPriority(document?: Document): () => void {
+        if (document && !this.hasCurrentSyncedDocument(document)) {
+            this.scheduleBackgroundSvelteSync(document);
+        }
+        if (this.foregroundCompletionLeases++ === 0) {
+            this.backgroundPermit = new Promise<void>((resolve) => {
+                this.releaseBackgroundPermit = resolve;
+            });
+        }
+        let released = false;
+        return () => {
+            if (released) {
+                return;
+            }
+            released = true;
+            if (this.foregroundCompletionLeases <= 0) {
+                return;
+            }
+            if (--this.foregroundCompletionLeases === 0) {
+                const release = this.releaseBackgroundPermit;
+                this.releaseBackgroundPermit = undefined;
+                release?.();
+                this.backgroundPermit = Promise.resolve();
+            }
+        };
+    }
+
+    /** Yield one event-loop turn, then wait until every active completion has settled. */
+    private async awaitBackgroundPermit(yieldTurn = false): Promise<void> {
+        if (yieldTurn) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        while (this.foregroundCompletionLeases > 0) {
+            await this.backgroundPermit;
+        }
+    }
+
+    /**
+     * A request in B can depend on an unsaved component A. Wait for every dirty buffer (or close
+     * which reverts one) queued before this request so native TypeScript never answers against the
+     * wrong overlay. A dirty lifecycle calls `syncDocument(..., true)` and therefore never waits
+     * on its own promise.
+     */
+    private async flushPendingSvelteSemanticSyncs(): Promise<void> {
+        while (this.pendingSvelteSemanticSyncs.size) {
+            const pending = [...this.pendingSvelteSemanticSyncs.values()];
+            await Promise.all(pending.map((work) => work.catch(() => undefined)));
+        }
     }
 
     private featureEnabled(feature: Exclude<keyof LSTypescriptConfig, 'enable'>): boolean {
@@ -377,7 +661,7 @@ export class TsGoPlugin implements Plugin {
         document: Document,
         snapshot: SvelteDocumentSnapshot,
         position: Position
-    ): { offset: number; tag: string | undefined } | undefined {
+    ): { offset: number; tag: string | undefined; resolutionKey?: string } | undefined {
         if (snapshot.parserError) {
             return undefined;
         }
@@ -393,6 +677,11 @@ export class TsGoPlugin implements Plugin {
             document.offsetAt(position)
         );
         if (!node) {
+            return undefined;
+        }
+        if (
+            !isComponentAttributeNamePosition(document.getText(), node, document.offsetAt(position))
+        ) {
             return undefined;
         }
         const generated = snapshot.getGeneratedPosition(document.positionAt(node.start + 1));
@@ -428,9 +717,27 @@ export class TsGoPlugin implements Plugin {
         const identifierEnd = generatedText.indexOf(')', identifierStart);
         const identifier = generatedText.slice(identifierStart, identifierEnd);
         const lastDot = identifier.lastIndexOf('.');
+        const tag = typeof (node as any).tag === 'string' ? (node as any).tag : undefined;
+        const attributesStart = tag ? node.start + tag.length + 1 : undefined;
+        const attributesEnd = node.startTagEnd;
+        // The component symbol cannot change while editing only this start tag's attributes.
+        // Hash everything else so import edits, lexical-scope edits, another occurrence, and
+        // unsaved retargets all get a distinct definition lookup without sacrificing the hot
+        // `<Button prop...>` typing loop.
+        const resolutionKey =
+            tag && attributesStart !== undefined && attributesEnd !== undefined
+                ? createHash('sha256')
+                      .update(tag)
+                      .update('\0')
+                      .update(document.getText().slice(0, attributesStart))
+                      .update('\0')
+                      .update(document.getText().slice(attributesEnd))
+                      .digest('base64url')
+                : undefined;
         return {
             offset: lastDot >= 0 ? identifierStart + lastDot + 1 : identifierStart,
-            tag: typeof (node as any).tag === 'string' ? (node as any).tag : undefined
+            tag,
+            resolutionKey
         };
     }
 
@@ -459,12 +766,19 @@ export class TsGoPlugin implements Plugin {
             openOverlays: this.stats.openOverlays,
             childOpenOverlays: this.stats.childOpenOverlays,
             pendingSvelteLifecycle: this.svelteLifecycle.size,
+            pendingBackgroundSvelteSync: this.backgroundSvelteSyncTimers.size,
             transformedShadows: this.stats.transformedShadows,
             reusedShadows: this.stats.reusedShadows,
             projectChecks: this.stats.projectChecks,
             cancellations: this.stats.cancellations,
             diagnosticCoalesced: this.stats.diagnosticCoalesced,
             diagnosticSuperseded: this.stats.diagnosticSuperseded,
+            completionApiHits: this.stats.completionApiHits,
+            completionApiFallbacks: this.stats.completionApiFallbacks,
+            completionIsolatedHits: this.stats.completionIsolatedHits,
+            completionIsolatedFallbacks: this.stats.completionIsolatedFallbacks,
+            syncCoalesced: this.stats.syncCoalesced,
+            syncReused: this.stats.syncReused,
             materialisationCleanupRuns: this.stats.materialisationCleanupRuns,
             materialisationCleanupSkips: this.stats.materialisationCleanupSkips,
             phaseTimings: Object.fromEntries(this.stats.phaseTimings)
@@ -649,6 +963,8 @@ export class TsGoPlugin implements Plugin {
 
     private advanceStructuralEpoch(): number {
         const epoch = ++this.structuralEpoch;
+        this.syncGeneration++;
+        this.syncedSvelte.clear();
         for (const [key, entry] of this.materialisationTails) {
             if (entry.epoch !== epoch) {
                 this.materialisationTails.delete(key);
@@ -679,9 +995,11 @@ export class TsGoPlugin implements Plugin {
         shadows: ShadowManager,
         assertCurrent: () => void
     ): Promise<void> {
+        await this.awaitBackgroundPermit(true);
         // Project/package discovery records manager-local scope and pending fingerprints. Never
         // let a pass which started against an older graph continue into that mutable state.
         assertCurrent();
+        const discoveryStarted = Date.now();
         const requiredFiles = [
             ...new Set([
                 ...shadows.findProjectSvelteFiles(),
@@ -689,7 +1007,14 @@ export class TsGoPlugin implements Plugin {
                 ...(shadows.getBatchMaterializedSvelteFiles?.() ?? [])
             ])
         ];
+        this.recordPhase('materialiseDiscovery', Date.now() - discoveryStarted);
         assertCurrent();
+        const configStarted = Date.now();
+        await shadows.refreshShadowKinds?.(requiredFiles);
+        assertCurrent();
+        shadows.writeOverlayTsconfig?.();
+        assertCurrent();
+        this.recordPhase('materialiseConfig', Date.now() - configStarted);
         const requiredShadowPaths = new Map(
             requiredFiles.map((file) => [file, shadows.getShadowPath(file)] as const)
         );
@@ -703,15 +1028,24 @@ export class TsGoPlugin implements Plugin {
         const written = new Set<string>();
         let reused = 0;
         let failures = 0;
-        let sinceYield = 0;
+        let overlayConfigNeedsRewrite = false;
+        let sliceStarted = Date.now();
+        const yieldIfNeeded = async () => {
+            if (
+                this.foregroundCompletionLeases === 0 &&
+                Date.now() - sliceStarted < MATERIALISATION_EVENT_LOOP_BUDGET_MS
+            ) {
+                return;
+            }
+            await this.awaitBackgroundPermit(true);
+            assertCurrent();
+            sliceStarted = Date.now();
+        };
         for (const filePath of files) {
             // The loop is synchronous fs work end to end; without yielding it blocks the event
-            // loop for the whole pass and every LSP request queues behind it. Recheck immediately
-            // after every yield so a structural watcher always wins before the next transform.
-            if (++sinceYield >= 50) {
-                sinceYield = 0;
-                await new Promise(setImmediate);
-            }
+            // loop for the whole pass and every LSP request queues behind it. A file-count budget
+            // still produced 400ms+ stalls for expensive transforms, so use elapsed time instead.
+            await yieldIfNeeded();
             assertCurrent();
             try {
                 const shadowPathIfFresh = requiredShadowPaths.get(filePath)!;
@@ -749,6 +1083,12 @@ export class TsGoPlugin implements Plugin {
                 assertCurrent();
                 const snapshot = shadows.transform(document);
                 const shadowPath = shadows.getShadowPath(filePath);
+                if (shadowPath !== shadowPathIfFresh) {
+                    requiredShadowPaths.set(filePath, shadowPath);
+                    liveShadowPaths.delete(shadowPathIfFresh);
+                    liveShadowPaths.add(shadowPath);
+                    overlayConfigNeedsRewrite = true;
+                }
                 const generatedText = shadows.rewriteBatchModuleSpecifiers
                     ? shadows.rewriteBatchModuleSpecifiers(snapshot.getFullText(), filePath)
                     : snapshot.getFullText();
@@ -771,6 +1111,12 @@ export class TsGoPlugin implements Plugin {
             }
         }
 
+        if (overlayConfigNeedsRewrite) {
+            assertCurrent();
+            shadows.writeOverlayTsconfig?.();
+            assertCurrent();
+        }
+
         assertCurrent();
         // Materialisation needs generated text only long enough to write the shadow. Client-open
         // documents stay hot; navigation can regenerate any other snapshot on demand.
@@ -787,10 +1133,7 @@ export class TsGoPlugin implements Plugin {
         // extension-substitutes into the mirror, creating two nominal type identities.
         for (const { originalPath, mirrorPath, kind } of shadows.getBatchSourceMirrorEntries?.() ??
             []) {
-            if (++sinceYield >= 50) {
-                sinceYield = 0;
-                await new Promise(setImmediate);
-            }
+            await yieldIfNeeded();
             assertCurrent();
             liveShadowPaths.add(mirrorPath);
             try {
@@ -877,35 +1220,244 @@ export class TsGoPlugin implements Plugin {
         this.recordPhase('materialise', Date.now() - started);
     }
 
+    /** Whether the exact client buffer revision has already been published to tsgo. */
+    private hasCurrentSyncedDocument(document: Document): boolean {
+        const filePath = document.getFilePath();
+        if (!filePath || !filePath.endsWith('.svelte')) {
+            return false;
+        }
+        const cached = this.syncedSvelte.get(filePath);
+        return !!cached && this.isCurrentSvelteSyncIdentity(filePath, cached);
+    }
+
     /** Bring a document's shadow up to date and hand back what's needed to map positions. */
-    private async syncDocument(document: Document): Promise<SyncedDocument | null> {
+    private async syncDocument(
+        document: Document,
+        alreadyInLifecycleQueue = false,
+        flushDirtySiblings = true
+    ): Promise<SyncedDocument | null> {
         await this.watchWork;
-        return this.syncDocumentNow(document, this.structuralEpoch);
+        const filePath = document.getFilePath();
+        if (!filePath || !filePath.endsWith('.svelte')) {
+            return null;
+        }
+        if (!alreadyInLifecycleQueue && flushDirtySiblings) {
+            await this.flushPendingSvelteSemanticSyncs();
+        }
+        if (!alreadyInLifecycleQueue) {
+            // didClose/didOpen operations own the same generated URI. A feature request arriving
+            // during that transition must observe the close tail; otherwise it can publish a
+            // reopened buffer immediately before an older delayed close deletes it. Ordinary
+            // open/change sync remains coalescible with the feature hot path.
+            while (true) {
+                const closeLifecycle = this.svelteCloseLifecycle.get(filePath);
+                if (!closeLifecycle) {
+                    break;
+                }
+                await closeLifecycle.catch(() => undefined);
+                if (this.svelteCloseLifecycle.get(filePath) === closeLifecycle) {
+                    break;
+                }
+            }
+        }
+
+        const identity: SvelteSyncIdentity = {
+            document,
+            documentVersion: document.version,
+            sourceText: document.getText(),
+            configPromise: document.configPromise,
+            structuralEpoch: this.structuralEpoch,
+            syncGeneration: this.syncGeneration,
+            lifecycleRevision: this.svelteLifecycleRevisions.get(filePath) ?? 0
+        };
+        const existing = this.svelteSyncs.get(filePath);
+        if (existing && sameSvelteSyncIdentity(existing, identity)) {
+            this.stats.syncCoalesced++;
+            return existing.promise;
+        }
+        // A different revision is still publishing. It must win or be rejected before an older
+        // cached A revision can be reused after an A -> B -> A edit/undo sequence.
+        if (!existing) {
+            const cached = this.syncedSvelte.get(filePath);
+            if (cached && sameSvelteSyncIdentity(cached, identity)) {
+                this.stats.syncReused++;
+                return cached.result;
+            }
+        }
+
+        // A later buffer revision waits for the previous notification to finish. Apart from
+        // preventing duplicate work, this guarantees that range edits are sent to the child in
+        // source order even when didChange and completion arrive in adjacent event-loop turns.
+        const previous = existing?.promise;
+        const flight = { ...identity } as SvelteSyncFlight;
+        const promise = (async () => {
+            await previous?.catch(() => undefined);
+            if (!this.isCurrentSvelteSyncIdentity(filePath, identity)) {
+                return null;
+            }
+            const result = await this.syncDocumentNow(
+                document,
+                identity.structuralEpoch,
+                identity.sourceText,
+                identity.configPromise,
+                identity.syncGeneration,
+                identity.documentVersion,
+                identity.lifecycleRevision
+            );
+            if (result && this.isCurrentSvelteSyncIdentity(filePath, identity)) {
+                this.syncedSvelte.set(filePath, { ...identity, result });
+            }
+            return result;
+        })().finally(() => {
+            if (this.svelteSyncs.get(filePath) === flight) {
+                this.svelteSyncs.delete(filePath);
+            }
+        });
+        flight.promise = promise;
+        this.svelteSyncs.set(filePath, flight);
+        return promise;
+    }
+
+    /**
+     * Hide the checker's first snapshot/project lookup behind the idle turn after the first
+     * successful pull-diagnostic response. Starting it from didOpen made the checker API contend
+     * with tsgo's first full project check, delaying the first squiggles by seconds on large apps.
+     *
+     * This stays fire-and-forget so a slow native snapshot never blocks a subsequent didChange
+     * or close in the per-document lifecycle queue. The full buffer identity and native
+     * generation are checked in the next event-loop turn; an edit/close/restart which wins that
+     * race cannot warm stale text. TsGoApiSession also generation-guards and single-flights the
+     * work once it has started, so an explicit feature arriving concurrently joins this lookup.
+     */
+    private scheduleInitialApiWarm(document: Document, synced: SyncedDocument): void {
+        if (!this.apiSession?.available || this.initialApiWarmProjects.has(synced.projectKey)) {
+            return;
+        }
+        const filePath = document.getFilePath();
+        if (!filePath) {
+            return;
+        }
+        const identity: SvelteSyncIdentity = {
+            document,
+            documentVersion: document.version,
+            sourceText: document.getText(),
+            configPromise: document.configPromise,
+            structuralEpoch: this.structuralEpoch,
+            syncGeneration: this.syncGeneration,
+            lifecycleRevision: this.svelteLifecycleRevisions.get(filePath) ?? 0
+        };
+        const nativeGeneration = this.server.generation;
+        setImmediate(() => {
+            if (
+                this.initialApiWarmProjects.has(synced.projectKey) ||
+                this.server.generation !== nativeGeneration ||
+                !this.isCurrentSvelteSyncIdentity(filePath, identity) ||
+                this.svelteOverlayBySource.get(filePath) !== synced.shadowPath
+            ) {
+                return;
+            }
+            this.initialApiWarmProjects.add(synced.projectKey);
+            const started = Date.now();
+            void this.apiSession!.warmProjectForFile(synced.shadowPath)
+                .then((warmed) => {
+                    if (!warmed) {
+                        this.initialApiWarmProjects.delete(synced.projectKey);
+                    }
+                })
+                .catch((error) => {
+                    this.initialApiWarmProjects.delete(synced.projectKey);
+                    Logger.debug('[tsgo] initial checker API warmup failed', error);
+                })
+                .finally(() => this.recordPhase('completionApiWarm', Date.now() - started));
+        });
+    }
+
+    private isCurrentSvelteSyncIdentity(filePath: string, identity: SvelteSyncIdentity): boolean {
+        return (
+            identity.document.getFilePath() === filePath &&
+            identity.document.openedByClient &&
+            this.docManager.get(identity.document.uri) === identity.document &&
+            this.desiredOpenSvelte.has(filePath) &&
+            identity.document.version === identity.documentVersion &&
+            identity.document.getText() === identity.sourceText &&
+            identity.document.configPromise === identity.configPromise &&
+            this.structuralEpoch === identity.structuralEpoch &&
+            this.syncGeneration === identity.syncGeneration &&
+            (this.svelteLifecycleRevisions.get(filePath) ?? 0) === identity.lifecycleRevision
+        );
+    }
+
+    private advanceSvelteLifecycleRevision(filePath: string): number {
+        const revision = (this.svelteLifecycleRevisions.get(filePath) ?? 0) + 1;
+        this.svelteLifecycleRevisions.set(filePath, revision);
+        return revision;
     }
 
     /** Internal form used by the structural rebuild itself, which must not await its own task. */
     private async syncDocumentNow(
         document: Document,
-        expectedStructuralEpoch: number
+        expectedStructuralEpoch: number,
+        expectedSourceText = document.getText(),
+        expectedConfigPromise = document.configPromise,
+        expectedSyncGeneration = this.syncGeneration,
+        expectedDocumentVersion = document.version,
+        expectedLifecycleRevision = this.svelteLifecycleRevisions.get(
+            document.getFilePath() ?? ''
+        ) ?? 0
     ): Promise<SyncedDocument | null> {
         const filePath = document.getFilePath();
         if (!filePath || !filePath.endsWith('.svelte')) {
             return null;
         }
+        // Always yield before the synchronous registry boundary. If a completion message is
+        // already waiting in the poll queue it can acquire priority before graph validation
+        // blocks this process.
+        if (!this.svelteOverlayBySource.has(filePath)) {
+            await this.awaitBackgroundPermit(true);
+        }
+        const configStarted = Date.now();
+        await expectedConfigPromise;
+        this.recordPhase('documentConfig', Date.now() - configStarted);
+        if (
+            expectedStructuralEpoch !== this.structuralEpoch ||
+            expectedSyncGeneration !== this.syncGeneration ||
+            expectedDocumentVersion !== document.version ||
+            expectedLifecycleRevision !== (this.svelteLifecycleRevisions.get(filePath) ?? 0) ||
+            expectedConfigPromise !== document.configPromise ||
+            expectedSourceText !== document.getText()
+        ) {
+            return null;
+        }
+        const projectResolveStarted = Date.now();
         const shadows = this.projects.forFile(filePath);
+        this.recordPhase('projectResolve', Date.now() - projectResolveStarted);
+        const projectReadyStarted = Date.now();
         await this.ensureProjectOpened(shadows);
-        await document.configPromise;
-        if (expectedStructuralEpoch !== this.structuralEpoch) {
+        this.recordPhase('projectReady', Date.now() - projectReadyStarted);
+        if (
+            expectedStructuralEpoch !== this.structuralEpoch ||
+            expectedSyncGeneration !== this.syncGeneration ||
+            expectedDocumentVersion !== document.version ||
+            expectedLifecycleRevision !== (this.svelteLifecycleRevisions.get(filePath) ?? 0) ||
+            expectedConfigPromise !== document.configPromise ||
+            expectedSourceText !== document.getText()
+        ) {
             return null;
         }
 
         const t0 = Date.now();
+        const configuredShadowPath = shadows.getShadowPath(filePath);
         if (document.openedByClient && this.desiredOpenSvelte.has(filePath)) {
             shadows.pinSnapshot?.(filePath);
         }
         const snapshot = shadows.transform(document);
         const t1 = Date.now();
         const shadowPath = shadows.getShadowPath(filePath);
+        if (shadowPath !== configuredShadowPath) {
+            // An unsaved `lang` edit can cross the JS/TS parse boundary after baseline
+            // materialisation. Publish the corrected root before opening it in the child.
+            shadows.writeOverlayTsconfig?.();
+        }
         const previousShadowPath = this.svelteOverlayBySource.get(filePath);
         if (previousShadowPath && previousShadowPath !== shadowPath) {
             this.componentInfo?.invalidateFile(previousShadowPath);
@@ -925,27 +1477,47 @@ export class TsGoPlugin implements Plugin {
                 : snapshot.getFullText();
             const previous = this.server.getOpenText(shadowPath);
             if (previous !== text) {
-                this.componentInfo?.invalidateFile(shadowPath);
+                // Definition cache keys include all source text except the current component's
+                // attributes. Retain those safe usage-site entries so typing another prop does
+                // not repay a native definition request; declaration type data is still evicted.
+                this.componentInfo?.invalidateFile(shadowPath, true);
             }
             if (this.server.isOpen(shadowPath)) {
                 await this.server.updateDocument(
                     shadowPath,
                     incrementalChanges(previous, text),
-                    text
+                    text,
+                    undefined,
+                    shadows.overlayTsconfigPath
                 );
             } else {
                 shadows.ensureShadowDirectory(shadowPath);
-                await this.server.openDocument(shadowPath, text);
+                await this.server.openDocument(
+                    shadowPath,
+                    text,
+                    languageIdForFile(shadowPath),
+                    shadows.overlayTsconfigPath
+                );
             }
             // A close or structural change which happened during child startup wins. Queueing
             // lifecycle operations normally closes this immediately, while this guard covers a
             // feature request which was not itself in that queue.
             if (
                 expectedStructuralEpoch !== this.structuralEpoch ||
+                expectedSyncGeneration !== this.syncGeneration ||
+                expectedDocumentVersion !== document.version ||
+                expectedLifecycleRevision !== (this.svelteLifecycleRevisions.get(filePath) ?? 0) ||
                 !this.desiredOpenSvelte.has(filePath)
             ) {
                 this.svelteOverlayBySource.delete(filePath);
                 await this.server.closeDocument(shadowPath);
+                return null;
+            }
+            if (
+                expectedConfigPromise !== document.configPromise ||
+                expectedDocumentVersion !== document.version ||
+                expectedSourceText !== document.getText()
+            ) {
                 return null;
             }
         }
@@ -994,10 +1566,9 @@ export class TsGoPlugin implements Plugin {
         if (!synced) {
             return { kind: 'full', items: [] };
         }
-        // The mapped result is a function of the shadow text and of everything else tsgo
-        // knows, all of which move the server generation (the sync above just bumped it if
-        // this document changed). Same generation ⇒ same answer, without asking tsgo.
-        const resultId = `g${this.server.generation}`;
+        // Pull answers are project-scoped. A change in another independent tsconfig must not
+        // invalidate this result id or pay for another whole-project native check.
+        const resultId = `g${this.diagnosticProjectGeneration(synced.projectKey)}`;
         if (previousResultId === resultId) {
             return { kind: 'unchanged', resultId };
         }
@@ -1019,7 +1590,7 @@ export class TsGoPlugin implements Plugin {
             });
             if (
                 cancellationToken?.isCancellationRequested ||
-                `g${this.server.generation}` !== resultId
+                `g${this.diagnosticProjectGeneration(synced.projectKey)}` !== resultId
             ) {
                 return previousResultId
                     ? { kind: 'unchanged', resultId: previousResultId }
@@ -1036,11 +1607,19 @@ export class TsGoPlugin implements Plugin {
                 ? { kind: 'unchanged', resultId: previousResultId }
                 : { kind: 'full', items: [] };
         }
+        // Do not let the checker API's first snapshot/project construction compete with this
+        // native project check. The setImmediate inside the scheduler lets this response return
+        // to the JSON-RPC layer first while preserving the synced buffer/generation identity.
+        this.scheduleInitialApiWarm(document, synced);
         // A different document can move the project generation in the narrow gap between the
         // quiescence guard and joining its diagnostic flight. A usable flight is guaranteed to
         // match the generation at delivery, so attach that generation rather than the earlier
         // optimistic id (which would force an unnecessary repeat check on the next pull).
-        return { kind: 'full', resultId: `g${this.server.generation}`, items };
+        return {
+            kind: 'full',
+            resultId: `g${this.diagnosticProjectGeneration(synced.projectKey)}`,
+            items
+        };
     }
 
     private collectDiagnosticsSingleFlight(
@@ -1048,7 +1627,7 @@ export class TsGoPlugin implements Plugin {
         cancellationToken: CancellationToken | undefined,
         tStart: number
     ): Promise<Diagnostic[] | null> {
-        const generation = this.server.generation;
+        const generation = this.diagnosticProjectGeneration(synced.projectKey);
         const key = `${synced.projectKey}:${generation}:${synced.shadowPath}`;
         const existing = this.diagnosticsInFlight.get(key);
         if (existing) {
@@ -1080,7 +1659,7 @@ export class TsGoPlugin implements Plugin {
             await previous?.catch(() => undefined);
             if (
                 internalCancellation.token.isCancellationRequested ||
-                this.server.generation !== generation
+                this.diagnosticProjectGeneration(synced.projectKey) !== generation
             ) {
                 return null;
             }
@@ -1105,6 +1684,27 @@ export class TsGoPlugin implements Plugin {
         });
         this.diagnosticsInFlight.set(key, entry);
         return this.waitForDiagnosticFlight(key, entry, cancellationToken);
+    }
+
+    /** Production servers expose project generations; old focused test doubles use global. */
+    private diagnosticProjectGeneration(projectKey: string): number {
+        const server = this.server as TsGoServer & {
+            projectGeneration?: (projectKey: string) => number;
+        };
+        return server.projectGeneration?.(projectKey) ?? this.server.generation;
+    }
+
+    /** Cancel only flights whose own project advanced; independent project work stays alive. */
+    private cancelSupersededProjectDiagnostics(projectKeys: readonly string[]): void {
+        const changed = new Set(projectKeys);
+        for (const [key, flight] of this.diagnosticsInFlight) {
+            if (
+                changed.has(flight.projectKey) &&
+                flight.generation !== this.diagnosticProjectGeneration(flight.projectKey)
+            ) {
+                this.cancelDiagnosticFlight(key, flight, true);
+            }
+        }
     }
 
     private cancelDiagnosticFlight(
@@ -1172,7 +1772,8 @@ export class TsGoPlugin implements Plugin {
                         resolve(
                             cancellationToken?.isCancellationRequested ||
                                 flight.cancellation.token.isCancellationRequested ||
-                                this.server.generation !== flight.generation
+                                this.diagnosticProjectGeneration(flight.projectKey) !==
+                                    flight.generation
                                 ? null
                                 : result
                         );
@@ -1211,6 +1812,7 @@ export class TsGoPlugin implements Plugin {
 
         let report: any;
         const tCheck = TIMING ? Date.now() : 0;
+        const nativeCheckStarted = Date.now();
         try {
             this.stats.projectChecks++;
             report = await this.server.sendRequest(
@@ -1231,13 +1833,14 @@ export class TsGoPlugin implements Plugin {
             this.fallback('diagnostic-request-failed');
             return null;
         }
+        this.recordPhase('diagnosticNative', Date.now() - nativeCheckStarted);
 
         // A different document, watcher event, or crash can change the program while the native
         // checker is running. Its response then belongs to the old program even if this file's
         // own text did not change, so publishing it would overwrite newer diagnostics.
         if (
             cancellationToken?.isCancellationRequested ||
-            this.server.generation !== expectedGeneration
+            this.diagnosticProjectGeneration(synced.projectKey) !== expectedGeneration
         ) {
             return null;
         }
@@ -1245,6 +1848,7 @@ export class TsGoPlugin implements Plugin {
         const items: any[] = report?.items ?? [];
         this.stats.served++;
         const tMap = TIMING ? Date.now() : 0;
+        const mapStarted = Date.now();
 
         if (TIMING) {
             // Severity 1=Error 2=Warning 3=Information 4=Hint. Anything above 2 is a suggestion:
@@ -1273,6 +1877,17 @@ export class TsGoPlugin implements Plugin {
             }
             const start = snapshot.offsetAt(diagnostic.range.start);
             const end = snapshot.offsetAt(diagnostic.range.end);
+            if (
+                this.isNativeOnlyMaterializedSvelteJs7016(
+                    sourceFile,
+                    start,
+                    Math.max(0, end - start),
+                    code,
+                    diagnostic.message
+                )
+            ) {
+                return [];
+            }
             const tsDiagnostic: ts.Diagnostic = {
                 file: sourceFile,
                 start,
@@ -1315,6 +1930,7 @@ export class TsGoPlugin implements Plugin {
                     : withRelatedInformation;
             });
         });
+        this.recordPhase('diagnosticMap', Date.now() - mapStarted);
 
         if (TIMING) {
             timing('tsgo', tMap - tCheck);
@@ -1322,6 +1938,41 @@ export class TsGoPlugin implements Plugin {
             timing('total', Date.now() - tStart);
         }
         return mapped;
+    }
+
+    /**
+     * Stock tsgo's LSP project service treats a generated JSX module below `node_modules` as an
+     * untyped external library even when the overlay config names that exact file as a root.
+     * The batch compiler consumes the same config correctly, so this is an LSP-only TS7016.
+     *
+     * Keep the parity exception deliberately narrower than the diagnostic text: it must point at
+     * an actual import/export module-specifier span ending in `.svelte`, name the corresponding
+     * `.svelte.jsx` path, map back through our reverse index, and still be owned by the current
+     * materialisation generation. Ordinary untyped JavaScript imports therefore remain visible.
+     */
+    private isNativeOnlyMaterializedSvelteJs7016(
+        sourceFile: ts.SourceFile,
+        start: number,
+        length: number,
+        code: number,
+        message: unknown
+    ): boolean {
+        if (
+            nativeSvelteModuleSpecifierAt7016(sourceFile, start, length, code) === undefined ||
+            typeof message !== 'string'
+        ) {
+            return false;
+        }
+        const shadowPath = nativeSvelteJsShadowPathFrom7016(message);
+        if (!shadowPath) {
+            return false;
+        }
+        const originalPath = this.projects.getOriginalPath(shadowPath);
+        if (!originalPath) {
+            return false;
+        }
+        const materialisations = this.materializedShadowsBySource.get(normalizePath(originalPath));
+        return [...(materialisations?.values() ?? [])].some((paths) => paths.has(shadowPath));
     }
 
     async doHover(
@@ -1332,10 +1983,14 @@ export class TsGoPlugin implements Plugin {
         if (!this.featureEnabled('hover') || cancellationToken?.isCancellationRequested) {
             return null;
         }
+        const sourceIdentity = this.captureFeatureRequest(document);
         const synced = await this.syncDocument(document);
-        if (!synced || cancellationToken?.isCancellationRequested) {
+        if (!synced || !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
             return null;
         }
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrentRequest = () =>
+            this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
         const { snapshot, shadowPath } = synced;
 
         const componentOffset = this.componentInfo
@@ -1345,9 +2000,11 @@ export class TsGoPlugin implements Plugin {
             const props = await this.componentInfo!.getProps(
                 shadowPath,
                 componentOffset.offset,
-                componentOffset.tag
+                componentOffset.tag,
+                componentOffset.resolutionKey,
+                isCurrentRequest
             );
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             if (props.length) {
@@ -1378,16 +2035,16 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (error) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             throw error;
         }
-        if (!hover || cancellationToken?.isCancellationRequested) {
+        if (!hover || !isCurrentRequest()) {
             return null;
         }
         const hoverRange = hover.range ? mapRangeToOriginal(snapshot, hover.range) : undefined;
-        if (cancellationToken?.isCancellationRequested) {
+        if (!isCurrentRequest()) {
             return null;
         }
         this.stats.served++;
@@ -1406,6 +2063,46 @@ export class TsGoPlugin implements Plugin {
         completionContext?: CompletionContext,
         cancellationToken?: CancellationToken
     ): Promise<AppCompletionList | null> {
+        const result = await this.getCompletionsInternal(
+            document,
+            position,
+            completionContext,
+            cancellationToken,
+            false
+        );
+        return result === TSGO_COMPLETION_DEFERRED ? null : result;
+    }
+
+    /**
+     * Completion entry point used by the hybrid editor plugin.
+     *
+     * didOpen/didChange already starts tsgo materialisation in the background. Until that exact
+     * buffer revision is published, waiting here would turn the first dropdown into a multi-second
+     * project-graph operation. Returning null after the cheap syntax exits lets the completion-only
+     * classic service answer immediately; the next keystroke switches to tsgo once it is ready.
+     */
+    async getCompletionsIfReady(
+        document: Document,
+        position: Position,
+        completionContext?: CompletionContext,
+        cancellationToken?: CancellationToken
+    ): Promise<AppCompletionList | null | typeof TSGO_COMPLETION_DEFERRED> {
+        return this.getCompletionsInternal(
+            document,
+            position,
+            completionContext,
+            cancellationToken,
+            true
+        );
+    }
+
+    private async getCompletionsInternal(
+        document: Document,
+        position: Position,
+        completionContext: CompletionContext | undefined,
+        cancellationToken: CancellationToken | undefined,
+        deferUntilReady: boolean
+    ): Promise<AppCompletionList | null | typeof TSGO_COMPLETION_DEFERRED> {
         if (
             !this.featureEnabled('completions') ||
             cancellationToken?.isCancellationRequested ||
@@ -1426,11 +2123,14 @@ export class TsGoPlugin implements Plugin {
 
         const originalOffset = document.offsetAt(position);
         const originalText = document.getText();
+        const originalVersion = document.version;
+        const isCurrentRequest = () =>
+            document.version === originalVersion && document.getText() === originalText;
         if (
             originalText.substring(originalOffset - 1, originalOffset + 2) === '></' ||
             (!isInTag(position, document.scriptInfo) &&
                 !isInTag(position, document.moduleScriptInfo) &&
-                (isClearlyPlainMarkup(originalText, originalOffset) ||
+                (isClearlyPlainMarkup(document, originalText, originalOffset) ||
                     /\{[#@:/][\w-]*$/.test(
                         originalText.slice(Math.max(0, originalOffset - 100), originalOffset)
                     )))
@@ -1438,8 +2138,26 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
 
-        const synced = await this.syncDocument(document);
-        if (!synced || cancellationToken?.isCancellationRequested) {
+        if (deferUntilReady && !this.hasCurrentSyncedDocument(document)) {
+            const isolated = await this.getIsolatedMemberCompletions(
+                document,
+                position,
+                originalText,
+                originalOffset,
+                isCurrentRequest,
+                cancellationToken
+            );
+            if (isolated) {
+                return isolated;
+            }
+            this.fallback('completion-project-not-ready');
+            return TSGO_COMPLETION_DEFERRED;
+        }
+
+        // Completion owns the foreground permit and must never wait for unrelated dirty buffers.
+        // Their immediate lifecycle work resumes as soon as the dropdown request releases it.
+        const synced = await this.syncDocument(document, false, false);
+        if (!synced || cancellationToken?.isCancellationRequested || !isCurrentRequest()) {
             return null;
         }
         const { snapshot, shadowPath } = synced;
@@ -1476,9 +2194,11 @@ export class TsGoPlugin implements Plugin {
             const props = await this.componentInfo!.getProps(
                 shadowPath,
                 componentOffset.offset,
-                componentOffset.tag
+                componentOffset.tag,
+                componentOffset.resolutionKey,
+                isCurrentRequest
             );
-            if (cancellationToken?.isCancellationRequested) {
+            if (cancellationToken?.isCancellationRequested || !isCurrentRequest()) {
                 return null;
             }
             if (props.length) {
@@ -1501,7 +2221,80 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
 
+        // The attached checker answers property/member lists without constructing the global
+        // auto-import catalogue or resolve payload. On the Reintersect corpus this is ~3ms after
+        // a change versus ~50-80ms through textDocument/completion. Keep globals on LSP: their
+        // opaque data is required to resolve and apply auto-import edits.
+        if (
+            this.apiSession?.available &&
+            isMemberAccessCompletion(document, originalText, originalOffset)
+        ) {
+            const apiStarted = Date.now();
+            const completionApiGeneration = this.server.generation;
+            const isCurrentApiRequest = () =>
+                !cancellationToken?.isCancellationRequested &&
+                isCurrentRequest() &&
+                this.server.generation === completionApiGeneration;
+            const completion = await this.apiSession.getCompletionsAtPosition(
+                shadowPath,
+                snapshot.offsetAt(generated),
+                completionContext?.triggerCharacter === '.' ? '.' : undefined,
+                isCurrentApiRequest
+            );
+            this.recordPhase('completionApi', Date.now() - apiStarted);
+            if (completion?.timings) {
+                this.recordPhase('completionApiProject', completion.timings.projectMs);
+                this.recordPhase('completionApiChecker', completion.timings.checkerMs);
+            }
+            if (!isCurrentApiRequest()) {
+                return null;
+            }
+            if (completion?.entries.length) {
+                this.stats.completionApiHits++;
+                this.stats.served++;
+                const uri = document.uri;
+                const defaultCommitCharacters = completion.isNewIdentifierLocation
+                    ? completion.defaultCommitCharacters
+                    : completion.defaultCommitCharacters
+                      ? [...new Set([...completion.defaultCommitCharacters, '('])]
+                      : TSGO_MEMBER_COMMIT_CHARACTERS;
+                return {
+                    isIncomplete: completion.isIncomplete,
+                    items: completion.entries.map((entry) => ({
+                        label: stripComponentSuffix(entry.name),
+                        ...(entry.kind ? { kind: entry.kind as CompletionItemKind } : {}),
+                        ...(entry.sortText ? { sortText: entry.sortText } : {}),
+                        ...(entry.insertText
+                            ? { insertText: stripComponentSuffix(entry.insertText) }
+                            : {}),
+                        ...(entry.filterText
+                            ? { filterText: stripComponentSuffix(entry.filterText) }
+                            : {}),
+                        ...(entry.detail ? { detail: entry.detail } : {}),
+                        ...(entry.labelDetails ? { labelDetails: entry.labelDetails } : {}),
+                        ...(entry.commitCharacters || defaultCommitCharacters
+                            ? {
+                                  commitCharacters:
+                                      entry.commitCharacters ?? defaultCommitCharacters
+                              }
+                            : {}),
+                        // PluginHost needs the source URI to route resolve. Checker entries are
+                        // already self-contained for member access; deliberately do not rebuild a
+                        // native completion list on focus (VS Code resolves the highlighted item
+                        // while the user is still typing, which erased the fast dropdown win).
+                        data: {
+                            uri,
+                            [TSGO_API_COMPLETION]: true
+                        }
+                    }))
+                };
+            }
+            this.stats.completionApiFallbacks++;
+        }
+
         let result: any;
+        const nativeStarted = Date.now();
+        const completionNativeGeneration = this.server.generation;
         try {
             result = await this.server.sendRequest(
                 'textDocument/completion',
@@ -1518,17 +2311,53 @@ export class TsGoPlugin implements Plugin {
             }
             throw error;
         }
-        if (!result || cancellationToken?.isCancellationRequested) {
+        this.recordPhase('completionNative', Date.now() - nativeStarted);
+        if (
+            !result ||
+            cancellationToken?.isCancellationRequested ||
+            !isCurrentRequest() ||
+            this.server.generation !== completionNativeGeneration
+        ) {
             return null;
         }
         this.stats.served++;
 
         const items: any[] = Array.isArray(result) ? result : (result.items ?? []);
+        const componentNode =
+            componentOffset !== undefined
+                ? getNodeIfIsInComponentStartTag(document.html, document, originalOffset)
+                : undefined;
+        const atComponentAttributeWhitespace =
+            !!componentNode?.tag &&
+            originalOffset > componentNode.start + 1 + componentNode.tag.length &&
+            /\s[\s>/]/.test(originalText.substring(originalOffset - 1, originalOffset + 1));
+        if (
+            items.length > 500 &&
+            (svelteNode?.type === 'Element' || atComponentAttributeWhitespace) &&
+            ![CompletionItemKind.Field, CompletionItemKind.Property].includes(items[0]?.kind)
+        ) {
+            // Native occasionally mistakes a start-tag attribute position for a global TS
+            // context. Classic filters the same >500-item false list; returning it makes every
+            // dropdown both slow and irrelevant while the HTML/Svelte providers already have
+            // the valid tag/directive answers.
+            return null;
+        }
         const uri = document.uri;
+        const completionOwner: CompletionRequestOwner = {
+            uri,
+            documentVersion: originalVersion,
+            sourceFingerprint: completionSourceFingerprint(originalText),
+            nativeGeneration: completionNativeGeneration
+        };
+        const mapStarted = Date.now();
         // Mutated in place: a global completion is thousands of items, and cloning each one
         // just to attach `data` dominated the post-request time.
         for (const item of items) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (
+                cancellationToken?.isCancellationRequested ||
+                !isCurrentRequest() ||
+                this.server.generation !== completionNativeGeneration
+            ) {
                 return null;
             }
             // `connection.onCompletionResolve` reads `item.data` as a TextDocumentIdentifier to
@@ -1539,7 +2368,12 @@ export class TsGoPlugin implements Plugin {
             //
             // tsgo's payload is nested rather than merged, so it round-trips back to tsgo exactly
             // as issued rather than with an extra key it never emitted.
-            item.data = { uri, [TSGO_DATA]: item.data };
+            item.data = {
+                uri,
+                [TSGO_DATA]: item.data,
+                [TSGO_COMPLETION_POSITION]: position,
+                [TSGO_COMPLETION_OWNER]: completionOwner
+            };
             // Component completions surface as `Button__SvelteComponent_`; the user wants to
             // see and insert `Button`.
             if (typeof item.label === 'string' && item.label.endsWith(COMPONENT_SUFFIX)) {
@@ -1558,14 +2392,105 @@ export class TsGoPlugin implements Plugin {
                 }
                 item.textEdit = mappedEdit;
             }
-            if (cancellationToken?.isCancellationRequested) {
+            if (item.additionalTextEdits) {
+                item.additionalTextEdits = this.mapCompletionAdditionalEdits(
+                    document,
+                    snapshot,
+                    item.additionalTextEdits,
+                    position,
+                    cancellationToken
+                );
+            }
+            if (
+                cancellationToken?.isCancellationRequested ||
+                !isCurrentRequest() ||
+                this.server.generation !== completionNativeGeneration
+            ) {
                 return null;
             }
         }
+        this.recordPhase('completionMap', Date.now() - mapStarted);
 
         return {
             isIncomplete: Array.isArray(result) ? false : (result.isIncomplete ?? false),
             items
+        };
+    }
+
+    private async getIsolatedMemberCompletions(
+        document: Document,
+        position: Position,
+        originalText: string,
+        originalOffset: number,
+        isCurrentRequest: () => boolean,
+        cancellationToken: CancellationToken | undefined
+    ): Promise<AppCompletionList | undefined> {
+        const provider = this.isolatedMemberCompletions;
+        const resolveSnapshotOptions = this.resolveIsolatedSnapshotOptions;
+        const filePath = document.getFilePath();
+        if (!provider || !resolveSnapshotOptions || !filePath) {
+            this.stats.completionIsolatedFallbacks++;
+            return undefined;
+        }
+        const classifyStarted = Date.now();
+        const isMember = isMemberAccessCompletion(document, originalText, originalOffset);
+        this.recordPhase('completionIsolatedClassify', Date.now() - classifyStarted);
+        if (!isMember) {
+            this.stats.completionIsolatedFallbacks++;
+            return undefined;
+        }
+
+        const configStarted = Date.now();
+        await document.configPromise;
+        this.recordPhase('completionIsolatedConfig', Date.now() - configStarted);
+        if (cancellationToken?.isCancellationRequested || !isCurrentRequest()) {
+            return undefined;
+        }
+
+        const transformStarted = Date.now();
+        const snapshot = DocumentSnapshot.fromDocument(document, resolveSnapshotOptions(filePath));
+        this.recordPhase('completionIsolatedTransform', Date.now() - transformStarted);
+        if (cancellationToken?.isCancellationRequested || !isCurrentRequest()) {
+            return undefined;
+        }
+        const generated = snapshot.getGeneratedPosition(position);
+        if (generated.line < 0) {
+            this.stats.completionIsolatedFallbacks++;
+            return undefined;
+        }
+
+        const compilerStarted = Date.now();
+        const compiler = resolveIsolatedCompilerOptions(filePath);
+        this.recordPhase('completionIsolatedCompilerOptions', Date.now() - compilerStarted);
+        const completion = provider.getCompletions({
+            filePath,
+            generatedText: snapshot.getFullText(),
+            generatedOffset: snapshot.offsetAt(generated),
+            version: document.version,
+            compilerOptions: compiler.options
+        });
+        if (!completion || cancellationToken?.isCancellationRequested || !isCurrentRequest()) {
+            this.stats.completionIsolatedFallbacks++;
+            return undefined;
+        }
+        this.recordPhase('completionIsolatedSlice', completion.timings.sliceMs);
+        this.recordPhase('completionIsolatedChecker', completion.timings.checkerMs);
+        this.stats.completionIsolatedHits++;
+        this.stats.served++;
+        return {
+            isIncomplete: completion.isIncomplete,
+            items: completion.entries.map((entry) => ({
+                label: stripComponentSuffix(entry.name),
+                kind: scriptElementKindToCompletionItemKind(entry.kind),
+                ...(entry.sortText ? { sortText: entry.sortText } : {}),
+                ...(entry.insertText ? { insertText: stripComponentSuffix(entry.insertText) } : {}),
+                ...(entry.filterText ? { filterText: stripComponentSuffix(entry.filterText) } : {}),
+                ...(entry.labelDetails ? { labelDetails: entry.labelDetails } : {}),
+                data: {
+                    uri: document.uri,
+                    [TSGO_ISOLATED_COMPLETION]: true
+                }
+            })) as CompletionItem[]
         };
     }
 
@@ -1575,6 +2500,89 @@ export class TsGoPlugin implements Plugin {
     // any that resolve purely into svelte2tsx scaffolding.
     // ---------------------------------------------------------------------------------------
 
+    private captureFeatureRequest(document?: Document): FeatureRequestIdentity {
+        const filePath =
+            document && typeof document.getFilePath === 'function'
+                ? (document.getFilePath() ?? undefined)
+                : undefined;
+        return {
+            document,
+            documentVersion: document?.version,
+            sourceText:
+                document && typeof document.getText === 'function' ? document.getText() : undefined,
+            openedByClient: !!document?.openedByClient,
+            filePath,
+            lifecycleRevision: filePath
+                ? (this.svelteLifecycleRevisions.get(filePath) ?? 0)
+                : undefined,
+            structuralEpoch: this.structuralEpoch,
+            syncGeneration: this.syncGeneration
+        };
+    }
+
+    private bindNativeGeneration(identity: FeatureRequestIdentity): NativeFeatureRequestIdentity {
+        return { ...identity, nativeGeneration: this.server.generation };
+    }
+
+    private isFeatureRequestCurrent(
+        identity: FeatureRequestIdentity | NativeFeatureRequestIdentity,
+        cancellationToken?: CancellationToken
+    ): boolean {
+        if (
+            cancellationToken?.isCancellationRequested ||
+            identity.structuralEpoch !== this.structuralEpoch ||
+            identity.syncGeneration !== this.syncGeneration
+        ) {
+            return false;
+        }
+        if (
+            'nativeGeneration' in identity &&
+            identity.nativeGeneration !== this.server.generation
+        ) {
+            return false;
+        }
+
+        const document = identity.document;
+        if (!document) {
+            return true;
+        }
+        if (
+            document.version !== identity.documentVersion ||
+            (identity.sourceText !== undefined &&
+                (typeof document.getText !== 'function' ||
+                    document.getText() !== identity.sourceText))
+        ) {
+            return false;
+        }
+        if (
+            identity.filePath &&
+            (this.svelteLifecycleRevisions.get(identity.filePath) ?? 0) !==
+                identity.lifecycleRevision
+        ) {
+            return false;
+        }
+        return (
+            !identity.openedByClient ||
+            (document.openedByClient && this.docManager.get(document.uri) === document)
+        );
+    }
+
+    private isRequestAtResponseCurrent(
+        response: { isCurrent?: () => boolean } | null | undefined,
+        cancellationToken?: CancellationToken
+    ): boolean {
+        return (
+            !!response &&
+            !cancellationToken?.isCancellationRequested &&
+            response.isCurrent?.() !== false
+        );
+    }
+
+    private sourceDocumentVersion(uri: string): number | null {
+        const managed = this.docManager.get(uri);
+        return managed?.openedByClient ? managed.version : null;
+    }
+
     private async requestAt<T>(
         document: Document,
         position: Position,
@@ -1582,17 +2590,24 @@ export class TsGoPlugin implements Plugin {
         extra: Record<string, unknown> = {},
         token?: CancellationToken,
         generatedPosition?: (synced: SyncedDocument) => Position | undefined
-    ): Promise<{ result: T; snapshot: SvelteDocumentSnapshot } | null> {
+    ): Promise<{
+        result: T;
+        snapshot: SvelteDocumentSnapshot;
+        isCurrent?: () => boolean;
+    } | null> {
         if (token?.isCancellationRequested) {
             return null;
         }
+        const sourceIdentity = this.captureFeatureRequest(document);
         const synced = await this.syncDocument(document);
-        if (!synced || token?.isCancellationRequested) {
+        if (!synced || !this.isFeatureRequestCurrent(sourceIdentity, token)) {
             return null;
         }
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrent = () => this.isFeatureRequestCurrent(requestIdentity, token);
         const generated =
             generatedPosition?.(synced) ?? synced.snapshot.getGeneratedPosition(position);
-        if (generated.line < 0 || token?.isCancellationRequested) {
+        if (generated.line < 0 || !isCurrent()) {
             return null;
         }
         try {
@@ -1605,13 +2620,13 @@ export class TsGoPlugin implements Plugin {
                 },
                 token
             );
-            if (token?.isCancellationRequested) {
+            if (!isCurrent()) {
                 return null;
             }
             this.stats.served++;
-            return { result, snapshot: synced.snapshot };
+            return { result, snapshot: synced.snapshot, isCurrent };
         } catch (e) {
-            if (token?.isCancellationRequested) {
+            if (!isCurrent()) {
                 return null;
             }
             Logger.debug(`[tsgo] ${method} failed`, e);
@@ -1663,7 +2678,7 @@ export class TsGoPlugin implements Plugin {
                 return component ? snapshot.positionAt(component.offset) : undefined;
             }
         );
-        if (!response) {
+        if (!response || !this.isRequestAtResponseCurrent(response, cancellationToken)) {
             return [];
         }
         const entries: any[] = Array.isArray(response.result)
@@ -1672,8 +2687,9 @@ export class TsGoPlugin implements Plugin {
               ? [response.result]
               : [];
         const definitions: DefinitionLink[] = [];
+        const seenDefinitions = new Set<string>();
         for (const entry of entries) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isRequestAtResponseCurrent(response, cancellationToken)) {
                 return [];
             }
             const targetUri = entry.targetUri ?? entry.uri;
@@ -1686,7 +2702,7 @@ export class TsGoPlugin implements Plugin {
                 targetSelectionRange,
                 cancellationToken
             );
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isRequestAtResponseCurrent(response, cancellationToken)) {
                 return [];
             }
             if (!selection) {
@@ -1695,9 +2711,19 @@ export class TsGoPlugin implements Plugin {
             const origin = entry.originSelectionRange
                 ? mapRangeToOriginal(response.snapshot, entry.originSelectionRange)
                 : undefined;
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isRequestAtResponseCurrent(response, cancellationToken)) {
                 return [];
             }
+            const mappedOrigin = isMapped(origin) ? origin : undefined;
+            // A Svelte 5 component can resolve through both its generated variable declaration
+            // and generated default export. Both native targets map to the same source anchor;
+            // expose that anchor once, matching the classic provider and avoiding duplicate
+            // locations in the editor's definition picker.
+            const identity = JSON.stringify([selection.uri, selection.range, mappedOrigin]);
+            if (seenDefinitions.has(identity)) {
+                continue;
+            }
+            seenDefinitions.add(identity);
             definitions.push(
                 LocationLink.create(
                     selection.uri,
@@ -1706,7 +2732,7 @@ export class TsGoPlugin implements Plugin {
                     // normalize it so editor navigation has the same source-level contract.
                     selection.range,
                     selection.range,
-                    isMapped(origin) ? origin : undefined
+                    mappedOrigin
                 )
             );
         }
@@ -1777,7 +2803,9 @@ export class TsGoPlugin implements Plugin {
             {},
             cancellationToken
         );
-        return response ? this.toLocations(response.result, cancellationToken) : null;
+        return this.isRequestAtResponseCurrent(response, cancellationToken)
+            ? this.toLocations(response!.result, cancellationToken)
+            : null;
     }
 
     async getImplementation(
@@ -1792,7 +2820,9 @@ export class TsGoPlugin implements Plugin {
             {},
             cancellationToken
         );
-        return response ? this.toLocations(response.result, cancellationToken) : null;
+        return this.isRequestAtResponseCurrent(response, cancellationToken)
+            ? this.toLocations(response!.result, cancellationToken)
+            : null;
     }
 
     async findReferences(
@@ -1808,7 +2838,9 @@ export class TsGoPlugin implements Plugin {
             { context: { includeDeclaration: context?.includeDeclaration ?? true } },
             cancellationToken
         );
-        return response ? this.toLocations(response.result, cancellationToken) : null;
+        return this.isRequestAtResponseCurrent(response, cancellationToken)
+            ? this.toLocations(response!.result, cancellationToken)
+            : null;
     }
 
     async findDocumentHighlight(
@@ -1823,17 +2855,17 @@ export class TsGoPlugin implements Plugin {
             {},
             cancellationToken
         );
-        if (!response) {
+        if (!response || !this.isRequestAtResponseCurrent(response, cancellationToken)) {
             return null;
         }
         const highlights: any[] = response.result ?? [];
         const mappedHighlights: DocumentHighlight[] = [];
         for (const highlight of highlights) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isRequestAtResponseCurrent(response, cancellationToken)) {
                 return null;
             }
             const range = mapRangeToOriginal(response.snapshot, highlight.range);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isRequestAtResponseCurrent(response, cancellationToken)) {
                 return null;
             }
             if (isMapped(range)) {
@@ -1859,7 +2891,9 @@ export class TsGoPlugin implements Plugin {
             context ? { context } : {},
             cancellationToken
         );
-        return response?.result ?? null;
+        return this.isRequestAtResponseCurrent(response, cancellationToken)
+            ? (response!.result ?? null)
+            : null;
     }
 
     async getSelectionRange(
@@ -1870,12 +2904,16 @@ export class TsGoPlugin implements Plugin {
         if (!this.featureEnabled('selectionRange') || cancellationToken?.isCancellationRequested) {
             return null;
         }
+        const sourceIdentity = this.captureFeatureRequest(document);
         const synced = await this.syncDocument(document);
-        if (!synced || cancellationToken?.isCancellationRequested) {
+        if (!synced || !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
             return null;
         }
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrentRequest = () =>
+            this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
         const generated = synced.snapshot.getGeneratedPosition(position);
-        if (generated.line < 0) {
+        if (generated.line < 0 || !isCurrentRequest()) {
             return null;
         }
         let result: any;
@@ -1889,12 +2927,12 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (error) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             throw error;
         }
-        if (cancellationToken?.isCancellationRequested) {
+        if (!isCurrentRequest()) {
             return null;
         }
         const first = Array.isArray(result) ? result[0] : result;
@@ -1906,11 +2944,11 @@ export class TsGoPlugin implements Plugin {
         // Walk the parent chain, keeping only the levels that survive mapping.
         const levels: Range[] = [];
         for (let node = first; node; node = node.parent) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             const range = mapRangeToOriginal(synced.snapshot, node.range);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             if (isMapped(range)) {
@@ -1941,10 +2979,14 @@ export class TsGoPlugin implements Plugin {
         if (!this.featureEnabled('semanticTokens')) {
             return { data: [] };
         }
+        const sourceIdentity = this.captureFeatureRequest(document);
         const synced = await this.syncDocument(document);
-        if (!synced || cancellationToken?.isCancellationRequested) {
+        if (!synced || !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
             return null;
         }
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrentRequest = () =>
+            this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
         const { snapshot, shadowPath } = synced;
 
         // A range request (the editor asks viewport-sized ones) maps to the generated range
@@ -1978,14 +3020,14 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (e) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             Logger.debug('[tsgo] semanticTokens failed', e);
             this.fallback('semanticTokens');
             return null;
         }
-        if (cancellationToken?.isCancellationRequested) {
+        if (!isCurrentRequest()) {
             return null;
         }
         if (!result?.data?.length) {
@@ -1999,9 +3041,9 @@ export class TsGoPlugin implements Plugin {
 
         for (const [line, char, length, type, modifiers] of decodeSemanticTokens(
             result.data,
-            () => !!cancellationToken?.isCancellationRequested
+            () => !isCurrentRequest()
         )) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             const tokenType = legendMap ? legendMap[type] : type;
@@ -2009,7 +3051,7 @@ export class TsGoPlugin implements Plugin {
                 continue;
             }
             const target = mapTokenRangeBack(snapshot, line, char, length);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             if (!target) {
@@ -2052,13 +3094,13 @@ export class TsGoPlugin implements Plugin {
             ]);
         }
 
-        if (cancellationToken?.isCancellationRequested) {
+        if (!isCurrentRequest()) {
             return null;
         }
         // The builder requires ascending order, and mapping can reorder tokens.
         mapped.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
         for (const token of mapped) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             builder.push(...token);
@@ -2073,10 +3115,14 @@ export class TsGoPlugin implements Plugin {
         if (!this.featureEnabled('documentSymbols') || cancellationToken?.isCancellationRequested) {
             return [];
         }
+        const sourceIdentity = this.captureFeatureRequest(document);
         const synced = await this.syncDocument(document);
-        if (!synced || cancellationToken?.isCancellationRequested) {
+        if (!synced || !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
             return [];
         }
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrentRequest = () =>
+            this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
         let result: any;
         try {
             result = await this.server.sendRequest(
@@ -2087,19 +3133,19 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (error) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return [];
             }
             throw error;
         }
-        if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
+        if (!Array.isArray(result) || !isCurrentRequest()) {
             return [];
         }
         this.stats.served++;
 
         const out: SymbolInformation[] = [];
         const visit = (node: any, container?: string): boolean => {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return false;
             }
             const selection = node.selectionRange ?? node.range ?? node.location?.range;
@@ -2107,7 +3153,7 @@ export class TsGoPlugin implements Plugin {
                 return true;
             }
             const mapped = mapRangeToOriginal(synced.snapshot, selection);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return false;
             }
             // The shadow is .tsx, so every element in the generated template shows up as a JSX
@@ -2121,7 +3167,7 @@ export class TsGoPlugin implements Plugin {
                 isZeroLengthRange(mapped) ||
                 !isInScript(mapped.start, synced.snapshot) ||
                 inGeneratedRegion(synced.snapshot, synced.snapshot.offsetAt(selection.start));
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return false;
             }
             if (!isSynthetic && isMapped(mapped)) {
@@ -2158,10 +3204,14 @@ export class TsGoPlugin implements Plugin {
         ) {
             return null;
         }
+        const sourceIdentity = this.captureFeatureRequest(document);
         const synced = await this.syncDocument(document);
-        if (!synced || cancellationToken?.isCancellationRequested) {
+        if (!synced || !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
             return null;
         }
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrentRequest = () =>
+            this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
         const mappedStart = synced.snapshot.getGeneratedPosition(range.start);
         const mappedEnd = synced.snapshot.getGeneratedPosition(range.end);
         // Viewport ranges commonly begin or end in markup, which has no direct generated
@@ -2183,12 +3233,12 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (error) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             throw error;
         }
-        if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
+        if (!Array.isArray(result) || !isCurrentRequest()) {
             return null;
         }
         this.stats.served++;
@@ -2201,21 +3251,21 @@ export class TsGoPlugin implements Plugin {
         );
         const mappedHints: InlayHint[] = [];
         for (const hint of result) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             const generatedOnly =
                 !hint?.position ||
                 inGeneratedRegion(synced.snapshot, synced.snapshot.offsetAt(hint.position)) ||
                 isGeneratedParameterInlayHint(generatedSourceFile, synced.snapshot, hint);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             if (generatedOnly) {
                 continue;
             }
             const position = synced.snapshot.getOriginalPosition(hint.position);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             if (position.line < 0) {
@@ -2225,7 +3275,7 @@ export class TsGoPlugin implements Plugin {
             if (Array.isArray(hint.label)) {
                 const parts: any[] = [];
                 for (const part of hint.label) {
-                    if (cancellationToken?.isCancellationRequested) {
+                    if (!isCurrentRequest()) {
                         return null;
                     }
                     if (!part.location) {
@@ -2237,7 +3287,7 @@ export class TsGoPlugin implements Plugin {
                         part.location.uri,
                         part.location.range
                     );
-                    if (cancellationToken?.isCancellationRequested) {
+                    if (!isCurrentRequest()) {
                         return null;
                     }
                     // Keep the visible label even when its optional navigation target is
@@ -2250,7 +3300,7 @@ export class TsGoPlugin implements Plugin {
             const textEdits = hint.textEdits
                 ? this.mapEditsForDocument(document, hint.textEdits, cancellationToken)
                 : undefined;
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             mappedHints.push({ ...hint, position, textEdits, label });
@@ -2265,8 +3315,15 @@ export class TsGoPlugin implements Plugin {
         if (cancellationToken?.isCancellationRequested) {
             return [];
         }
+        const sourceIdentity = this.captureFeatureRequest(document);
         const synced = await this.syncDocument(document);
-        if (!synced || cancellationToken?.isCancellationRequested) {
+        if (!synced || !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
+            return [];
+        }
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrentRequest = () =>
+            this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
+        if (!isCurrentRequest()) {
             return [];
         }
         let result: any;
@@ -2279,25 +3336,25 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (error) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return [];
             }
             throw error;
         }
-        if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
+        if (!Array.isArray(result) || !isCurrentRequest()) {
             return [];
         }
         this.stats.served++;
         const ranges: FoldingRange[] = [];
         for (const folding of result) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return [];
             }
             const mapped = mapRangeToOriginal(synced.snapshot, {
                 start: { line: folding.startLine, character: folding.startCharacter ?? 0 },
                 end: { line: folding.endLine, character: folding.endCharacter ?? 0 }
             });
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return [];
             }
             if (isMapped(mapped) && mapped.end.line > mapped.start.line) {
@@ -2312,7 +3369,7 @@ export class TsGoPlugin implements Plugin {
                 );
             }
         }
-        return ranges;
+        return isCurrentRequest() ? ranges : [];
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2331,15 +3388,15 @@ export class TsGoPlugin implements Plugin {
             {},
             cancellationToken
         );
-        if (!response?.result) {
+        if (!response?.result || !this.isRequestAtResponseCurrent(response, cancellationToken)) {
             return null;
         }
-        if (cancellationToken?.isCancellationRequested) {
+        if (!this.isRequestAtResponseCurrent(response, cancellationToken)) {
             return null;
         }
         const raw = response.result.range ?? response.result;
         const mapped = mapRangeToOriginal(response.snapshot, raw);
-        if (cancellationToken?.isCancellationRequested) {
+        if (!this.isRequestAtResponseCurrent(response, cancellationToken)) {
             return null;
         }
         return isMapped(mapped) ? mapped : null;
@@ -2358,11 +3415,12 @@ export class TsGoPlugin implements Plugin {
             { newName },
             cancellationToken
         );
-        return response
+        return this.isRequestAtResponseCurrent(response, cancellationToken)
             ? mapWorkspaceEditBack(
                   this.projects,
-                  response.result,
-                  () => !!cancellationToken?.isCancellationRequested
+                  response!.result,
+                  () => !this.isRequestAtResponseCurrent(response, cancellationToken),
+                  (uri) => this.sourceDocumentVersion(uri)
               )
             : null;
     }
@@ -2376,8 +3434,9 @@ export class TsGoPlugin implements Plugin {
         if (!this.featureEnabled('codeActions') || cancellationToken?.isCancellationRequested) {
             return [];
         }
+        const sourceIdentity = this.captureFeatureRequest(document);
         const synced = await this.syncDocument(document);
-        if (!synced || cancellationToken?.isCancellationRequested) {
+        if (!synced || !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
             return [];
         }
         const start = synced.snapshot.getGeneratedPosition(range.start);
@@ -2390,11 +3449,11 @@ export class TsGoPlugin implements Plugin {
         // the quick fixes it knows about.
         const diagnostics: Diagnostic[] = [];
         for (const diagnostic of context?.diagnostics ?? []) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
                 return [];
             }
             const generated = mapRangeToGenerated(synced.snapshot, diagnostic.range);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
                 return [];
             }
             if (isMapped(generated)) {
@@ -2402,6 +3461,9 @@ export class TsGoPlugin implements Plugin {
             }
         }
 
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrentRequest = () =>
+            this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
         let result: any;
         try {
             result = await this.server.sendRequest(
@@ -2414,21 +3476,21 @@ export class TsGoPlugin implements Plugin {
                 cancellationToken
             );
         } catch (e) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return [];
             }
             Logger.debug('[tsgo] codeAction failed', e);
             this.fallback('codeAction');
             return [];
         }
-        if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
+        if (!Array.isArray(result) || !isCurrentRequest()) {
             return [];
         }
         this.stats.served++;
 
         const actions: CodeAction[] = [];
         for (const action of result) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return [];
             }
             const data =
@@ -2444,9 +3506,10 @@ export class TsGoPlugin implements Plugin {
             const edit = mapWorkspaceEditBack(
                 this.projects,
                 action.edit,
-                () => !!cancellationToken?.isCancellationRequested
+                () => !isCurrentRequest(),
+                (uri) => this.sourceDocumentVersion(uri)
             );
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return [];
             }
             if (edit) {
@@ -2457,33 +3520,38 @@ export class TsGoPlugin implements Plugin {
     }
 
     async resolveCodeAction(
-        _document: Document,
+        document: Document,
         codeAction: CodeAction,
         cancellationToken?: CancellationToken
     ): Promise<CodeAction> {
         if (!this.featureEnabled('codeActions') || cancellationToken?.isCancellationRequested) {
             return codeAction;
         }
+        const sourceIdentity = this.captureFeatureRequest(document);
         try {
             const data: any = codeAction.data;
             if (!data || typeof data !== 'object' || !(TSGO_DATA in data)) {
                 return codeAction;
             }
+            const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+            const isCurrentRequest = () =>
+                this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
             const forwarded = { ...codeAction, data: data[TSGO_DATA] };
             const resolved: any = await this.server.sendRequest(
                 'codeAction/resolve',
                 forwarded,
                 cancellationToken
             );
-            if (!resolved || cancellationToken?.isCancellationRequested) {
+            if (!resolved || !isCurrentRequest()) {
                 return codeAction;
             }
             const edit = mapWorkspaceEditBack(
                 this.projects,
                 resolved?.edit,
-                () => !!cancellationToken?.isCancellationRequested
+                () => !isCurrentRequest(),
+                (uri) => this.sourceDocumentVersion(uri)
             );
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return codeAction;
             }
             const { edit: _generatedEdit, ...resolvedWithoutEdit } = resolved;
@@ -2494,7 +3562,10 @@ export class TsGoPlugin implements Plugin {
                 ...(edit ? { edit } : {})
             };
         } catch (e) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (
+                cancellationToken?.isCancellationRequested ||
+                !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)
+            ) {
                 return codeAction;
             }
             Logger.debug('[tsgo] codeAction/resolve failed', e);
@@ -2503,7 +3574,7 @@ export class TsGoPlugin implements Plugin {
     }
 
     async resolveCompletion(
-        _document: Document,
+        document: Document,
         completionItem: AppCompletionItem,
         cancellationToken?: CancellationToken
     ): Promise<AppCompletionItem> {
@@ -2512,36 +3583,104 @@ export class TsGoPlugin implements Plugin {
         }
         try {
             const data: any = completionItem.data;
+            if (
+                data &&
+                typeof data === 'object' &&
+                (data[TSGO_API_COMPLETION] === true || data[TSGO_ISOLATED_COMPLETION] === true)
+            ) {
+                return completionItem;
+            }
+            const completionOwner = completionRequestOwner(data?.[TSGO_COMPLETION_OWNER]);
+            if (
+                !completionOwner ||
+                !completionOwnerMatches(document, completionOwner, this.server)
+            ) {
+                return completionItem;
+            }
+            const sourceIdentity = this.captureFeatureRequest(document);
+            const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+            const isCurrentRequest = () =>
+                this.isFeatureRequestCurrent(requestIdentity, cancellationToken) &&
+                completionOwner.nativeGeneration === this.server.generation;
+            if (!isCurrentRequest()) {
+                return completionItem;
+            }
+            // List-time edits have already been source-mapped. Do not round-trip them through the
+            // generated-file server: tsgo may echo those fields and we would map the original
+            // coordinates a second time. The opaque data is sufficient for native resolve.
+            const {
+                textEdit: listTextEdit,
+                additionalTextEdits: listAdditionalTextEdits,
+                ...completionWithoutMappedEdits
+            } = completionItem;
             const forwarded =
                 data && typeof data === 'object' && TSGO_DATA in data
-                    ? { ...completionItem, data: data[TSGO_DATA] }
-                    : completionItem;
+                    ? { ...completionWithoutMappedEdits, data: data[TSGO_DATA] }
+                    : completionWithoutMappedEdits;
+            const resolveStarted = Date.now();
             const resolved: any = await this.server.sendRequest(
                 'completionItem/resolve',
                 forwarded,
                 cancellationToken
             );
-            if (!resolved || cancellationToken?.isCancellationRequested) {
+            this.recordPhase('completionResolveNative', Date.now() - resolveStarted);
+            if (!resolved || !isCurrentRequest()) {
                 return completionItem;
             }
-            // additionalTextEdits are auto-imports written into the generated file; they have to
-            // come back to the original or they would be applied at the wrong offset.
-            const additionalTextEdits = resolved.additionalTextEdits
-                ? this.mapEditsForDocument(
-                      _document,
-                      resolved.additionalTextEdits,
-                      cancellationToken
-                  )
+            const combined = { ...forwarded, ...resolved };
+            const snapshot = document.getFilePath()
+                ? this.projects.ensureSnapshot(document.getFilePath()!)
                 : undefined;
-            if (cancellationToken?.isCancellationRequested) {
+            const triggerPosition =
+                data && typeof data === 'object' && isPosition(data[TSGO_COMPLETION_POSITION])
+                    ? data[TSGO_COMPLETION_POSITION]
+                    : undefined;
+            // Only edits returned by native resolve are still generated. List-time edits are
+            // retained exactly as the editor saw them, which avoids both double mapping and lost
+            // edits when resolve only adds documentation/detail.
+            const resolvedAdditionalTextEdits = Object.prototype.hasOwnProperty.call(
+                resolved,
+                'additionalTextEdits'
+            );
+            const additionalTextEdits = resolvedAdditionalTextEdits
+                ? snapshot && combined.additionalTextEdits
+                    ? this.mapCompletionAdditionalEdits(
+                          document,
+                          snapshot,
+                          combined.additionalTextEdits,
+                          triggerPosition,
+                          cancellationToken
+                      )
+                    : undefined
+                : listAdditionalTextEdits;
+            if (!isCurrentRequest()) {
                 return completionItem;
             }
+            const resolvedTextEdit = Object.prototype.hasOwnProperty.call(resolved, 'textEdit');
+            const textEdit = resolvedTextEdit
+                ? combined.textEdit && snapshot
+                    ? mapCompletionEdit(snapshot, combined.textEdit)
+                    : undefined
+                : listTextEdit;
+            if (resolvedTextEdit && textEdit) {
+                textEdit.newText = stripComponentSuffix(textEdit.newText);
+            }
+            if (!isCurrentRequest()) {
+                return completionItem;
+            }
+            const {
+                additionalTextEdits: _generatedAdditionalTextEdits,
+                textEdit: _generatedTextEdit,
+                ...combinedWithoutEdits
+            } = combined;
             // Keep our own `data` so a second resolve of the same item still finds the document.
             return {
-                ...completionItem,
-                ...resolved,
+                ...completionWithoutMappedEdits,
+                ...combinedWithoutEdits,
+                label: completionItem.label,
                 data: completionItem.data,
-                additionalTextEdits
+                ...(additionalTextEdits ? { additionalTextEdits } : {}),
+                ...(textEdit ? { textEdit } : {})
             };
         } catch (e) {
             if (cancellationToken?.isCancellationRequested) {
@@ -2550,6 +3689,51 @@ export class TsGoPlugin implements Plugin {
             Logger.debug('[tsgo] completionItem/resolve failed', e);
             return completionItem;
         }
+    }
+
+    private mapCompletionAdditionalEdits(
+        document: Document,
+        snapshot: SvelteDocumentSnapshot,
+        edits: TextEdit[],
+        triggerPosition?: Position,
+        cancellationToken?: CancellationToken
+    ): TextEdit[] | undefined {
+        if (cancellationToken?.isCancellationRequested) {
+            return undefined;
+        }
+        const mapped: TextEdit[] = [];
+        for (const textEdit of edits) {
+            if (cancellationToken?.isCancellationRequested) {
+                return undefined;
+            }
+            const range = mapRangeToOriginal(snapshot, textEdit.range);
+            if (cancellationToken?.isCancellationRequested) {
+                return undefined;
+            }
+            const importText = isImportCompletionEdit(textEdit) ? textEdit.newText : undefined;
+            if (isMapped(range) && (!importText || isInScript(range.start, snapshot))) {
+                mapped.push({
+                    ...textEdit,
+                    range,
+                    newText: importText
+                        ? fixCompletionImportText(importText, triggerPosition, document)
+                        : textEdit.newText
+                });
+                continue;
+            }
+            if (importText && textEdit.range.start.line === textEdit.range.end.line) {
+                mapped.push(
+                    this.mapGeneratedImportEdit(
+                        document,
+                        importText,
+                        triggerPosition,
+                        textEdit.range.start.line === textEdit.range.end.line &&
+                            textEdit.range.start.character === textEdit.range.end.character
+                    )
+                );
+            }
+        }
+        return mapped.length ? mapped : undefined;
     }
 
     private mapEditsForDocument(
@@ -2571,14 +3755,54 @@ export class TsGoPlugin implements Plugin {
                 return undefined;
             }
             const range = mapRangeToOriginal(snapshot, textEdit.range);
-            if (cancellationToken?.isCancellationRequested) {
-                return undefined;
-            }
             if (isMapped(range)) {
                 mapped.push({ ...textEdit, range });
             }
         }
         return mapped.length ? mapped : undefined;
+    }
+
+    private mapGeneratedImportEdit(
+        document: Document,
+        importText: string,
+        triggerPosition: Position | undefined,
+        isInsertion: boolean
+    ): TextEdit {
+        const newLine = document.getText().includes('\r\n') ? '\r\n' : '\n';
+        let newText = fixCompletionImportText(importText, triggerPosition, document);
+        const scriptInfo =
+            (triggerPosition && isInTag(triggerPosition, document.scriptInfo)
+                ? document.scriptInfo
+                : triggerPosition && isInTag(triggerPosition, document.moduleScriptInfo)
+                  ? document.moduleScriptInfo
+                  : undefined) ??
+            document.scriptInfo ??
+            document.moduleScriptInfo;
+
+        if (!scriptInfo) {
+            newText = newText.replace(/^(?:\r?\n)+/, '');
+            const startTag = this.configManager
+                ? getNewScriptStartTag(this.configManager.getConfig(), newLine)
+                : `<script>${newLine}`;
+            return TextEdit.insert(
+                Position.create(0, 0),
+                `${startTag}${newText}</script>${newLine}`
+            );
+        }
+
+        const range = Range.create(scriptInfo.startPos, scriptInfo.startPos);
+        if (!newText.startsWith('\r\n') && !newText.startsWith('\n')) {
+            newText = newLine + newText;
+        }
+        const after = document.getText().slice(scriptInfo.start);
+        if (after.startsWith('\r\n') || after.startsWith('\n')) {
+            newText = newText.trimEnd() + newLine;
+        }
+        // Native auto-import changes are insertions in practice. For a malformed replacement
+        // range, still fail safely at the script boundary instead of editing generated offsets.
+        return isInsertion
+            ? TextEdit.insert(scriptInfo.startPos, newText)
+            : TextEdit.replace(range, newText);
     }
 
     async updateImports(fileRename: FileRename): Promise<WorkspaceEdit | null> {
@@ -2613,7 +3837,9 @@ export class TsGoPlugin implements Plugin {
                     files: [{ oldUri, newUri }]
                 }
             );
-            return mapWorkspaceEditBack(this.projects, result);
+            return mapWorkspaceEditBack(this.projects, result, undefined, (uri) =>
+                this.sourceDocumentVersion(uri)
+            );
         } catch (e) {
             Logger.debug('[tsgo] willRenameFiles failed', e);
             return null;
@@ -2697,11 +3923,15 @@ export class TsGoPlugin implements Plugin {
         if (!filePath) {
             return null;
         }
+        const managedDocument = this.docManager.get(uri);
+        const sourceIdentity = this.captureFeatureRequest(
+            managedDocument?.openedByClient ? managedDocument : undefined
+        );
         await this.watchWork;
-        if (cancellationToken?.isCancellationRequested) {
+        await this.flushPendingSvelteSemanticSyncs();
+        if (!this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
             return null;
         }
-        const managedDocument = this.docManager.get(uri);
         let snapshot: SvelteDocumentSnapshot | undefined;
         let shadowPath: string;
         if (managedDocument?.openedByClient) {
@@ -2710,11 +3940,11 @@ export class TsGoPlugin implements Plugin {
             // work, then explicitly synchronize the current buffer so a request made in the
             // same turn as an edit cannot observe the previous disk-backed component export.
             await this.svelteLifecycle.get(filePath)?.catch(() => undefined);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
                 return null;
             }
             const synced = await this.syncDocument(managedDocument);
-            if (!synced || cancellationToken?.isCancellationRequested) {
+            if (!synced || !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
                 return null;
             }
             snapshot = synced.snapshot;
@@ -2722,13 +3952,13 @@ export class TsGoPlugin implements Plugin {
         } else {
             const shadows = this.projects.forFile(filePath);
             await this.ensureProjectOpened(shadows);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
                 return null;
             }
             snapshot = this.projects.ensureSnapshot(filePath);
             shadowPath = shadows.getShadowPath(filePath);
         }
-        if (!snapshot || cancellationToken?.isCancellationRequested) {
+        if (!snapshot || !this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
             return null;
         }
         // Svelte 4 emits `export default class Name`; Svelte 5 emits
@@ -2739,7 +3969,10 @@ export class TsGoPlugin implements Plugin {
             return null;
         }
         const position = snapshot.positionAt(offset);
-        if (cancellationToken?.isCancellationRequested) {
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrentRequest = () =>
+            this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
+        if (!isCurrentRequest()) {
             return null;
         }
         try {
@@ -2754,12 +3987,13 @@ export class TsGoPlugin implements Plugin {
                 },
                 cancellationToken
             );
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
-            return this.toLocations(result, cancellationToken);
+            const locations = this.toLocations(result, cancellationToken);
+            return isCurrentRequest() ? locations : null;
         } catch (e) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             Logger.debug('[tsgo] component references failed', e);
@@ -2779,16 +4013,19 @@ export class TsGoPlugin implements Plugin {
             {},
             cancellationToken
         );
-        if (!Array.isArray(response?.result)) {
+        if (
+            !Array.isArray(response?.result) ||
+            !this.isRequestAtResponseCurrent(response, cancellationToken)
+        ) {
             return null;
         }
         const items: CallHierarchyItem[] = [];
         for (const item of response!.result) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isRequestAtResponseCurrent(response, cancellationToken)) {
                 return null;
             }
             const mapped = this.mapCallHierarchyItem(item, cancellationToken);
-            if (cancellationToken?.isCancellationRequested) {
+            if (!this.isRequestAtResponseCurrent(response, cancellationToken)) {
                 return null;
             }
             if (mapped) {
@@ -2881,6 +4118,12 @@ export class TsGoPlugin implements Plugin {
         }
         // Send the item back in generated coordinates, which is where tsgo left it.
         const filePath = urlToPath(item.uri);
+        const managedDocument = filePath?.endsWith('.svelte')
+            ? this.docManager.get(item.uri)
+            : undefined;
+        const sourceIdentity = this.captureFeatureRequest(
+            managedDocument?.openedByClient ? managedDocument : undefined
+        );
         // Ordinary TS/JS items are already in the coordinates tsgo expects. Calling
         // `ensureSnapshot` for them attempts to run the Svelte transform on TypeScript source
         // and manufactures a non-existent shadow URI, which makes incoming calls disappear.
@@ -2896,9 +4139,12 @@ export class TsGoPlugin implements Plugin {
               }
             : item;
 
-        if (cancellationToken?.isCancellationRequested) {
+        if (!this.isFeatureRequestCurrent(sourceIdentity, cancellationToken)) {
             return null;
         }
+        const requestIdentity = this.bindNativeGeneration(sourceIdentity);
+        const isCurrentRequest = () =>
+            this.isFeatureRequestCurrent(requestIdentity, cancellationToken);
 
         try {
             const result: any = await this.server.sendRequest(
@@ -2906,16 +4152,16 @@ export class TsGoPlugin implements Plugin {
                 { item: generatedItem },
                 cancellationToken
             );
-            if (!Array.isArray(result) || cancellationToken?.isCancellationRequested) {
+            if (!Array.isArray(result) || !isCurrentRequest()) {
                 return null;
             }
             const calls: any[] = [];
             for (const call of result) {
-                if (cancellationToken?.isCancellationRequested) {
+                if (!isCurrentRequest()) {
                     return null;
                 }
                 const mappedItem = this.mapCallHierarchyItem(call[key], cancellationToken);
-                if (cancellationToken?.isCancellationRequested) {
+                if (!isCurrentRequest()) {
                     return null;
                 }
                 if (!mappedItem) {
@@ -2927,7 +4173,7 @@ export class TsGoPlugin implements Plugin {
                     const targetOriginal = target
                         ? this.projects.getOriginalPath(target)
                         : undefined;
-                    if (cancellationToken?.isCancellationRequested) {
+                    if (!isCurrentRequest()) {
                         return null;
                     }
                     rangeSnapshot = targetOriginal
@@ -2936,7 +4182,7 @@ export class TsGoPlugin implements Plugin {
                 }
                 const fromRanges: Range[] = [];
                 for (const range of call.fromRanges ?? []) {
-                    if (cancellationToken?.isCancellationRequested) {
+                    if (!isCurrentRequest()) {
                         return null;
                     }
                     const mappedRange = rangeSnapshot
@@ -2950,7 +4196,7 @@ export class TsGoPlugin implements Plugin {
             }
             return calls;
         } catch (e) {
-            if (cancellationToken?.isCancellationRequested) {
+            if (!isCurrentRequest()) {
                 return null;
             }
             Logger.debug(`[tsgo] ${method} failed`, e);
@@ -2975,13 +4221,84 @@ export class TsGoPlugin implements Plugin {
         return null;
     }
 
+    private projectKeyForFile(fileName: string): string | undefined {
+        try {
+            return this.projects.forFile(fileName).overlayTsconfigPath;
+        } catch {
+            // Mapping-only test doubles and a concurrently removed file may have no owner.
+            return undefined;
+        }
+    }
+
+    private projectKeyForManager(manager: ShadowManager): string | undefined {
+        return typeof manager.overlayTsconfigPath === 'string'
+            ? manager.overlayTsconfigPath
+            : undefined;
+    }
+
+    /**
+     * Resolve every completed project graph which consumes an ordinary source. `undefined` is a
+     * deliberate fail-closed result: some live program has not published enough ownership
+     * evidence, so the caller must invalidate every known project generation.
+     */
+    private diagnosticProjectKeysForSourceChange(fileName: string): string[] | undefined {
+        const registry = this.projects as ProjectRegistry & {
+            consumersForSourceChange?: (fileName: string) => ShadowManager[] | undefined;
+            all?: () => ShadowManager[];
+        };
+        const exact = registry.consumersForSourceChange?.(fileName);
+        if (exact !== undefined) {
+            return [...new Set(exact.map((manager) => this.projectKeyForManager(manager)))].filter(
+                (key): key is string => !!key
+            );
+        }
+        const all = registry.all?.();
+        if (!all?.length) {
+            return undefined;
+        }
+        return [...new Set(all.map((manager) => this.projectKeyForManager(manager)))].filter(
+            (key): key is string => !!key
+        );
+    }
+
+    /** TsGoServer already advances the nearest owner; advance its other proven consumers too. */
+    private noteOrdinarySourceChange(fileName: string, nearestProjectKey?: string): void {
+        const projectKeys = this.diagnosticProjectKeysForSourceChange(fileName);
+        if (!projectKeys) {
+            this.server.noteAllProjectsChanged?.();
+            return;
+        }
+        this.server.noteProjectChanges?.(
+            projectKeys.filter((projectKey) => projectKey !== nearestProjectKey)
+        );
+    }
+
+    private noteDiagnosticProjectsChanged(
+        projectKeys: Iterable<string>,
+        conservativeWhenEmpty = false
+    ): void {
+        const keys = [...new Set(projectKeys)];
+        if (keys.length) {
+            this.server.noteProjectChanges?.(keys);
+        } else if (conservativeWhenEmpty) {
+            this.server.noteAllProjectsChanged?.();
+        }
+    }
+
     openTsOrJsFile(fileName: string, text: string, languageId: string, _version?: number): void {
         this.recordSavedSourceGraphBaseline(fileName, text);
+        this.isolatedMemberCompletions?.invalidate();
         this.componentInfo?.invalidateFile(fileName);
         this.componentInfo?.invalidateResolutionGraph();
-        void this.server
-            .openDocument(fileName, text, languageId || languageIdForFile(fileName))
-            .catch((e) => Logger.debug(`[tsgo] could not open ${fileName}`, e));
+        const projectKey = this.projectKeyForFile(fileName);
+        const open = this.server.openDocument(
+            fileName,
+            text,
+            languageId || languageIdForFile(fileName),
+            projectKey
+        );
+        this.noteOrdinarySourceChange(fileName, projectKey);
+        void open.catch((e) => Logger.debug(`[tsgo] could not open ${fileName}`, e));
     }
 
     updateTsOrJsFile(
@@ -3008,24 +4325,30 @@ export class TsGoPlugin implements Plugin {
             nextText = applyContentChanges(previous, changes);
         }
 
+        this.isolatedMemberCompletions?.invalidate();
         this.componentInfo?.invalidateFile(fileName);
         this.componentInfo?.invalidateResolutionGraph();
+        const projectKey = this.projectKeyForFile(fileName);
         const update = this.server.isOpen(fileName)
-            ? this.server.updateDocument(fileName, changes, nextText, languageId)
+            ? this.server.updateDocument(fileName, changes, nextText, languageId, projectKey)
             : this.server.openDocument(
                   fileName,
                   nextText,
-                  languageId || languageIdForFile(fileName)
+                  languageId || languageIdForFile(fileName),
+                  projectKey
               );
+        this.noteOrdinarySourceChange(fileName, projectKey);
         void update.catch((e) => Logger.debug(`[tsgo] could not update ${fileName}`, e));
     }
 
     closeTsOrJsFile(fileName: string): void {
+        this.isolatedMemberCompletions?.invalidate();
         this.componentInfo?.invalidateFile(fileName);
         this.componentInfo?.invalidateResolutionGraph();
-        void this.server
-            .closeDocument(fileName)
-            .catch((e) => Logger.debug(`[tsgo] could not close ${fileName}`, e));
+        const projectKey = this.projectKeyForFile(fileName);
+        const close = this.server.closeDocument(fileName);
+        this.noteOrdinarySourceChange(fileName, projectKey);
+        void close.catch((e) => Logger.debug(`[tsgo] could not close ${fileName}`, e));
     }
 
     onWatchFileChanges(changes: OnWatchFileChangesPara[]): void {
@@ -3047,6 +4370,7 @@ export class TsGoPlugin implements Plugin {
         }
 
         this.componentInfo?.clearCache();
+        this.isolatedMemberCompletions?.invalidate();
         // Classify once. Source classification records the new import-graph baseline, so calling
         // it in `some()` and then again during the rebuild would turn the change which triggered
         // that rebuild into a false negative. Filtering also evaluates every coalesced event;
@@ -3071,6 +4395,8 @@ export class TsGoPlugin implements Plugin {
     ): Promise<void> {
         const structural = structuralChanges.length > 0;
         const previousOverlays = new Map(this.svelteOverlayBySource);
+        const affectedDiagnosticProjects = new Set<string>();
+        let diagnosticOwnershipUnproven = false;
 
         if (structural) {
             const openSvelteDocuments = this.docManager
@@ -3107,9 +4433,17 @@ export class TsGoPlugin implements Plugin {
                 invalidated.add(project);
             }
             for (const project of invalidated) {
+                const projectKey = this.projectKeyForManager(project);
+                if (projectKey) {
+                    affectedDiagnosticProjects.add(projectKey);
+                }
                 project.invalidateStructuralCaches();
                 this.opened.delete(project);
             }
+            // ProjectRegistry already expands structural inputs to their known consumers,
+            // including reverse-dependent projects. If it cannot prove any ownership, fail
+            // closed by invalidating every project which has issued diagnostics so far.
+            this.noteDiagnosticProjectsChanged(affectedDiagnosticProjects, true);
             this.forgetMaterializedProjects(invalidated);
             const affectedOpenDocuments = openSvelteDocuments.filter((document) => {
                 const previousProject = previousProjectByDocument.get(document);
@@ -3164,10 +4498,24 @@ export class TsGoPlugin implements Plugin {
         const forwarded: Array<{ uri: string; type: FileChangeType }> = [];
         for (const change of changes) {
             if (!change.fileName.endsWith('.svelte')) {
+                if (!structural) {
+                    const projectKeys = this.diagnosticProjectKeysForSourceChange(change.fileName);
+                    if (projectKeys) {
+                        for (const projectKey of projectKeys) {
+                            affectedDiagnosticProjects.add(projectKey);
+                        }
+                    } else {
+                        diagnosticOwnershipUnproven = true;
+                    }
+                }
                 forwarded.push({ uri: pathToUrl(change.fileName), type: change.changeType });
                 continue;
             }
             const shadows = this.projects.forFile(change.fileName);
+            const owningProjectKey = this.projectKeyForManager(shadows);
+            if (owningProjectKey) {
+                affectedDiagnosticProjects.add(owningProjectKey);
+            }
             const currentOverlay = this.svelteOverlayBySource.get(change.fileName);
             const shadowPath =
                 change.changeType === FileChangeType.Deleted
@@ -3177,6 +4525,12 @@ export class TsGoPlugin implements Plugin {
                     : shadows.getShadowPath(change.fileName);
             const managedDocument = this.docManager.get(pathToUrl(change.fileName));
             const materializedManagers = this.materializedManagersForSource(change.fileName);
+            for (const manager of materializedManagers.keys()) {
+                const projectKey = this.projectKeyForManager(manager);
+                if (projectKey) {
+                    affectedDiagnosticProjects.add(projectKey);
+                }
+            }
             const owningManagerPaths = materializedManagers.get(shadows) ?? new Set<string>();
             owningManagerPaths.add(shadowPath);
             materializedManagers.set(shadows, owningManagerPaths);
@@ -3256,7 +4610,18 @@ export class TsGoPlugin implements Plugin {
                 Logger.debug(`[tsgo] could not refresh shadow for ${change.fileName}`, e);
             }
         }
-        await this.server.notifyWatchedFiles(forwarded);
+        await this.server.notifyWatchedFiles(
+            forwarded,
+            // Structural generations moved before the potentially long rebuild so stale native
+            // requests were cancelled immediately. Do not advance them a second time here.
+            structural
+                ? []
+                : diagnosticOwnershipUnproven
+                  ? undefined
+                  : affectedDiagnosticProjects.size
+                    ? affectedDiagnosticProjects
+                    : undefined
+        );
     }
 
     /** Whether a watched save changes project/config membership or source reachability. */
@@ -3343,6 +4708,9 @@ export class TsGoPlugin implements Plugin {
      */
     resetProjects() {
         this.opened.clear();
+        this.syncGeneration++;
+        this.syncedSvelte.clear();
+        this.initialApiWarmProjects.clear();
         // A child restart does not invalidate the canonical on-disk shadows. Keep the shared
         // materialisation set so replaying a new child does not re-stat the monorepo.
         for (const [key, flight] of this.diagnosticsInFlight) {
@@ -3371,13 +4739,36 @@ export class TsGoPlugin implements Plugin {
     }
 
     dispose() {
+        if (this.disposed) {
+            return;
+        }
+        this.disposed = true;
+        for (const subscription of this.subscriptions.splice(0)) {
+            subscription.dispose();
+        }
+        for (const timer of this.backgroundSvelteSyncTimers.values()) {
+            clearTimeout(timer);
+        }
+        this.backgroundSvelteSyncTimers.clear();
+        this.foregroundCompletionLeases = 0;
+        this.releaseBackgroundPermit?.();
+        this.releaseBackgroundPermit = undefined;
+        this.backgroundPermit = Promise.resolve();
         this.desiredOpenSvelte.clear();
         this.svelteLifecycle.clear();
+        this.svelteCloseLifecycle.clear();
+        this.pendingSvelteSemanticSyncs.clear();
+        this.svelteLifecycleRevisions.clear();
+        this.svelteSyncs.clear();
+        this.syncedSvelte.clear();
+        this.initialApiWarmProjects.clear();
         for (const flight of this.diagnosticsInFlight.values()) {
             flight.cancellation.cancel();
         }
         this.diagnosticsInFlight.clear();
         this.diagnosticProjectTails.clear();
+        this.diagnosticProjectGenerationListener?.dispose();
+        this.isolatedMemberCompletions?.dispose();
         void this.componentInfo?.dispose();
         this.server.dispose();
     }
@@ -3568,6 +4959,16 @@ const PULL_QUIESCENCE_MS = process.env.SVELTE_LS_DIAGNOSTICS_DEBOUNCE_MS
 
 /** Where tsgo's own completion payload is parked while `data` carries the document uri. */
 const TSGO_DATA = '__tsgoData';
+/** Original Svelte caret used to choose the correct script for an auto-import on resolve. */
+const TSGO_COMPLETION_POSITION = '__tsgoCompletionPosition';
+/** List-time source/native identity; resolve edits are unsafe after either generation changes. */
+const TSGO_COMPLETION_OWNER = '__tsgoCompletionOwner';
+/** Marks lightweight checker-API member entries whose native resolve payload is fetched lazily. */
+const TSGO_API_COMPLETION = '__tsgoApiCompletion';
+/** Marks cold current-file entries which need no native resolve round trip. */
+const TSGO_ISOLATED_COMPLETION = '__tsgoIsolatedCompletion';
+/** VS Code/TypeScript's member defaults when the preview checker omits list defaults. */
+const TSGO_MEMBER_COMMIT_CHARACTERS = ['.', ',', ';', '('];
 
 /** Trigger characters tsgo will accept on `textDocument/completion`. */
 const TSGO_TRIGGER_CHARACTERS = new Set(['.', '"', "'", '`', '/', '@', '<', '#', ' ']);
@@ -3580,6 +4981,274 @@ const COMPONENT_SUFFIX = '__SvelteComponent_';
 
 function stripComponentSuffix(text: string): string {
     return text.endsWith(COMPONENT_SUFFIX) ? text.slice(0, -COMPONENT_SUFFIX.length) : text;
+}
+
+function completionSourceFingerprint(text: string): string {
+    return createHash('sha256').update(text, 'utf8').digest('base64url');
+}
+
+function completionRequestOwner(value: unknown): CompletionRequestOwner | undefined {
+    if (!value || typeof value !== 'object') {
+        return undefined;
+    }
+    const owner = value as Partial<CompletionRequestOwner>;
+    if (
+        typeof owner.uri !== 'string' ||
+        typeof owner.documentVersion !== 'number' ||
+        typeof owner.sourceFingerprint !== 'string' ||
+        (owner.nativeGeneration !== undefined && typeof owner.nativeGeneration !== 'number')
+    ) {
+        return undefined;
+    }
+    return owner as CompletionRequestOwner;
+}
+
+function completionOwnerMatches(
+    document: Document,
+    owner: CompletionRequestOwner,
+    server: Pick<TsGoServer, 'generation'>
+): boolean {
+    return (
+        owner.uri === document.uri &&
+        owner.documentVersion === document.version &&
+        owner.sourceFingerprint === completionSourceFingerprint(document.getText()) &&
+        owner.nativeGeneration === server.generation
+    );
+}
+
+function isPosition(value: unknown): value is Position {
+    return (
+        !!value &&
+        typeof value === 'object' &&
+        Number.isSafeInteger((value as Position).line) &&
+        Number.isSafeInteger((value as Position).character) &&
+        (value as Position).line >= 0 &&
+        (value as Position).character >= 0
+    );
+}
+
+function isImportCompletionEdit(edit: TextEdit): boolean {
+    return /^\s*import(?:\s|["'`{*])/u.test(edit.newText);
+}
+
+/** Match classic completion import cleanup for generated Svelte component symbols/templates. */
+function fixCompletionImportText(
+    importText: string,
+    triggerPosition: Position | undefined,
+    document: Document
+): string {
+    const changedName = changeSvelteComponentName(importText);
+    if (changedName !== importText || !triggerPosition || !isInScript(triggerPosition, document)) {
+        return changedName.replace(' type ', ' ');
+    }
+    return changedName;
+}
+
+function sameSvelteSyncIdentity(left: SvelteSyncIdentity, right: SvelteSyncIdentity): boolean {
+    return (
+        left.document === right.document &&
+        left.documentVersion === right.documentVersion &&
+        left.sourceText === right.sourceText &&
+        left.configPromise === right.configPromise &&
+        left.structuralEpoch === right.structuralEpoch &&
+        left.syncGeneration === right.syncGeneration &&
+        left.lifecycleRevision === right.lifecycleRevision
+    );
+}
+
+/** @internal True for `value.|`, `value.fo|` and optional-chain equivalents. */
+export function isMemberAccessCompletion(
+    document: Document,
+    text: string,
+    offset: number
+): boolean {
+    const before = text.slice(Math.max(0, offset - 256), offset);
+    if (
+        !/(?:[$_\p{ID_Start}][$_\p{ID_Continue}\u200c\u200d]*|[)\]}!])\s*(?:\?\.|\.)\s*[$_\p{ID_Continue}\u200c\u200d]*$/u.test(
+            before
+        )
+    ) {
+        return false;
+    }
+
+    // In scripts, reject lexical lookalikes such as `"value."`, comments and regex literals.
+    // Scanning only the current script is cheaper than a failed checker-API round trip.
+    const script = [document.scriptInfo, document.moduleScriptInfo].find(
+        (tag) => tag && offset >= tag.start && offset <= tag.end
+    );
+    if (!script) {
+        // Outside <script>, a textual `foo.` is TypeScript only while the caret is inside a
+        // Svelte `{...}` expression. Raw/quoted attributes, comments and ordinary markup can all
+        // contain the same characters but must stay with the HTML/Svelte providers.
+        return isTemplateExpressionAt(document, text, offset);
+    }
+    const localOffset = offset - script.start;
+    const scanner = ts.createScanner(
+        ts.ScriptTarget.Latest,
+        false,
+        ts.LanguageVariant.JSX,
+        script.content
+    );
+    for (
+        let token = scanner.scan();
+        token !== ts.SyntaxKind.EndOfFileToken;
+        token = scanner.scan()
+    ) {
+        if (localOffset < scanner.getTokenPos()) {
+            break;
+        }
+        if (localOffset > scanner.getTextPos()) {
+            continue;
+        }
+        const lexicalToken = ![
+            ts.SyntaxKind.StringLiteral,
+            ts.SyntaxKind.NoSubstitutionTemplateLiteral,
+            ts.SyntaxKind.TemplateHead,
+            ts.SyntaxKind.TemplateMiddle,
+            ts.SyntaxKind.TemplateTail,
+            ts.SyntaxKind.RegularExpressionLiteral,
+            ts.SyntaxKind.SingleLineCommentTrivia,
+            ts.SyntaxKind.MultiLineCommentTrivia
+        ].includes(token);
+        if (!lexicalToken) {
+            return false;
+        }
+        // TypeScript's standalone scanner tokenises `/pattern/` as slash + identifiers unless a
+        // parser supplies expression context. Parse only the nearby-slash case so ordinary member
+        // completion keeps the scanner-only hot path.
+        if (before.includes('/')) {
+            const sourceFile = ts.createSourceFile(
+                'completion.tsx',
+                script.content,
+                ts.ScriptTarget.Latest,
+                true,
+                ts.ScriptKind.TSX
+            );
+            const probe = Math.max(0, Math.min(localOffset - 1, script.content.length - 1));
+            if (
+                findContainingNode(
+                    sourceFile,
+                    { start: probe, length: 1 },
+                    ts.isRegularExpressionLiteral
+                )
+            ) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return true;
+}
+
+/** @internal Whether component-prop/directive completions own this start-tag position. */
+export function isComponentAttributeNamePosition(
+    text: string,
+    node: { start: number; tag?: string },
+    offset: number
+): boolean {
+    if (!node.tag) {
+        return false;
+    }
+    const nameEnd = node.start + 1 + node.tag.length;
+    if (offset <= nameEnd) {
+        return false;
+    }
+
+    let braces = 0;
+    let quote: '"' | "'" | '`' | undefined;
+    let escaped = false;
+    let expectsValue = false;
+    let value: 'none' | 'unquoted' | 'quoted' | 'braced' | 'complete' = 'none';
+    let inAttributeName = false;
+    let canSuggestAttribute = false;
+    for (let index = nameEnd; index < Math.min(offset, text.length); index++) {
+        const character = text[index];
+        if (quote) {
+            if (escaped) {
+                escaped = false;
+            } else if (character === '\\') {
+                escaped = true;
+            } else if (character === quote) {
+                quote = undefined;
+                value = braces > 0 ? value : 'complete';
+            }
+            continue;
+        }
+        if (braces > 0 && (character === '"' || character === "'" || character === '`')) {
+            quote = character;
+            continue;
+        }
+        if (braces > 0 && character === '{') {
+            braces++;
+            continue;
+        }
+        if (braces > 0 && character === '}') {
+            braces--;
+            if (braces === 0) {
+                value = 'complete';
+            }
+            continue;
+        }
+        if (/\s/.test(character)) {
+            if (
+                !expectsValue &&
+                (inAttributeName || value === 'unquoted' || value === 'complete')
+            ) {
+                inAttributeName = false;
+                value = 'none';
+                canSuggestAttribute = true;
+            } else if (!expectsValue && value === 'none') {
+                canSuggestAttribute = true;
+            }
+            continue;
+        }
+        if (character === '>' || character === '/') {
+            canSuggestAttribute = false;
+            inAttributeName = false;
+            continue;
+        }
+        if (expectsValue) {
+            expectsValue = false;
+            canSuggestAttribute = false;
+            if (character === '"' || character === "'" || character === '`') {
+                quote = character;
+                value = 'quoted';
+            } else if (character === '{') {
+                braces = 1;
+                value = 'braced';
+            } else {
+                value = 'unquoted';
+            }
+            continue;
+        }
+        if (character === '=') {
+            expectsValue = true;
+            inAttributeName = false;
+            value = 'none';
+            canSuggestAttribute = false;
+            continue;
+        }
+        if (character === '{') {
+            braces = 1;
+            inAttributeName = false;
+            value = 'braced';
+            canSuggestAttribute = false;
+            continue;
+        }
+        if (value === 'unquoted' || value === 'complete') {
+            canSuggestAttribute = false;
+            continue;
+        }
+        inAttributeName = true;
+        canSuggestAttribute = true;
+    }
+    return (
+        braces === 0 &&
+        quote === undefined &&
+        !expectsValue &&
+        value === 'none' &&
+        canSuggestAttribute
+    );
 }
 
 /** @internal Exported for a focused Svelte 4/5 transform regression test. */
@@ -3615,6 +5284,39 @@ export function findDefaultExportIdentifierOffset(text: string): number | undefi
                 return statement.name.getStart(source);
             }
         }
+    }
+    return undefined;
+}
+
+/** @internal Exact module-specifier guard for the stock native LSP's generated-JSX TS7016. */
+export function nativeSvelteModuleSpecifierAt7016(
+    sourceFile: ts.SourceFile,
+    start: number,
+    length: number,
+    code: number
+): string | undefined {
+    if (code !== 7016) {
+        return undefined;
+    }
+    const literal = findContainingNode(sourceFile, { start, length }, ts.isStringLiteral);
+    if (
+        !literal ||
+        literal.getStart(sourceFile) !== start ||
+        literal.getEnd() !== start + length ||
+        !literal.text.endsWith('.svelte')
+    ) {
+        return undefined;
+    }
+    const parent = literal.parent;
+    const isModuleSpecifier =
+        (ts.isImportDeclaration(parent) && parent.moduleSpecifier === literal) ||
+        (ts.isExportDeclaration(parent) && parent.moduleSpecifier === literal);
+    return isModuleSpecifier ? literal.text : undefined;
+}
+
+function nativeSvelteJsShadowPathFrom7016(message: string): string | undefined {
+    for (const match of message.matchAll(/['"]([^'"\r\n]+\.svelte\.jsx)['"]/g)) {
+        return normalizePath(match[1]);
     }
     return undefined;
 }
@@ -3736,8 +5438,22 @@ function watchEventIdentity(change: OnWatchFileChangesPara): string {
 }
 
 /** A conservative pre-transform exit for ordinary markup text completion. */
-function isClearlyPlainMarkup(text: string, offset: number): boolean {
+function isClearlyPlainMarkup(document: Document, text: string, offset: number): boolean {
     const before = text.slice(0, offset);
+    // Comparisons (`foo > bar`), arrows and nested object literals may make `>` or `}` the latest
+    // punctuation even though the caret is still inside the outer Svelte expression. This cheap
+    // exit must be conservative: a false negative merely pays for sync, while a false positive
+    // removes the TypeScript dropdown entirely.
+    if (isTemplateExpressionAt(document, text, offset)) {
+        return false;
+    }
+    if (isInsideHtmlComment(text, offset)) {
+        return true;
+    }
+    const attribute = getAttributeContextAtPosition(document, document.positionAt(offset));
+    if (attribute?.inValue) {
+        return true;
+    }
     const lastLt = before.lastIndexOf('<');
     const lastGt = before.lastIndexOf('>');
     const lastOpenExpression = before.lastIndexOf('{');
@@ -3753,6 +5469,20 @@ function isClearlyPlainMarkup(text: string, offset: number): boolean {
     // the post-transform AST check decide instead of suppressing a potentially useful result.
     const fragment = before.slice(boundary + 1);
     return !/[<'"`{]/.test(fragment);
+}
+
+/** Whether a template caret is inside a real Svelte expression, scoped to its HTML node. */
+function isTemplateExpressionAt(document: Document, text: string, offset: number): boolean {
+    if (isInsideHtmlComment(text, offset)) {
+        return false;
+    }
+    const node = document.html.findNodeAt(offset);
+    return isInsideMoustacheTag(text, node?.start ?? 0, offset);
+}
+
+function isInsideHtmlComment(text: string, offset: number): boolean {
+    const before = text.slice(0, offset);
+    return before.lastIndexOf('<!--') > before.lastIndexOf('-->');
 }
 
 function applyContentChanges(text: string, changes: TextDocumentContentChangeEvent[]): string {

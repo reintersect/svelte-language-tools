@@ -20,6 +20,7 @@ import {
     getService,
     getServiceForTsconfig,
     forAllServices,
+    disposeServicesForSnapshotManager,
     LanguageServiceContainer,
     LanguageServiceDocumentContext
 } from './service';
@@ -55,18 +56,23 @@ interface LSAndTSDocResolverOptions {
 }
 
 export class LSAndTSDocResolver {
+    private readonly subscriptions: Array<{ dispose(): void }> = [];
+    private disposed = false;
+
     constructor(
         private readonly docManager: DocumentManager,
         private readonly workspaceUris: string[],
         private readonly configManager: LSConfigManager,
         private readonly options?: LSAndTSDocResolverOptions
     ) {
-        docManager.on(
-            'documentChange',
-            debounceSameArg(
-                this.updateSnapshot.bind(this),
-                (newDoc, prevDoc) => newDoc.uri === prevDoc?.uri,
-                1000
+        this.subscriptions.push(
+            docManager.on(
+                'documentChange',
+                debounceSameArg(
+                    this.updateSnapshot.bind(this),
+                    (newDoc, prevDoc) => newDoc.uri === prevDoc?.uri,
+                    1000
+                )
             )
         );
 
@@ -74,14 +80,16 @@ export class LSAndTSDocResolver {
         // Open it immediately to reduce rebuilds in the startup
         // where multiple files and their dependencies
         // being loaded in a short period of times
-        docManager.on('documentOpen', (document) => {
-            if (document.openedByClient) {
-                this.getOrCreateSnapshot(document);
-            } else {
-                this.updateSnapshot(document);
-            }
-            docManager.lockDocument(document.uri);
-        });
+        this.subscriptions.push(
+            docManager.on('documentOpen', (document) => {
+                if (document.openedByClient) {
+                    this.getOrCreateSnapshot(document);
+                } else {
+                    this.updateSnapshot(document);
+                }
+                docManager.lockDocument(document.uri);
+            })
+        );
 
         this.getCanonicalFileName = createGetCanonicalFileName(
             (options?.tsSystem ?? ts.sys).useCaseSensitiveFileNames
@@ -92,33 +100,37 @@ export class LSAndTSDocResolver {
         // Notify when new snapshots are created so external watchers (svelte-check)
         // can react dynamically (for example: add parent directories to file watchers).
         if (this.options?.onFileSnapshotCreated) {
-            this.globalSnapshotsManager.onChange((fileName, newDocument) => {
-                if (newDocument) {
-                    try {
-                        this.options?.onFileSnapshotCreated?.(fileName);
-                    } catch {
-                        // best-effort; ignore errors in callback
+            this.subscriptions.push(
+                this.globalSnapshotsManager.onChange((fileName, newDocument) => {
+                    if (newDocument) {
+                        try {
+                            this.options?.onFileSnapshotCreated?.(fileName);
+                        } catch {
+                            // best-effort; ignore errors in callback
+                        }
                     }
-                }
-            });
+                })
+            );
         }
         this.userPreferencesAccessor = { preferences: this.getTsUserPreferences() };
         const projectService = createProjectService(this.tsSystem, this.userPreferencesAccessor);
 
-        configManager.onChange(() => {
-            const newPreferences = this.getTsUserPreferences();
-            const autoImportConfigChanged =
-                newPreferences.includePackageJsonAutoImports !==
-                this.userPreferencesAccessor.preferences.includePackageJsonAutoImports;
+        this.subscriptions.push(
+            configManager.onChange(() => {
+                const newPreferences = this.getTsUserPreferences();
+                const autoImportConfigChanged =
+                    newPreferences.includePackageJsonAutoImports !==
+                    this.userPreferencesAccessor.preferences.includePackageJsonAutoImports;
 
-            this.userPreferencesAccessor.preferences = newPreferences;
+                this.userPreferencesAccessor.preferences = newPreferences;
 
-            if (autoImportConfigChanged) {
-                forAllServices((service) => {
-                    service.onAutoImportProviderSettingsChanged();
-                });
-            }
-        });
+                if (autoImportConfigChanged) {
+                    forAllServices((service) => {
+                        service.onAutoImportProviderSettingsChanged();
+                    });
+                }
+            })
+        );
 
         this.packageJsonWatchers = new FileMap(this.tsSystem.useCaseSensitiveFileNames);
         this.watchedDirectories = new FileSet(this.tsSystem.useCaseSensitiveFileNames);
@@ -176,6 +188,24 @@ export class LSAndTSDocResolver {
     private readonly packageJsonWatchers: FileMap<ts.FileWatcher>;
     private lsDocumentContext: LanguageServiceDocumentContext;
     private readonly watchedDirectories: FileSet;
+
+    dispose(): void {
+        if (this.disposed) {
+            return;
+        }
+        this.disposed = true;
+        for (const subscription of this.subscriptions.splice(0)) {
+            subscription.dispose();
+        }
+        for (const watcher of this.packageJsonWatchers.values()) {
+            watcher.close();
+        }
+        this.packageJsonWatchers.clear();
+        this.watchedDirectories.clear();
+        this.extendedConfigCache.clear();
+        disposeServicesForSnapshotManager(this.globalSnapshotsManager);
+        this.globalSnapshotsManager.dispose();
+    }
 
     async getLSAndTSDoc(document: Document): Promise<{
         tsDoc: SvelteDocumentSnapshot;

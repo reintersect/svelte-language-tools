@@ -1123,22 +1123,6 @@ function reconcileSvelteParserDiagnostics(
             diagnostic.severity === 1 &&
             diagnostic.codeDescription?.href.includes('/compiler-errors#')
     );
-    const compilerErrorRegions = new Set(
-        compilerParserErrors.map((diagnostic) => diagnosticRegion(diagnostic.range.start, document))
-    );
-    const generatedSyntaxErrorRegions = new Set(
-        diagnostics
-            .filter(
-                (diagnostic) =>
-                    !!(diagnostic as Diagnostic & { [SVELTE_PARSER_ERROR]?: boolean })[
-                        SVELTE_PARSER_ERROR
-                    ]
-            )
-            .map((diagnostic) => diagnosticRegion(diagnostic.range.start, document))
-    );
-    const brokenGeneratedRegions = new Set(
-        [...compilerErrorRegions].filter((region) => generatedSyntaxErrorRegions.has(region))
-    );
     const fallbackIdentities = new Set<string>();
     const result: Diagnostic[] = [];
 
@@ -1148,7 +1132,15 @@ function reconcileSvelteParserDiagnostics(
         ];
         if (
             (diagnostic.source === 'ts' || diagnostic.source === 'js') &&
-            brokenGeneratedRegions.has(diagnosticRegion(diagnostic.range.start, document))
+            (compilerParserErrors.some((parserError) =>
+                rangesNarrowlyOverlap(diagnostic.range, parserError.range, document)
+            ) ||
+                (marked &&
+                    compilerParserErrors.some(
+                        (parserError) =>
+                            diagnosticRegion(parserError.range.start, document) ===
+                            diagnosticRegion(diagnostic.range.start, document)
+                    )))
         ) {
             continue;
         }
@@ -1174,6 +1166,31 @@ function reconcileSvelteParserDiagnostics(
     }
 
     return result;
+}
+
+/**
+ * Suppress an unmarked generated diagnostic only when it maps onto the compiler's actual
+ * parser-error span. Region-level matching is reserved for explicitly marked parser fallbacks:
+ * one malformed tag must not hide every unrelated template type error. Conversely a
+ * whole-document diagnostic only happens to overlap the parser span and may carry independent
+ * project/configuration information, so keep it.
+ */
+function rangesNarrowlyOverlap(generated: Range, parser: Range, document: Document): boolean {
+    const generatedStart = document.offsetAt(generated.start);
+    const generatedEnd = document.offsetAt(generated.end);
+    if (generatedStart === 0 && generatedEnd === document.getTextLength()) {
+        return false;
+    }
+
+    const parserStart = document.offsetAt(parser.start);
+    const parserEnd = document.offsetAt(parser.end);
+    if (generatedStart === generatedEnd) {
+        return parserStart <= generatedStart && generatedStart < parserEnd;
+    }
+    if (parserStart === parserEnd) {
+        return generatedStart <= parserStart && parserStart < generatedEnd;
+    }
+    return generatedStart < parserEnd && parserStart < generatedEnd;
 }
 
 function diagnosticRegion(position: Position, document: Document): 'script' | 'style' | 'template' {

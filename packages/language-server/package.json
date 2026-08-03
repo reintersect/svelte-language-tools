@@ -1,6 +1,6 @@
 {
     "name": "@reintersect/svelte-language-server",
-    "version": "0.19.7",
+    "version": "0.19.8",
     "description": "A language server for Svelte",
     "main": "dist/src/index.js",
     "typings": "dist/src/index",
@@ -9,6 +9,14 @@
         ".": "./dist/src/index.js",
         "./bin/server.js": "./bin/server.js"
     },
+    "files": [
+        "bin",
+        "dist/src",
+        "vendor/tsgo-api",
+        "README.md",
+        "CHANGELOG.md",
+        "LICENSE"
+    ],
     "scripts": {
         "test": "cross-env TS_NODE_TRANSPILE_ONLY=true mocha --require ts-node/register \"test/**/*.test.ts\" --no-experimental-strip-types",
         "build": "pnpm --filter @reintersect/svelte-load-config build && tsc",
@@ -20,7 +28,8 @@
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/sveltejs/language-tools.git"
+        "url": "git+https://github.com/reintersect/svelte-language-tools.git",
+        "directory": "packages/language-server"
     },
     "keywords": [
         "svelte",
@@ -32,9 +41,12 @@
     "author": "The Svelte Community",
     "license": "MIT",
     "bugs": {
-        "url": "https://github.com/sveltejs/language-tools/issues"
+        "url": "https://github.com/reintersect/svelte-language-tools/issues"
     },
-    "homepage": "https://github.com/sveltejs/language-tools#readme",
+    "homepage": "https://github.com/reintersect/svelte-language-tools/tree/master/packages/language-server#readme",
+    "publishConfig": {
+        "access": "public"
+    },
     "engines": {
         "node": ">= 18.0.0"
     },

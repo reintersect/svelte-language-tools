@@ -361,7 +361,8 @@ async function getTsGoStats(server) {
         stats.engine,
         {
             packageName: EXPECTED_ENGINE.packageName,
-            version: EXPECTED_ENGINE.version
+            version: EXPECTED_ENGINE.version,
+            apiAvailable: !!EXPECTED_ENGINE.apiEntry
         },
         `${server.name} ran a different native engine than the oracle selected`
     );

@@ -48,7 +48,8 @@ export function mapLocationBack(
 export function mapWorkspaceEditBack(
     shadows: ShadowLookup,
     edit: WorkspaceEdit | null | undefined,
-    shouldCancel?: () => boolean
+    shouldCancel?: () => boolean,
+    getSourceDocumentVersion?: (sourceUri: string) => number | null | undefined
 ): WorkspaceEdit | null {
     if (!edit || shouldCancel?.()) {
         return null;
@@ -63,14 +64,14 @@ export function mapWorkspaceEditBack(
     const mapEdits = (
         uri: string,
         edits: TextEdit[]
-    ): { uri: string; edits: TextEdit[] } | undefined => {
+    ): { uri: string; edits: TextEdit[]; mappedFromShadow: boolean } | undefined => {
         if (shouldCancel?.()) {
             return undefined;
         }
         const filePath = urlToPath(uri);
         const originalPath = filePath ? shadows.getOriginalPath(filePath) : undefined;
         if (!originalPath) {
-            return { uri, edits };
+            return { uri, edits, mappedFromShadow: false };
         }
         const snapshot = shadows.ensureSnapshot(originalPath);
         if (!snapshot) {
@@ -86,7 +87,7 @@ export function mapWorkspaceEditBack(
                 mapped.push({ ...textEdit, range });
             }
         }
-        return { uri: pathToUrl(originalPath), edits: mapped };
+        return { uri: pathToUrl(originalPath), edits: mapped, mappedFromShadow: true };
     };
 
     const changes: Record<string, TextEdit[]> = {};
@@ -116,7 +117,17 @@ export function mapWorkspaceEditBack(
             if (mapped?.edits.length) {
                 documentChanges.push({
                     ...change,
-                    textDocument: { ...change.textDocument, uri: mapped.uri },
+                    textDocument: {
+                        ...change.textDocument,
+                        uri: mapped.uri,
+                        // A shadow's version belongs to the generated buffer and is unrelated to
+                        // the version the outer client assigned to its `.svelte` document. Use the
+                        // live source version when the caller can prove that document is open;
+                        // otherwise an unversioned edit is the only correct LSP representation.
+                        version: mapped.mappedFromShadow
+                            ? (getSourceDocumentVersion?.(mapped.uri) ?? null)
+                            : change.textDocument.version
+                    },
                     edits: mapped.edits
                 });
             }

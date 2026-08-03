@@ -1,1 +1,2 @@
 * text=auto eol=lf
+packages/language-server/vendor/tsgo-api/** -whitespace

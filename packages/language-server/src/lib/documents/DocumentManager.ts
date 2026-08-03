@@ -131,6 +131,16 @@ export class DocumentManager {
 
     on(name: DocumentEvent, listener: (document: Document) => void) {
         this.emitter.on(name, listener);
+        let active = true;
+        return {
+            dispose: () => {
+                if (!active) {
+                    return;
+                }
+                active = false;
+                this.emitter.off(name, listener);
+            }
+        };
     }
 
     get(uri: string) {

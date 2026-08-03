@@ -1,7 +1,256 @@
 import assert from 'assert';
 import { TsGoComponentInfo } from '../../../../src/plugins/typescript-go/lsp/TsGoComponentInfo';
 
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => (resolve = done));
+    return { promise, resolve };
+}
+
+const sessionFor = (checker: any) => ({
+    signatureKind: { Call: 0, Construct: 1 },
+    withProjectForFile: async (
+        _fileName: string,
+        operation: (project: { checker: any }) => unknown
+    ) => operation({ checker })
+});
+
 describe('typescript-go TsGoComponentInfo cache invalidation', () => {
+    it('overlaps and single-flights concurrent first definition and prop lookups', async () => {
+        const releaseDefinition = deferred<{ filePath: string; offset: number } | undefined>();
+        const releaseProject = deferred<void>();
+        let definitionCalls = 0;
+        let projectCalls = 0;
+        let propertyWalks = 0;
+        let definitionStarted = false;
+        let projectStarted = false;
+        const checker = {
+            getTypeAtPosition: async (filePath: string) => ({ filePath }),
+            typeToString: async (type: any) => type.text ?? 'component',
+            getPropertyOfType: async (type: any, name: string) =>
+                name === '$$prop_def' ? { carrierPath: type.filePath } : undefined,
+            getTypeOfSymbol: async (symbol: any) =>
+                symbol.carrierPath ? { filePath: symbol.carrierPath } : { text: 'string' },
+            getPropertiesOfType: async () => {
+                propertyWalks++;
+                return [{ name: 'size' }];
+            },
+            getDocumentationCommentOfSymbol: async () => '',
+            getSignaturesOfType: async () => []
+        };
+        const session = {
+            signatureKind: { Call: 0, Construct: 1 },
+            withProjectForFile: async (
+                _fileName: string,
+                operation: (project: { checker: any }) => unknown,
+                isCurrent: () => boolean
+            ) => {
+                projectCalls++;
+                projectStarted = true;
+                await releaseProject.promise;
+                return isCurrent() ? operation({ checker }) : undefined;
+            }
+        };
+        const info = new TsGoComponentInfo(session as any, async () => {
+            definitionCalls++;
+            definitionStarted = true;
+            return releaseDefinition.promise;
+        });
+
+        const first = info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button', 'same-context');
+        const second = info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button', 'same-context');
+        await Promise.resolve();
+
+        assert.strictEqual(projectStarted, true, 'project acquisition must start immediately');
+        assert.strictEqual(definitionStarted, true, 'definition resolution must start immediately');
+        assert.strictEqual(projectCalls, 1);
+        assert.strictEqual(definitionCalls, 1);
+
+        releaseDefinition.resolve({ filePath: '/workspace/Button.svelte.tsx', offset: 1 });
+        releaseProject.resolve();
+        const [firstResult, secondResult] = await Promise.all([first, second]);
+
+        assert.deepStrictEqual(firstResult, secondResult);
+        assert.deepStrictEqual(
+            firstResult.map((part) => part.name),
+            ['size']
+        );
+        assert.strictEqual(propertyWalks, 1);
+    });
+
+    it('memoises an authoritative empty prop carrier until its declaration version changes', async () => {
+        let declarationVersion = 1;
+        let definitionCalls = 0;
+        let projectCalls = 0;
+        let propertyWalks = 0;
+        const checker = {
+            getTypeAtPosition: async (filePath: string) => ({ filePath }),
+            typeToString: async () => 'component',
+            getPropertyOfType: async (type: any, name: string) =>
+                name === '$$prop_def' ? { carrierPath: type.filePath } : undefined,
+            getTypeOfSymbol: async (symbol: any) => ({ filePath: symbol.carrierPath }),
+            getPropertiesOfType: async () => {
+                propertyWalks++;
+                return [];
+            },
+            getDocumentationCommentOfSymbol: async () => '',
+            getSignaturesOfType: async () => []
+        };
+        const session = {
+            ...sessionFor(checker),
+            withProjectForFile: async (
+                _fileName: string,
+                operation: (project: { checker: any }) => unknown
+            ) => {
+                projectCalls++;
+                return operation({ checker });
+            }
+        };
+        const info = new TsGoComponentInfo(
+            session as any,
+            async () => {
+                definitionCalls++;
+                return { filePath: '/workspace/Button.svelte.tsx', offset: 1 };
+            },
+            () => declarationVersion
+        );
+
+        assert.deepStrictEqual(
+            await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button'),
+            []
+        );
+        assert.deepStrictEqual(
+            await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button'),
+            []
+        );
+        assert.strictEqual(definitionCalls, 1);
+        assert.strictEqual(projectCalls, 1);
+        assert.strictEqual(propertyWalks, 1);
+
+        declarationVersion++;
+        assert.deepStrictEqual(
+            await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button'),
+            []
+        );
+        assert.strictEqual(definitionCalls, 1, 'the declaration identity itself remains valid');
+        assert.strictEqual(projectCalls, 2);
+        assert.strictEqual(propertyWalks, 2);
+    });
+
+    it('does not publish or cache a type walk overtaken by a declaration edit', async () => {
+        const propertyWalkStarted = deferred<void>();
+        const releasePropertyWalk = deferred<void>();
+        let declarationVersion = 1;
+        let propertyWalks = 0;
+        const checker = {
+            getTypeAtPosition: async (filePath: string) => ({ filePath }),
+            typeToString: async (type: any) => type.text ?? 'component',
+            getPropertyOfType: async (type: any, name: string) =>
+                name === '$$prop_def' ? { carrierPath: type.filePath } : undefined,
+            getTypeOfSymbol: async (symbol: any) =>
+                symbol.carrierPath ? { filePath: symbol.carrierPath } : { text: 'string' },
+            getPropertiesOfType: async () => {
+                propertyWalks++;
+                if (propertyWalks === 1) {
+                    propertyWalkStarted.resolve();
+                    await releasePropertyWalk.promise;
+                }
+                return [{ name: 'size' }];
+            },
+            getDocumentationCommentOfSymbol: async () => '',
+            getSignaturesOfType: async () => []
+        };
+        const info = new TsGoComponentInfo(
+            sessionFor(checker) as any,
+            async () => ({ filePath: '/workspace/Button.svelte.tsx', offset: 1 }),
+            () => declarationVersion
+        );
+
+        const stale = info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button');
+        await propertyWalkStarted.promise;
+        declarationVersion++;
+        releasePropertyWalk.resolve();
+
+        assert.deepStrictEqual(await stale, []);
+        assert.deepStrictEqual(
+            (await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button')).map(
+                (part) => part.name
+            ),
+            ['size']
+        );
+        assert.strictEqual(propertyWalks, 2);
+    });
+
+    it('does not let a cancelled concurrent caller cancel or consume another caller result', async () => {
+        const releaseDefinition = deferred<{ filePath: string; offset: number } | undefined>();
+        let firstCurrent = true;
+        const checker = {
+            getTypeAtPosition: async (filePath: string) => ({ filePath }),
+            typeToString: async () => 'component',
+            getPropertyOfType: async (type: any, name: string) =>
+                name === '$$prop_def' ? { carrierPath: type.filePath } : undefined,
+            getTypeOfSymbol: async (symbol: any) =>
+                symbol.carrierPath ? { filePath: symbol.carrierPath } : { text: 'string' },
+            getPropertiesOfType: async () => [{ name: 'size' }],
+            getDocumentationCommentOfSymbol: async () => '',
+            getSignaturesOfType: async () => []
+        };
+        const info = new TsGoComponentInfo(sessionFor(checker) as any, () => {
+            return releaseDefinition.promise;
+        });
+
+        const cancelled = info.getProps(
+            '/workspace/Usage.svelte.tsx',
+            10,
+            'Button',
+            'same-context',
+            () => firstCurrent
+        );
+        const current = info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button', 'same-context');
+        firstCurrent = false;
+        releaseDefinition.resolve({ filePath: '/workspace/Button.svelte.tsx', offset: 1 });
+
+        assert.deepStrictEqual(await cancelled, []);
+        assert.deepStrictEqual(
+            (await current).map((part) => part.name),
+            ['size']
+        );
+    });
+
+    it('retries rather than caching a failed definition lookup', async () => {
+        let definitionCalls = 0;
+        const checker = {
+            getTypeAtPosition: async (filePath: string) => ({ filePath }),
+            typeToString: async () => 'component',
+            getPropertyOfType: async (type: any, name: string) =>
+                name === '$$prop_def' ? { carrierPath: type.filePath } : undefined,
+            getTypeOfSymbol: async (symbol: any) =>
+                symbol.carrierPath ? { filePath: symbol.carrierPath } : { text: 'string' },
+            getPropertiesOfType: async () => [{ name: 'size' }],
+            getDocumentationCommentOfSymbol: async () => '',
+            getSignaturesOfType: async () => []
+        };
+        const info = new TsGoComponentInfo(sessionFor(checker) as any, async () => {
+            definitionCalls++;
+            if (definitionCalls === 1) {
+                throw new Error('transient definition failure');
+            }
+            return { filePath: '/workspace/Button.svelte.tsx', offset: 1 };
+        });
+
+        assert.deepStrictEqual(
+            await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button'),
+            []
+        );
+        assert.deepStrictEqual(
+            (await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button')).map(
+                (part) => part.name
+            ),
+            ['size']
+        );
+        assert.strictEqual(definitionCalls, 2);
+    });
+
     it('does not conflate same-named component tags in different lexical scopes', async () => {
         let definitionCalls = 0;
         const checker = {
@@ -17,10 +266,7 @@ describe('typescript-go TsGoComponentInfo cache invalidation', () => {
             getDocumentationCommentOfSymbol: async () => '',
             getSignaturesOfType: async () => []
         };
-        const session = {
-            signatureKind: { Call: 0, Construct: 1 },
-            getProjectForFile: async () => ({ checker })
-        };
+        const session = sessionFor(checker);
         const info = new TsGoComponentInfo(session as any, async (_shadowPath, offset) => {
             definitionCalls++;
             return {
@@ -61,16 +307,10 @@ describe('typescript-go TsGoComponentInfo cache invalidation', () => {
             getDocumentationCommentOfSymbol: async () => '',
             getSignaturesOfType: async () => []
         };
-        const info = new TsGoComponentInfo(
-            {
-                signatureKind: { Call: 0, Construct: 1 },
-                getProjectForFile: async () => ({ checker })
-            } as any,
-            async () => {
-                definitionCalls++;
-                return { filePath: target, offset: 1 };
-            }
-        );
+        const info = new TsGoComponentInfo(sessionFor(checker) as any, async () => {
+            definitionCalls++;
+            return { filePath: target, offset: 1 };
+        });
 
         const first = await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button');
         target = '/workspace/Second.svelte.tsx';
@@ -126,5 +366,67 @@ describe('typescript-go TsGoComponentInfo cache invalidation', () => {
         info.invalidateFile('/workspace/Usage.svelte.tsx');
 
         assert.deepStrictEqual([...definitions.keys()], ['/workspace/Other.svelte.tsx::Button']);
+    });
+
+    it('retains a semantic usage definition while only component attributes change', async () => {
+        let definitionCalls = 0;
+        const checker = {
+            getTypeAtPosition: async (filePath: string) => ({ filePath }),
+            typeToString: async () => 'component',
+            getPropertyOfType: async (type: any, name: string) =>
+                name === '$$prop_def' ? { carrierPath: type.filePath } : undefined,
+            getTypeOfSymbol: async (symbol: any) => ({ filePath: symbol.carrierPath }),
+            getPropertiesOfType: async () => [{ name: 'size' }],
+            getDocumentationCommentOfSymbol: async () => '',
+            getSignaturesOfType: async () => []
+        };
+        const info = new TsGoComponentInfo(sessionFor(checker) as any, async () => {
+            definitionCalls++;
+            return { filePath: '/workspace/Button.svelte.tsx', offset: 1 };
+        });
+
+        await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button', 'same-context');
+        info.invalidateFile('/workspace/Usage.svelte.tsx', true);
+        await info.getProps('/workspace/Usage.svelte.tsx', 40, 'Button', 'same-context');
+        assert.strictEqual(definitionCalls, 1);
+
+        info.invalidateFile('/workspace/Usage.svelte.tsx');
+        await info.getProps('/workspace/Usage.svelte.tsx', 40, 'Button', 'same-context');
+        assert.strictEqual(definitionCalls, 2);
+    });
+
+    it('retries a transient negative definition after an attribute edit', async () => {
+        let definitionCalls = 0;
+        const checker = {
+            getTypeAtPosition: async (filePath: string) => ({ filePath }),
+            typeToString: async () => 'component',
+            getPropertyOfType: async (type: any, name: string) =>
+                name === '$$prop_def' ? { carrierPath: type.filePath } : undefined,
+            getTypeOfSymbol: async (symbol: any) => ({ filePath: symbol.carrierPath }),
+            getPropertiesOfType: async () => [{ name: 'size' }],
+            getDocumentationCommentOfSymbol: async () => '',
+            getSignaturesOfType: async () => []
+        };
+        const info = new TsGoComponentInfo(sessionFor(checker) as any, async () => {
+            definitionCalls++;
+            return definitionCalls === 1
+                ? undefined
+                : { filePath: '/workspace/Button.svelte.tsx', offset: 1 };
+        });
+
+        await info.getProps('/workspace/Usage.svelte.tsx', 10, 'Button', 'same-context');
+        info.invalidateFile('/workspace/Usage.svelte.tsx', true);
+        const props = await info.getProps(
+            '/workspace/Usage.svelte.tsx',
+            10,
+            'Button',
+            'same-context'
+        );
+
+        assert.strictEqual(definitionCalls, 2);
+        assert.deepStrictEqual(
+            props.map((prop) => prop.name),
+            ['size']
+        );
     });
 });

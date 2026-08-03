@@ -33,11 +33,26 @@
 > | editor: keystroke → diagnostics       | 948ms    | **420ms** |
 >
 > These figures predate the current correctness and lifecycle hardening and are historical context,
-> not current performance claims. The post-fix 1 August 2026 acceptance run found editor
-> fresh-process p50/p95 of 6.41s/7.97s classic versus 4.59s/5.40s stock tsgo. A separate strict
-> whole-project checker oracle completed in 17.3s classic versus 6.7s stock. Fail-fast dependency
-> discovery reduced the native adapter phase from roughly 13-17s to 1.45s; a warm checker reused all
-> 663 Svelte shadows in 148ms with zero transforms or writes.
+> not current performance claims. The validated 2 August 2026 Reintersect run used paired fresh
+> editor processes over already-materialised disk state. Pull-diagnostic p50/p95 was
+> 5407ms/6490ms classic, 2960ms/3655ms stock tsgo, and 2926ms/3648ms Effect tsgo. Completion was kept
+> off the project-graph critical path: stock measured 179.3ms for the first dropdown, about 15ms
+> script-member p95, 14.2ms template-member p95 and 190.4ms auto-import p95; Effect measured 233.4ms,
+> 16ms, 13.5ms and 196.3ms respectively.
+>
+> A valid completion requested before the native project is ready may lazily start a classic
+> completion-only resolver so the first dropdown is useful instead of blank. It does not provide
+> diagnostics or any other editor feature, unsupported completion contexts start neither engine,
+> and native-ready completion stays on tsgo. Dirty TypeScript-family buffers are mirrored into this
+> resolver when it exists.
+>
+> There is an important cold-cache tradeoff. After deleting the materialisation cache, the first
+> checker run took 14.304s classic versus 33.058s stock and 35.044s Effect. The immediate warm run
+> took 13.299s classic versus 8.205s stock and 8.240s Effect. Both native warm runs reused 675 Svelte
+> shadows with zero transforms or writes, stable shadow mtimes, and field-for-field identical
+> diagnostics to their corresponding cold run. The tested diagnostics quiescence remains 150ms:
+> 80ms reduced stock p50/p95 by 14.6%/12.8% but raised CPU 24.1% and native checks 33.3%; for Effect,
+> p50 improved 14.4% while p95 regressed 59.2%, CPU rose 27.3%, and checks rose 29.8%.
 >
 > The repository runs the strict `pnpm test:tsgo-oracle` editor-feature oracle and the whole-project
 > `pnpm test:tsgo-checker-oracle -- --project <project>` checker oracle. Exact parity is an invariant
@@ -83,7 +98,7 @@
 > **CLI / CI:**
 >
 > ```bash
-> pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.6 @reintersect/effect-tsgo
+> pnpm add -D svelte-check@npm:@reintersect/svelte-check@^4.8.7 @reintersect/effect-tsgo
 > svelte-check --tsgo --tsconfig ./tsconfig.json
 > ```
 >

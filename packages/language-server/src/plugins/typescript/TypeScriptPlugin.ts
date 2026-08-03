@@ -160,6 +160,7 @@ export class TypeScriptPlugin
     private readonly codLensProvider: CodeLensProviderImpl;
     private readonly documentHeightProvider: DocumentHighlightProviderImpl;
     private readonly workspaceSymbolsProvider: WorkspaceSymbolsProvider;
+    private disposed = false;
 
     constructor(
         configManager: LSConfigManager,
@@ -745,6 +746,14 @@ export class TypeScriptPlugin
             return null;
         }
         return this.workspaceSymbolsProvider.getWorkspaceSymbols(query, cancellationToken);
+    }
+
+    dispose(): void {
+        if (this.disposed) {
+            return;
+        }
+        this.disposed = true;
+        this.lsAndTsDocResolver.dispose();
     }
 
     private featureEnabled(feature: keyof LSTypescriptConfig) {

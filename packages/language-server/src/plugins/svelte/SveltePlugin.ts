@@ -18,7 +18,8 @@ import {
 } from 'vscode-languageserver';
 import { Plugin } from 'prettier';
 import { getPackageInfo, importPrettier } from '../../importPackage';
-import { Document } from '../../lib/documents';
+import { Document, isInTag } from '../../lib/documents';
+import { getAttributeContextAtPosition } from '../../lib/documents/parseHtml';
 import { Logger } from '../../logger';
 import { LSConfigManager, LSSvelteConfig } from '../../ls-config';
 import { isNotNullOrUndefined } from '../../utils';
@@ -326,6 +327,25 @@ export class SveltePlugin
         cancellationToken?: CancellationToken
     ): Promise<CompletionList | null> {
         if (!this.featureEnabled('completions')) {
+            return null;
+        }
+        // Svelte-specific completions are directives, block tags, event modifiers and component
+        // documentation. A caret in script/style can only be answered by TypeScript/CSS, so do
+        // not import/compile the workspace's Svelte package merely to rediscover that fact.
+        if (
+            isInTag(position, document.scriptInfo) ||
+            isInTag(position, document.moduleScriptInfo) ||
+            isInTag(position, document.styleInfo)
+        ) {
+            return null;
+        }
+        const offset = document.offsetAt(position);
+        const nearby = document.getText().slice(Math.max(0, offset - 10), offset);
+        if (
+            !/{\s*[#:/@]\w*$/.test(nearby) &&
+            !nearby.includes('<!--') &&
+            !getAttributeContextAtPosition(document, position)
+        ) {
             return null;
         }
 

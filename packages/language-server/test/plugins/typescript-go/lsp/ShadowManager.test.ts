@@ -9,6 +9,7 @@ import {
     invalidateTsGoWorkspaceIndex,
     ShadowManager
 } from '../../../../src/plugins/typescript-go/lsp/ShadowManager';
+import { configLoader } from '../../../../src/lib/documents/configLoader';
 import { normalizePath } from '../../../../src/utils';
 
 const monorepo = normalizePath(path.join(__dirname, '..', 'fixtures', 'monorepo'));
@@ -37,6 +38,7 @@ function manager(projectRoot: string, tsconfigPath: string | undefined, writeCon
 }
 
 function cleanOverlays() {
+    configLoader.invalidateConfigs();
     for (const packageRoot of [monorepo, appRoot, uiRoot, nocfgRoot]) {
         fs.rmSync(path.join(packageRoot, 'node_modules'), { recursive: true, force: true });
         fs.rmSync(path.join(packageRoot, '.svelte-ls-overlay'), { recursive: true, force: true });
@@ -107,6 +109,78 @@ describe('typescript-go ShadowManager', () => {
             shadows.getOriginalPath(renamedShadow),
             `${appRoot}/src/lib/Renamed.svelte`
         );
+    });
+
+    it('uses JSX for JavaScript shadows and TSX for every configured TypeScript form', async () => {
+        const root = tempProject();
+        const javascript = `${root}/src/JavaScript.svelte`;
+        const explicitTypeScript = `${root}/src/ExplicitTypeScript.svelte`;
+        const mixedTypeScript = `${root}/src/MixedTypeScript.svelte`;
+        const configuredTypeScript = `${root}/src/ConfiguredTypeScript.svelte`;
+        fs.writeFileSync(javascript, '<script>export let value;</script><p>{value}</p>');
+        fs.writeFileSync(
+            `${root}/src/main.ts`,
+            'import JavaScript from "./JavaScript.svelte"; void JavaScript;\n'
+        );
+        fs.writeFileSync(
+            explicitTypeScript,
+            '<script lang="ts">export let value: string;</script><p>{value}</p>'
+        );
+        fs.writeFileSync(
+            mixedTypeScript,
+            '<script module lang="ts">export const answer: number = 42;</script>' +
+                '<script>export let value;</script><p>{value}{answer}</p>'
+        );
+        fs.mkdirSync(`${root}/configured`, { recursive: true });
+        fs.writeFileSync(
+            `${root}/configured/svelte.config.js`,
+            'module.exports = { preprocess: { defaultLanguages: { script: "ts" } } };\n'
+        );
+        fs.writeFileSync(
+            configuredTypeScript.replace('/src/', '/configured/'),
+            '<script>export let value: string;</script><p>{value}</p>'
+        );
+        const configured = configuredTypeScript.replace('/src/', '/configured/');
+
+        const shadows = new ShadowManager({
+            projectPath: root,
+            sourceRoot: root,
+            tsconfigPath: `${root}/tsconfig.json`,
+            snapshotOptions
+        });
+        await shadows.refreshShadowKinds([
+            javascript,
+            explicitTypeScript,
+            mixedTypeScript,
+            configured
+        ]);
+
+        const javascriptShadow = shadows.getShadowPath(javascript);
+        assert.ok(javascriptShadow.endsWith('.svelte.jsx'), javascriptShadow);
+        assert.strictEqual(shadows.getOriginalPath(javascriptShadow), javascript);
+        const fresh = new ShadowManager({
+            projectPath: root,
+            sourceRoot: root,
+            tsconfigPath: `${root}/tsconfig.json`,
+            snapshotOptions
+        });
+        assert.strictEqual(fresh.getOriginalPath(javascriptShadow), javascript);
+        assert.strictEqual(
+            fresh.getOriginalPath(javascriptShadow.replace('.svelte.jsx', '.__svlt.jsx')),
+            javascript
+        );
+        assert.ok(shadows.getShadowPath(explicitTypeScript).endsWith('.svelte.tsx'));
+        assert.ok(shadows.getShadowPath(mixedTypeScript).endsWith('.svelte.tsx'));
+        assert.ok(shadows.getShadowPath(configured).endsWith('.svelte.tsx'));
+
+        shadows.writeOverlayTsconfig([]);
+        const config = JSON.parse(fs.readFileSync(shadows.overlayTsconfigPath, 'utf8'));
+        assert.strictEqual(config.compilerOptions.allowJs, true);
+        assert.ok(config.files.includes(javascriptShadow));
+        const tsSupport = JSON.parse(
+            fs.readFileSync(`${root}/${OVERLAY}/tsconfig.ts-support.json`, 'utf8')
+        );
+        assert.strictEqual(tsSupport.compilerOptions.allowJs, true);
     });
 
     it('bounds navigation snapshots while retaining client-open snapshots', () => {
@@ -1474,6 +1548,56 @@ describe('typescript-go ShadowManager', () => {
         );
     });
 
+    it('roots reachable JavaScript shadows without rooting conservative dependency scans', async () => {
+        const root = tempProject();
+        const reachable = `${root}/src/Reachable.svelte`;
+        fs.writeFileSync(reachable, '<script>export let value;</script>');
+        fs.writeFileSync(
+            `${root}/package.json`,
+            JSON.stringify({ name: 'consumer', dependencies: { controls: '1.0.0' } })
+        );
+        fs.writeFileSync(
+            `${root}/src/main.ts`,
+            'import Reachable from "./Reachable.svelte"; import "controls"; void Reachable;'
+        );
+        const dependency = `${root}/node_modules/controls`;
+        fs.mkdirSync(`${dependency}/dist`, { recursive: true });
+        fs.mkdirSync(`${dependency}/src`, { recursive: true });
+        fs.writeFileSync(
+            `${dependency}/package.json`,
+            JSON.stringify({
+                name: 'controls',
+                version: '1.0.0',
+                exports: { '.': { types: './dist/index.d.ts' } }
+            })
+        );
+        fs.writeFileSync(
+            `${dependency}/dist/index.d.ts`,
+            '/// <reference path="./missing.d.ts" />\n'
+        );
+        const conservative = `${dependency}/src/Conservative.svelte`;
+        fs.writeFileSync(conservative, '<script>export let value;</script>');
+
+        const shadows = new ShadowManager({
+            projectPath: root,
+            sourceRoot: root,
+            tsconfigPath: `${root}/tsconfig.json`,
+            snapshotOptions
+        });
+        assert.ok(shadows.findDependencySvelteFiles().includes(conservative));
+        assert.strictEqual(shadows.getDependencyScopeStats().mode, 'declared-fallback');
+
+        await shadows.refreshShadowKinds([reachable, conservative]);
+        shadows.writeOverlayTsconfig([]);
+        const config = JSON.parse(fs.readFileSync(shadows.overlayTsconfigPath, 'utf8'));
+        const reachableShadow = shadows.getShadowPath(reachable);
+        const conservativeShadow = shadows.getShadowPath(conservative);
+        assert.ok(reachableShadow.endsWith('.svelte.jsx'));
+        assert.ok(conservativeShadow.endsWith('.svelte.jsx'));
+        assert.ok(config.files.includes(reachableShadow));
+        assert.ok(!config.files.includes(conservativeShadow));
+    });
+
     it('does not transform dependencies with modern .d.svelte.ts declarations', () => {
         const root = tempProject();
         fs.writeFileSync(
@@ -1581,7 +1705,8 @@ describe('typescript-go ShadowManager', () => {
             directImports: 1,
             dependencyRoots: 2,
             svelteFiles: 1,
-            fallbackReasons: []
+            fallbackReasons: [],
+            closureComplete: true
         });
     });
 
@@ -1640,7 +1765,8 @@ describe('typescript-go ShadowManager', () => {
             directImports: 1,
             dependencyRoots: 2,
             svelteFiles: 1,
-            fallbackReasons: []
+            fallbackReasons: [],
+            closureComplete: true
         });
     });
 
@@ -1826,7 +1952,8 @@ describe('typescript-go ShadowManager', () => {
             directImports: 1,
             dependencyRoots: 2,
             svelteFiles: 1,
-            fallbackReasons: []
+            fallbackReasons: [],
+            closureComplete: true
         });
     });
 
@@ -1940,6 +2067,13 @@ describe('typescript-go ShadowManager', () => {
             false,
             'the later public entry must not be parsed after fallback is inevitable'
         );
+        assert.strictEqual(
+            shadows
+                .getBatchGraphPlanSourceInputs()
+                .some((input) => input.path === `${ambiguous}/index.js`),
+            false,
+            'the failed narrow proof must not burden the authoritative fallback cache'
+        );
     });
 
     it('retains declared dependency scanning when the project graph is ambiguous', () => {
@@ -1987,6 +2121,75 @@ describe('typescript-go ShadowManager', () => {
         const stats = shadows.getDependencyScopeStats();
         assert.strictEqual(stats.mode, 'declared-fallback');
         assert.ok(stats.fallbackReasons.some((reason) => reason.startsWith('computed-import:')));
+    });
+
+    it('follows public companion re-exports through included and locally-indirected peers', () => {
+        const root = tempProject();
+        fs.writeFileSync(
+            `${root}/package.json`,
+            JSON.stringify({
+                name: 'consumer',
+                peerDependencies: { 'svelte-facade': '1.0.0', 'indirect-facade': '1.0.0' }
+            })
+        );
+        fs.writeFileSync(`${root}/src/main.ts`, 'const name = "dynamic"; void import(name);');
+        const svelteFacade = `${root}/node_modules/svelte-facade`;
+        const indirectFacade = `${root}/node_modules/indirect-facade`;
+        const companion = `${root}/node_modules/companion`;
+        fs.mkdirSync(svelteFacade, { recursive: true });
+        fs.mkdirSync(indirectFacade, { recursive: true });
+        fs.mkdirSync(companion, { recursive: true });
+        fs.writeFileSync(
+            `${svelteFacade}/package.json`,
+            JSON.stringify({
+                name: 'svelte-facade',
+                version: '1.0.0',
+                types: './index.d.ts',
+                peerDependencies: { svelte: '^5', companion: '1.0.0' }
+            })
+        );
+        fs.writeFileSync(
+            `${svelteFacade}/index.d.ts`,
+            'export { default as Button } from "companion";'
+        );
+        fs.writeFileSync(
+            `${indirectFacade}/package.json`,
+            JSON.stringify({
+                name: 'indirect-facade',
+                version: '1.0.0',
+                types: './index.d.ts',
+                peerDependencies: { companion: '1.0.0' }
+            })
+        );
+        fs.writeFileSync(
+            `${indirectFacade}/index.d.ts`,
+            [
+                'import Button from "companion";',
+                'const make = () => Button;',
+                'export { make };'
+            ].join('\n')
+        );
+        fs.writeFileSync(
+            `${companion}/package.json`,
+            JSON.stringify({
+                name: 'companion',
+                version: '1.0.0',
+                exports: { '.': './Button.svelte' }
+            })
+        );
+        const button = `${companion}/Button.svelte`;
+        fs.writeFileSync(button, '<button />');
+
+        const shadows = new ShadowManager({
+            projectPath: root,
+            sourceRoot: root,
+            tsconfigPath: `${root}/tsconfig.json`,
+            snapshotOptions
+        });
+        shadows.writeOverlayTsconfig([]);
+
+        assert.ok(shadows.findDependencySvelteFiles().includes(button));
+        assert.strictEqual(shadows.getDependencyScopeStats().mode, 'declared-fallback');
     });
 
     it("prunes only shadows whose original is gone, keeping other managers' work", () => {

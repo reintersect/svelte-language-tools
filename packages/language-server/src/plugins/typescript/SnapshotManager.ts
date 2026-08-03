@@ -82,10 +82,25 @@ export class GlobalSnapshotsManager {
 
     onChange(listener: SnapshotChangeHandler) {
         this.emitter.on('change', listener);
+        let active = true;
+        return {
+            dispose: () => {
+                if (!active) {
+                    return;
+                }
+                active = false;
+                this.emitter.off('change', listener);
+            }
+        };
     }
 
     removeChangeListener(listener: SnapshotChangeHandler) {
         this.emitter.off('change', listener);
+    }
+
+    dispose() {
+        this.emitter.removeAllListeners();
+        this.documents.clear();
     }
 }
 
@@ -318,6 +333,10 @@ export class SnapshotManager {
 
     dispose() {
         this.globalSnapshotsManager.removeChangeListener(this.onSnapshotChange);
+    }
+
+    usesGlobalSnapshotsManager(manager: GlobalSnapshotsManager): boolean {
+        return this.globalSnapshotsManager === manager;
     }
 }
 

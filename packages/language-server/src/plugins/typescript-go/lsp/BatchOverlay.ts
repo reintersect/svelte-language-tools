@@ -1,6 +1,8 @@
 import fs from 'fs';
-import { createHash } from 'crypto';
-import { dirname, join, relative, resolve } from 'path';
+import { spawn } from 'child_process';
+import { createHash, randomBytes } from 'crypto';
+import { dirname, isAbsolute, join, relative, resolve } from 'path';
+import { setPriority } from 'os';
 import ts from 'typescript';
 import { internalHelpers, InternalHelpers } from 'svelte2tsx';
 import { Diagnostic, DiagnosticSeverity, Position, Range } from 'vscode-languageserver';
@@ -23,13 +25,26 @@ import {
 } from './ShadowManager';
 import { ResolvedTsGoEngine, resolveTsGoEngine } from './TsGoEngine';
 import {
-    DirectoryMembershipProof,
     MaterialisationPlanCache,
     MaterialisationPlanCacheCounters,
+    MaterialisationPlanEngineIdentity,
     MaterialisationPlanFileInput,
+    MaterialisationPlanIdentity,
     MaterialisationPlanMissReason,
-    MaterialisationPlanWriteFailureReason
+    MaterialisationPlanValidationOnlyFileInput,
+    MaterialisationPlanWriteFailureReason,
+    materialisationPlanEngineCacheKey,
+    materialisationPlanExactFileProof,
+    materialisationPlanLayoutTopologyProof,
+    readValidMaterialisationPlanFile,
+    readValidMaterialisationPlanIdentity
 } from './MaterialisationPlanCache';
+import {
+    BATCH_GRAPH_DIRECTORY_VALIDATOR,
+    batchGraphDirectoryMembershipCoversPath,
+    batchGraphDirectoryMembership,
+    createBatchGraphDirectoryMembershipBudget
+} from './BatchGraphEvidence';
 
 /**
  * A diagnostic as it comes off a batch compiler run, positioned in the *generated* file.
@@ -163,6 +178,7 @@ export interface BatchMaterialiseResult {
             dependencyRoots: number;
             svelteFiles: number;
             fallbackReasons: readonly string[];
+            closureComplete: boolean;
         };
         collisionMirrors: {
             reachableScripts: number;
@@ -185,9 +201,10 @@ const defaultKitFiles: InternalHelpers.KitFilesSettings = {
 };
 
 const BATCH_STATE_VERSION = 5;
-const BATCH_GRAPH_ALGORITHM_VERSION = `batch-graph-v3:typescript-${ts.version}`;
-const BATCH_GRAPH_DIRECTORY_VALIDATOR = 'tsgo:batch-graph-directory-membership:v1';
-const BATCH_GRAPH_PLAN_FILE = 'materialisation-plan.json';
+const BATCH_GRAPH_ALGORITHM_VERSION = `batch-graph-v18:typescript-${ts.version}`;
+const BATCH_GRAPH_PLAN_FILE_PREFIX = 'materialisation-plan';
+const MAX_VALID_BATCH_GRAPH_ENGINE_CACHE_ENTRIES = 2;
+const MAX_BATCH_GRAPH_DIRECTORY_ROOTS = 1_024;
 
 interface StoredParserError {
     range: Range;
@@ -225,6 +242,1056 @@ interface BatchState {
     entries: Record<string, StoredShadowState>;
     /** Hash of every live mirror output path after the last successful reconciliation/prune. */
     cleanupIdentity?: string;
+}
+
+export interface BatchGraphPlanCacheLookup {
+    hit: boolean;
+    plan?: BatchGraphPlan;
+    missReason?: MaterialisationPlanMissReason | 'restore-rejected';
+    missDetail?: string;
+    lookupMs: number;
+    restoreMs: number;
+}
+
+export interface BatchGraphPlanPublication {
+    readonly plan: BatchGraphPlan;
+    readonly safeDirectoryRoots: readonly string[] | undefined;
+    readonly directories:
+        | ReturnType<MaterialisationPlanCache<BatchGraphPlan>['snapshotDirectory']>[]
+        | undefined;
+    readonly refreshInputStats: boolean;
+    readonly shouldPublish: boolean;
+    readonly discoveryCurrent: boolean;
+    readonly discoveryStatus: BatchGraphDiscoveryEvidenceStatus;
+}
+
+type BatchGraphDiscoveryEvidenceStatus = 'current' | 'stale' | 'incomplete' | 'unverifiable';
+
+interface BatchGraphPlanProcessRequest {
+    engine: ResolvedTsGoEngine;
+    overlayPath: string;
+    project: {
+        projectPath: string;
+        sourceRoot: string;
+        tsconfigPath: string | undefined;
+        configPath?: string;
+    };
+    plan: BatchGraphPlan;
+    collisionFallbackReasons: string[];
+}
+
+interface BatchGraphPlanPublicationJob {
+    readonly key: string;
+    readonly request: BatchGraphPlanProcessRequest;
+    readonly approximateBytes: number;
+    readonly attempt: number;
+}
+
+const pendingBatchGraphPlanPublications = new Map<string, BatchGraphPlanPublicationJob>();
+const MAX_BATCH_GRAPH_PLAN_REQUEST_BYTES = 64 * 1024 * 1024;
+const MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES = 96 * 1024 * 1024;
+const MAX_PENDING_BATCH_GRAPH_PLAN_PUBLICATIONS = 8;
+const MAX_BATCH_GRAPH_PLAN_PUBLICATION_ATTEMPTS = 2;
+const BATCH_GRAPH_PLAN_PUBLICATION_TIMEOUT_MS = 30_000;
+const MAX_BATCH_GRAPH_PLAN_REQUEST_ESTIMATE_NODES = 1_000_000;
+const MAX_BATCH_GRAPH_PLAN_REQUEST_ESTIMATE_DEPTH = 512;
+/** Interactive cache proof must remain cheaper than rebuilding the graph it is meant to save. */
+const EDITOR_GRAPH_PLAN_LOOKUP_MAX_DURATION_MS = 2_000;
+const EDITOR_GRAPH_PLAN_LOOKUP_MAX_CONTENT_FALLBACKS = 64;
+const EDITOR_GRAPH_PLAN_DIRECTORY_MAX_DURATION_MS = 1_500;
+let batchGraphPlanPublicationTimer: NodeJS.Timeout | undefined;
+let activeBatchGraphPlanPublication: BatchGraphPlanPublicationJob | undefined;
+let retainedBatchGraphPlanRequestBytes = 0;
+
+/** Coalesce project replacement bursts and run at most one low-priority publisher at a time. */
+function enqueueBatchGraphPlanPublication(request: BatchGraphPlanProcessRequest): void {
+    const key = `${normalizePath(request.overlayPath)}\0${batchGraphProjectIdentity(
+        request.project
+    )}\0${materialisationPlanEngineCacheKey(batchGraphEngineIdentity(request.engine))}`;
+    if (
+        activeBatchGraphPlanPublication?.key === key &&
+        batchGraphPlanPublicationRequestsMatch(activeBatchGraphPlanPublication.request, request)
+    ) {
+        return;
+    }
+    const previous = pendingBatchGraphPlanPublications.get(key);
+    if (previous && batchGraphPlanPublicationRequestsMatch(previous.request, request)) {
+        return;
+    }
+    // A newer graph for the same project supersedes a queued one even when the new auxiliary
+    // request is too large to retain. Publishing the known-stale request would only add I/O and
+    // its final cache validation would reject it anyway.
+    if (previous) {
+        discardPendingBatchGraphPlanPublication(previous);
+    }
+    const approximateBytes = approximateBatchGraphPlanRequestBytes(request);
+    if (
+        approximateBytes === undefined ||
+        approximateBytes > MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES
+    ) {
+        Logger.debug('[tsgo] dropped an unbounded graph-plan publication request');
+        return;
+    }
+    retainPendingBatchGraphPlanPublication({
+        key,
+        request,
+        approximateBytes,
+        attempt: 0
+    });
+    scheduleNextBatchGraphPlanPublication();
+}
+
+function scheduleNextBatchGraphPlanPublication(): void {
+    if (
+        activeBatchGraphPlanPublication ||
+        batchGraphPlanPublicationTimer ||
+        pendingBatchGraphPlanPublications.size === 0
+    ) {
+        return;
+    }
+    batchGraphPlanPublicationTimer = setTimeout(() => {
+        batchGraphPlanPublicationTimer = undefined;
+        void runNextBatchGraphPlanPublication();
+    }, 50);
+    batchGraphPlanPublicationTimer.unref();
+}
+
+async function runNextBatchGraphPlanPublication(): Promise<void> {
+    if (activeBatchGraphPlanPublication) {
+        return;
+    }
+    const next = pendingBatchGraphPlanPublications.entries().next().value as
+        | [string, BatchGraphPlanPublicationJob]
+        | undefined;
+    if (!next) {
+        return;
+    }
+    const [key, job] = next;
+    pendingBatchGraphPlanPublications.delete(key);
+    activeBatchGraphPlanPublication = job;
+    const { request } = job;
+    let requestPath: string | undefined;
+    const finish = (retry: boolean, detail: string) => {
+        if (activeBatchGraphPlanPublication !== job) {
+            return;
+        }
+        activeBatchGraphPlanPublication = undefined;
+        retainedBatchGraphPlanRequestBytes = Math.max(
+            0,
+            retainedBatchGraphPlanRequestBytes - job.approximateBytes
+        );
+        let retryQueued = false;
+        if (
+            retry &&
+            job.attempt + 1 < MAX_BATCH_GRAPH_PLAN_PUBLICATION_ATTEMPTS &&
+            !pendingBatchGraphPlanPublications.has(job.key)
+        ) {
+            retryQueued = retainPendingBatchGraphPlanPublication({
+                ...job,
+                attempt: job.attempt + 1
+            });
+        }
+        if (retry) {
+            Logger.debug(
+                `[tsgo] graph-plan publisher ${detail}; ${
+                    retryQueued ? 'queued one retry' : 'dropped auxiliary publication'
+                }`
+            );
+        }
+        scheduleNextBatchGraphPlanPublication();
+    };
+    try {
+        await fs.promises.mkdir(request.overlayPath, { recursive: true });
+        requestPath = join(
+            request.overlayPath,
+            `.materialisation-plan-request-${process.pid}-${randomBytes(6).toString('hex')}.json`
+        );
+        // Serialize/write in bounded chunks. JSON.stringify on a real workspace plan can block
+        // the LS event loop on tens of MiB immediately after the first completion.
+        await writeJsonFileCooperatively(requestPath, request);
+        const script = `
+const fs = require('node:fs');
+const [modulePath, requestPath] = process.argv.slice(1);
+try {
+    const request = JSON.parse(fs.readFileSync(requestPath, 'utf8'));
+    require(modulePath).publishBatchGraphPlanInProcess(request);
+} finally {
+    try { fs.unlinkSync(requestPath); } catch {}
+}
+`;
+        const execArgs = __filename.endsWith('.ts')
+            ? ['--require', require.resolve('ts-node/register')]
+            : [];
+        const child = spawn(
+            process.execPath,
+            [...execArgs, '-e', script, __filename, requestPath],
+            { detached: true, stdio: 'ignore', windowsHide: true }
+        );
+        let settled = false;
+        let childTimeout: NodeJS.Timeout | undefined;
+        let childError: (error: Error) => void;
+        let childClose: (code: number | null, signal: NodeJS.Signals | null) => void;
+        const cleanupAfterSettlement = () => {
+            unlinkBatchGraphPlanProcessRequest(requestPath);
+        };
+        const childFinished = (retry: boolean, detail: string) => {
+            // The child normally unlinks in its finally block, but it may never execute the
+            // script (for example a failing --require), be killed by a signal, or time out.
+            // Parent ownership makes cleanup independent of how far bootstrap progressed.
+            unlinkBatchGraphPlanProcessRequest(requestPath);
+            if (settled) {
+                return;
+            }
+            settled = true;
+            if (childTimeout) {
+                clearTimeout(childTimeout);
+                childTimeout = undefined;
+            }
+            // A process which ignores/does not observe the timeout must not retain the complete
+            // request through these lifecycle closures. Keep only a path-sized cleanup listener.
+            child.removeListener('error', childError);
+            child.removeListener('close', childClose);
+            child.once('error', cleanupAfterSettlement);
+            child.once('close', cleanupAfterSettlement);
+            finish(retry, detail);
+        };
+        childError = (error) => {
+            childFinished(true, `failed to start (${error.message})`);
+        };
+        childClose = (code, signal) => {
+            const failed = code !== 0 || signal !== null;
+            childFinished(
+                failed,
+                signal ? `closed from ${signal}` : `exited with status ${String(code)}`
+            );
+        };
+        child.once('error', childError);
+        child.once('close', childClose);
+        childTimeout = setTimeout(() => {
+            try {
+                child.kill('SIGKILL');
+            } catch {
+                // Settlement below still releases the queue if the process cannot be signalled.
+            }
+            childFinished(true, 'timed out');
+        }, BATCH_GRAPH_PLAN_PUBLICATION_TIMEOUT_MS);
+        childTimeout.unref();
+        if (child.pid) {
+            try {
+                setPriority(child.pid, 10);
+            } catch {
+                // Priority is advisory and unsupported on some hosts.
+            }
+        }
+        child.unref();
+    } catch (error) {
+        unlinkBatchGraphPlanProcessRequest(requestPath);
+        finish(
+            true,
+            `failed before child bootstrap (${error instanceof Error ? error.message : String(error)})`
+        );
+    }
+}
+
+function retainPendingBatchGraphPlanPublication(job: BatchGraphPlanPublicationJob): boolean {
+    const activeBytes = activeBatchGraphPlanPublication?.approximateBytes ?? 0;
+    if (job.approximateBytes > MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES - activeBytes) {
+        return false;
+    }
+    while (
+        pendingBatchGraphPlanPublications.size >= MAX_PENDING_BATCH_GRAPH_PLAN_PUBLICATIONS ||
+        job.approximateBytes >
+            MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES - retainedBatchGraphPlanRequestBytes
+    ) {
+        const oldest = pendingBatchGraphPlanPublications.values().next().value as
+            | BatchGraphPlanPublicationJob
+            | undefined;
+        if (!oldest) {
+            return false;
+        }
+        discardPendingBatchGraphPlanPublication(oldest);
+    }
+    pendingBatchGraphPlanPublications.set(job.key, job);
+    retainedBatchGraphPlanRequestBytes += job.approximateBytes;
+    return true;
+}
+
+function discardPendingBatchGraphPlanPublication(job: BatchGraphPlanPublicationJob): void {
+    if (pendingBatchGraphPlanPublications.get(job.key) !== job) {
+        return;
+    }
+    pendingBatchGraphPlanPublications.delete(job.key);
+    retainedBatchGraphPlanRequestBytes = Math.max(
+        0,
+        retainedBatchGraphPlanRequestBytes - job.approximateBytes
+    );
+}
+
+function batchGraphPlanPublicationRequestsMatch(
+    left: BatchGraphPlanProcessRequest,
+    right: BatchGraphPlanProcessRequest
+): boolean {
+    return (
+        left.plan.signature === right.plan.signature &&
+        left.collisionFallbackReasons.length === right.collisionFallbackReasons.length &&
+        left.collisionFallbackReasons.every(
+            (reason, index) => reason === right.collisionFallbackReasons[index]
+        )
+    );
+}
+
+/**
+ * Conservatively estimate retained JS heap without stringifying the graph on the editor thread.
+ * The traversal is itself bounded and rejects cycles/repeated object identities, excessive depth,
+ * unsupported JSON values and plans too large for the auxiliary queue.
+ */
+function approximateBatchGraphPlanRequestBytes(value: unknown): number | undefined {
+    const seen = new WeakSet<object>();
+    let bytes = 0;
+    let nodes = 0;
+    const add = (amount: number): boolean => {
+        if (
+            !Number.isSafeInteger(amount) ||
+            amount < 0 ||
+            amount > MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES - bytes
+        ) {
+            bytes = MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES + 1;
+            return false;
+        }
+        bytes += amount;
+        return true;
+    };
+    const visit = (current: unknown, depth: number): boolean => {
+        nodes++;
+        if (
+            nodes > MAX_BATCH_GRAPH_PLAN_REQUEST_ESTIMATE_NODES ||
+            depth > MAX_BATCH_GRAPH_PLAN_REQUEST_ESTIMATE_DEPTH
+        ) {
+            return false;
+        }
+        if (current === null) {
+            return add(8);
+        }
+        switch (typeof current) {
+            case 'string':
+                return add(current.length * 2 + 16);
+            case 'number':
+                return add(8);
+            case 'boolean':
+            case 'undefined':
+                return add(4);
+            case 'bigint':
+            case 'function':
+            case 'symbol':
+                return false;
+            case 'object':
+                break;
+        }
+        const object = current as object;
+        if (seen.has(object)) {
+            return false;
+        }
+        seen.add(object);
+        if (!add(Array.isArray(object) ? 24 : 48)) {
+            return false;
+        }
+        if (Array.isArray(object)) {
+            if (!add(object.length * 8)) {
+                return false;
+            }
+            for (let index = 0; index < object.length; index++) {
+                if (!visit(object[index], depth + 1)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        let entries: [string, unknown][];
+        try {
+            entries = Object.entries(object);
+        } catch {
+            return false;
+        }
+        if (!add(entries.length * 16)) {
+            return false;
+        }
+        for (const [property, propertyValue] of entries) {
+            if (!add(property.length * 2 + 16)) {
+                return false;
+            }
+            if (!visit(propertyValue, depth + 1)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!visit(value, 0)) {
+        return bytes > MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES ? bytes : undefined;
+    }
+    return bytes;
+}
+
+function unlinkBatchGraphPlanProcessRequest(requestPath: string | undefined): void {
+    if (!requestPath) {
+        return;
+    }
+    void fs.promises.unlink(requestPath).catch(() => undefined);
+}
+
+async function writeJsonFileCooperatively(filePath: string, value: unknown): Promise<void> {
+    const handle = await fs.promises.open(filePath, 'wx', 0o600);
+    let buffer = '';
+    let bytesWritten = 0;
+    const flush = async () => {
+        if (!buffer) {
+            return;
+        }
+        const chunk = buffer;
+        buffer = '';
+        const encoded = Uint8Array.from(Buffer.from(chunk, 'utf8'));
+        bytesWritten += encoded.byteLength;
+        if (bytesWritten > MAX_BATCH_GRAPH_PLAN_REQUEST_BYTES) {
+            throw new Error('materialisation plan request exceeds the cache size limit');
+        }
+        let offset = 0;
+        while (offset < encoded.byteLength) {
+            const written = await handle.write(encoded, offset, encoded.byteLength - offset, null);
+            if (written.bytesWritten <= 0) {
+                throw new Error('could not make progress writing materialisation plan request');
+            }
+            offset += written.bytesWritten;
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    };
+    const append = async (text: string) => {
+        buffer += text;
+        if (buffer.length >= 256 * 1024) {
+            await flush();
+        }
+    };
+    const writeValue = async (input: unknown): Promise<void> => {
+        if (input === null || typeof input !== 'object') {
+            const encoded = JSON.stringify(input);
+            await append(encoded === undefined ? 'null' : encoded);
+            return;
+        }
+        if (Array.isArray(input)) {
+            await append('[');
+            for (let index = 0; index < input.length; index++) {
+                if (index) {
+                    await append(',');
+                }
+                await writeValue(input[index]);
+            }
+            await append(']');
+            return;
+        }
+        await append('{');
+        let first = true;
+        for (const [property, propertyValue] of Object.entries(input)) {
+            if (propertyValue === undefined) {
+                continue;
+            }
+            if (!first) {
+                await append(',');
+            }
+            first = false;
+            await append(`${JSON.stringify(property)}:`);
+            await writeValue(propertyValue);
+        }
+        await append('}');
+    };
+    try {
+        await writeValue(value);
+        await flush();
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
+}
+
+/**
+ * The single persisted BatchGraphPlan boundary shared by the checker and editor. Both consumers
+ * therefore use the same engine/project identity, freshness validators, completeness proof and
+ * fail-closed publication rules.
+ */
+export class BatchGraphPlanCache {
+    private readonly cache: MaterialisationPlanCache<BatchGraphPlan>;
+    private readonly cachePath: string;
+    private readonly legacyCachePath: string;
+    private readonly cacheIdentity: MaterialisationPlanIdentity;
+    private readonly cacheProjectIdentity: string;
+    private readonly cacheProjectKey: string;
+    private lookup: BatchGraphPlanCacheLookup | undefined;
+    private eligible = false;
+    private writeStatus: BatchMaterialisationPlanTelemetry['writeStatus'] = 'pending';
+    private writeFailureReason: MaterialisationPlanWriteFailureReason | undefined;
+    private readonly processRequest: Omit<
+        BatchGraphPlanProcessRequest,
+        'plan' | 'collisionFallbackReasons'
+    >;
+    private readonly interactiveLookup: boolean;
+
+    constructor(
+        engine: ResolvedTsGoEngine,
+        shadows: ShadowManager,
+        project: {
+            projectPath: string;
+            sourceRoot: string;
+            tsconfigPath: string | undefined;
+            configPath?: string;
+        }
+    ) {
+        const projectIdentity = batchGraphProjectIdentity(project);
+        const engineIdentity = batchGraphEngineIdentity(engine);
+        const projectKey = projectIdentity.slice(0, 16);
+        const engineKey = materialisationPlanEngineCacheKey(engineIdentity);
+        const cacheFile = `${BATCH_GRAPH_PLAN_FILE_PREFIX}-${projectKey}-${engineKey}.json`;
+        this.cachePath = resolve(shadows.overlayPath, cacheFile);
+        this.legacyCachePath = resolve(
+            shadows.overlayPath,
+            project.configPath
+                ? `${BATCH_GRAPH_PLAN_FILE_PREFIX}-${projectKey}.json`
+                : `${BATCH_GRAPH_PLAN_FILE_PREFIX}.json`
+        );
+        this.cacheIdentity = {
+            engine: engineIdentity,
+            algorithm: BATCH_GRAPH_ALGORITHM_VERSION,
+            project: projectIdentity
+        };
+        this.cacheProjectIdentity = projectIdentity;
+        this.cacheProjectKey = projectKey;
+        this.cache = new MaterialisationPlanCache<BatchGraphPlan>(
+            this.cachePath,
+            this.cacheIdentity,
+            { maxCacheBytes: MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES }
+        );
+        this.processRequest = {
+            engine: { ...engine, argsPrefix: [...engine.argsPrefix] },
+            overlayPath: shadows.overlayPath,
+            project: { ...project }
+        };
+        this.interactiveLookup = project.configPath === undefined;
+    }
+
+    lookupAndRestore(shadows: ShadowManager): BatchGraphPlanCacheLookup {
+        if (this.lookup) {
+            return this.lookup;
+        }
+        let started = performance.now();
+        migrateLegacyBatchGraphPlanCache({
+            legacyPath: this.legacyCachePath,
+            cachePath: this.cachePath,
+            identity: this.cacheIdentity
+        });
+        const directoryBudget = createBatchGraphDirectoryMembershipBudget({
+            maxEntries: 500_000,
+            maxDurationMs: this.interactiveLookup
+                ? EDITOR_GRAPH_PLAN_DIRECTORY_MAX_DURATION_MS
+                : 3_000
+        });
+        const lookup = this.cache.lookup({
+            sourceSignature: (filePath) =>
+                computeBatchGraphSourceSignature(fs.readFileSync(filePath, 'utf8')),
+            directoryMembership: (request) =>
+                batchGraphDirectoryMembership({ ...request, budget: directoryBudget }),
+            ...(this.interactiveLookup
+                ? {
+                      validationBudget: {
+                          maxDurationMs: EDITOR_GRAPH_PLAN_LOOKUP_MAX_DURATION_MS,
+                          maxContentFallbacks: EDITOR_GRAPH_PLAN_LOOKUP_MAX_CONTENT_FALLBACKS
+                      }
+                  }
+                : {})
+        });
+        const lookupMs = performance.now() - started;
+        started = performance.now();
+        if (lookup.hit) {
+            if (shadows.restoreBatchGraphPlan(lookup.payload)) {
+                return (this.lookup = {
+                    hit: true,
+                    plan: lookup.payload,
+                    lookupMs,
+                    restoreMs: performance.now() - started
+                });
+            }
+            invalidateTsGoWorkspaceIndex();
+            return (this.lookup = {
+                hit: false,
+                missReason: 'restore-rejected',
+                lookupMs,
+                restoreMs: performance.now() - started
+            });
+        }
+        if (batchGraphMissInvalidatesWorkspaceIndex(lookup.reason)) {
+            invalidateTsGoWorkspaceIndex();
+        }
+        return (this.lookup = {
+            hit: false,
+            missReason: lookup.reason,
+            ...(lookup.detail ? { missDetail: lookup.detail } : {}),
+            lookupMs,
+            restoreMs: performance.now() - started
+        });
+    }
+
+    prepare(
+        plan: BatchGraphPlan,
+        collisionFallbackReasons: readonly string[],
+        revalidateDiscovery = true
+    ): BatchGraphPlanPublication {
+        const safeDirectoryRoots = safeBatchGraphDirectoryRoots(plan);
+        const discoveryComplete = batchGraphDiscoveryEvidenceIsComplete(plan);
+        const discoveryStatus: BatchGraphDiscoveryEvidenceStatus = !discoveryComplete
+            ? 'incomplete'
+            : revalidateDiscovery
+              ? batchGraphDiscoveryEvidenceStatus(plan)
+              : 'current';
+        const discoveryCurrent = discoveryStatus === 'current';
+        const projectProofComplete = projectScopeHasCompleteCacheProof(plan, safeDirectoryRoots);
+        const dependencyProofComplete = dependencyScopeHasCompleteCacheProof(
+            plan,
+            safeDirectoryRoots
+        );
+        this.eligible =
+            discoveryCurrent &&
+            plan.project.tsconfigPath !== null &&
+            plan.configInputs.includes(plan.project.tsconfigPath) &&
+            projectProofComplete &&
+            dependencyProofComplete &&
+            collisionFallbackReasons.length === 0 &&
+            plan.baseConfigDiagnostics.length === 0 &&
+            safeDirectoryRoots !== undefined &&
+            safeDirectoryRoots.length > 0;
+        const counters = this.cache.counters;
+        const refreshInputStats =
+            counters.sourceSignatureFallbacks > 0 || counters.exactContentFallbacks > 0;
+        const shouldPublish =
+            !this.lookup?.hit ||
+            refreshInputStats ||
+            (!!this.lookup.plan && this.lookup.plan.signature !== plan.signature);
+        let directories: BatchGraphPlanPublication['directories'];
+        if (this.eligible && safeDirectoryRoots && shouldPublish) {
+            const proofs = new Map(plan.directoryProofs.map((proof) => [proof.path, proof]));
+            directories = safeDirectoryRoots.map((path) => {
+                const proof = proofs.get(path);
+                return {
+                    path,
+                    validator: BATCH_GRAPH_DIRECTORY_VALIDATOR,
+                    allowMissing: false,
+                    discoveryProof: proof
+                        ? { stamp: proof.stamp, entryCount: proof.entryCount }
+                        : null
+                };
+            });
+            if (directories.some((input) => input.discoveryProof === null)) {
+                directories = undefined;
+                this.eligible = false;
+            }
+        }
+        return {
+            plan,
+            safeDirectoryRoots,
+            directories,
+            refreshInputStats,
+            shouldPublish,
+            discoveryCurrent,
+            discoveryStatus
+        };
+    }
+
+    /** Revalidate a restored hit using the cache's stored stat identities before commit. */
+    revalidateHitAtCommit(
+        plan: BatchGraphPlan,
+        collisionFallbackReasons: readonly string[]
+    ): BatchGraphPlanPublication {
+        let publication = this.prepare(plan, collisionFallbackReasons, false);
+        if (!this.lookup?.hit || !publication.discoveryCurrent) {
+            return publication;
+        }
+        const directoryBudget = createBatchGraphDirectoryMembershipBudget({
+            maxEntries: 500_000,
+            maxDurationMs: 3_000
+        });
+        const validation = this.cache.revalidate({
+            sourceSignature: (filePath) =>
+                computeBatchGraphSourceSignature(fs.readFileSync(filePath, 'utf8')),
+            directoryMembership: (request) =>
+                batchGraphDirectoryMembership({ ...request, budget: directoryBudget })
+        });
+        // revalidate() can take a source/exact-content fallback and change the cache counters.
+        // Re-prepare so refreshInputStats, shouldPublish and the guarded directory snapshots all
+        // describe the post-validation decision rather than the earlier optimistic fast path.
+        publication = this.prepare(plan, collisionFallbackReasons, false);
+        const discoveryStatus: BatchGraphDiscoveryEvidenceStatus = validation.hit
+            ? 'current'
+            : validation.reason === 'directory-validator-unavailable' ||
+                validation.reason === 'directory-membership-error' ||
+                validation.reason === 'source-signature-unavailable' ||
+                validation.reason === 'source-signature-error' ||
+                validation.reason === 'exact-content-error' ||
+                validation.reason === 'read-error'
+              ? 'unverifiable'
+              : 'stale';
+        if (discoveryStatus !== 'current') {
+            this.eligible = false;
+        }
+        return {
+            ...publication,
+            discoveryCurrent: discoveryStatus === 'current',
+            discoveryStatus
+        };
+    }
+
+    publish(publication: BatchGraphPlanPublication): void {
+        const { plan, safeDirectoryRoots, directories, shouldPublish } = publication;
+        if (!this.eligible || !safeDirectoryRoots) {
+            this.writeStatus = 'skipped';
+        } else if (!shouldPublish) {
+            this.writeStatus = 'unchanged';
+        } else if (!directories) {
+            this.writeStatus = 'skipped';
+        } else {
+            const directoryBudget = createBatchGraphDirectoryMembershipBudget({
+                maxEntries: 500_000,
+                maxDurationMs: 3_000
+            });
+            const fileInputs = batchGraphPlanFileInputs(plan, safeDirectoryRoots);
+            const write = this.cache.write({
+                complete: true,
+                payload: plan,
+                files: fileInputs.files,
+                validationOnlyFiles: fileInputs.validationOnlyFiles,
+                directories,
+                sourceSignature: (filePath) =>
+                    computeBatchGraphSourceSignature(fs.readFileSync(filePath, 'utf8')),
+                directoryMembership: (request) =>
+                    batchGraphDirectoryMembership({ ...request, budget: directoryBudget })
+            });
+            if (write.ok) {
+                this.writeStatus = write.written ? 'written' : 'unchanged';
+                pruneBatchGraphPlanEngineCaches({
+                    cachePath: this.cachePath,
+                    projectIdentity: this.cacheProjectIdentity,
+                    projectKey: this.cacheProjectKey
+                });
+            } else {
+                this.writeStatus = 'failed';
+                this.writeFailureReason = write.reason;
+            }
+        }
+    }
+
+    /**
+     * Validate and persist a cold editor graph away from the language-server event loop. A large
+     * workspace can carry tens of thousands of exact/source inputs; synchronously re-reading them
+     * after discovery made the first completion wait for cache maintenance which benefits only a
+     * later process.
+     */
+    publishOffProcess(plan: BatchGraphPlan, collisionFallbackReasons: readonly string[]): void {
+        enqueueBatchGraphPlanPublication({
+            ...this.processRequest,
+            plan,
+            collisionFallbackReasons: [...collisionFallbackReasons]
+        });
+    }
+
+    telemetry(): BatchMaterialisationPlanTelemetry {
+        return {
+            hit: this.lookup?.hit ?? false,
+            ...(this.lookup?.missReason ? { missReason: this.lookup.missReason } : {}),
+            ...(this.lookup?.missDetail ? { missDetail: this.lookup.missDetail } : {}),
+            eligible: this.eligible,
+            writeStatus: this.writeStatus,
+            ...(this.writeFailureReason ? { writeFailureReason: this.writeFailureReason } : {}),
+            counters: this.cache.counters
+        };
+    }
+}
+
+interface BatchGraphPlanCacheRetentionRequest {
+    cachePath: string;
+    projectIdentity: string;
+    projectKey: string;
+}
+
+interface LegacyBatchGraphPlanMigrationRequest {
+    legacyPath: string;
+    cachePath: string;
+    identity: MaterialisationPlanIdentity;
+}
+
+interface ValidBatchGraphPlanCacheFile {
+    path: string;
+    mtimeMs: number;
+    dev: number;
+    ino: number;
+}
+
+interface PotentialBatchGraphPlanCacheFile extends ValidBatchGraphPlanCacheFile {
+    engineKey?: string;
+}
+
+/**
+ * Upgrade a checksum-valid single-file cache without publishing stale bytes over a concurrent
+ * keyed writer. A hard-link from a fully-written private temp file gives us atomic
+ * create-if-absent semantics; the ordinary keyed lookup still performs complete freshness checks.
+ */
+function migrateLegacyBatchGraphPlanCache(request: LegacyBatchGraphPlanMigrationRequest): void {
+    const legacy = readValidMaterialisationPlanFile(
+        request.legacyPath,
+        MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES
+    );
+    if (!legacy || !sameBatchGraphPlanIdentity(legacy.identity, request.identity)) {
+        return;
+    }
+
+    const removeLegacyIfTargetMatches = (): boolean => {
+        const targetIdentity = readValidMaterialisationPlanIdentity(
+            request.cachePath,
+            MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES
+        );
+        if (!targetIdentity || !sameBatchGraphPlanIdentity(targetIdentity, request.identity)) {
+            return false;
+        }
+        unlinkUnchangedRegularCacheFile({
+            path: request.legacyPath,
+            mtimeMs: 0,
+            dev: legacy.dev,
+            ino: legacy.ino
+        });
+        fsyncBatchGraphCacheDirectoryBestEffort(dirname(request.cachePath));
+        return true;
+    };
+
+    if (fs.lstatSync(request.cachePath, { throwIfNoEntry: false })) {
+        removeLegacyIfTargetMatches();
+        return;
+    }
+
+    const tempPath = `${request.cachePath}.migrate-${process.pid}-${randomBytes(6).toString('hex')}`;
+    let descriptor: number | undefined;
+    try {
+        fs.mkdirSync(dirname(request.cachePath), { recursive: true });
+        descriptor = fs.openSync(tempPath, 'wx', 0o600);
+        fs.writeFileSync(descriptor, legacy.contents, 'utf8');
+        fs.fsyncSync(descriptor);
+        fs.closeSync(descriptor);
+        descriptor = undefined;
+
+        let published = false;
+        try {
+            fs.linkSync(tempPath, request.cachePath);
+            fsyncBatchGraphCacheDirectoryBestEffort(dirname(request.cachePath));
+            published = true;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+                throw error;
+            }
+        }
+        if (published) {
+            unlinkUnchangedRegularCacheFile({
+                path: request.legacyPath,
+                mtimeMs: 0,
+                dev: legacy.dev,
+                ino: legacy.ino
+            });
+        } else {
+            removeLegacyIfTargetMatches();
+        }
+    } catch (error) {
+        Logger.debug('[tsgo] could not migrate legacy materialisation-plan cache', error);
+    } finally {
+        if (descriptor !== undefined) {
+            try {
+                fs.closeSync(descriptor);
+            } catch {
+                // Best effort; migration remains fail-closed.
+            }
+        }
+        try {
+            fs.unlinkSync(tempPath);
+        } catch {
+            // The unique temp is never considered by lookup or retention.
+        }
+    }
+}
+
+function fsyncBatchGraphCacheDirectoryBestEffort(directory: string): void {
+    let descriptor: number | undefined;
+    try {
+        descriptor = fs.openSync(directory, 'r');
+        fs.fsyncSync(descriptor);
+    } catch {
+        // Some platforms do not support directory fsync; atomic create-if-absent still holds.
+    } finally {
+        if (descriptor !== undefined) {
+            try {
+                fs.closeSync(descriptor);
+            } catch {
+                // Best effort durability only.
+            }
+        }
+    }
+}
+
+function sameBatchGraphPlanIdentity(
+    left: MaterialisationPlanIdentity,
+    right: MaterialisationPlanIdentity
+): boolean {
+    return (
+        left.algorithm === right.algorithm &&
+        left.project === right.project &&
+        left.engine.packageName === right.engine.packageName &&
+        left.engine.version === right.engine.version
+    );
+}
+
+/** Keep engine switching warm without allowing obsolete native builds to accumulate forever. */
+function pruneBatchGraphPlanEngineCaches(request: BatchGraphPlanCacheRetentionRequest): void {
+    const cacheDirectory = dirname(request.cachePath);
+    const keyedPrefix = `${BATCH_GRAPH_PLAN_FILE_PREFIX}-${request.projectKey}-`;
+    const legacyNames = new Set([
+        `${BATCH_GRAPH_PLAN_FILE_PREFIX}.json`,
+        `${BATCH_GRAPH_PLAN_FILE_PREFIX}-${request.projectKey}.json`
+    ]);
+    const keyedPotential: PotentialBatchGraphPlanCacheFile[] = [];
+    const legacyPotential: PotentialBatchGraphPlanCacheFile[] = [];
+
+    try {
+        for (const entry of fs.readdirSync(cacheDirectory, { withFileTypes: true })) {
+            let engineKey: string | undefined;
+            if (entry.name.startsWith(keyedPrefix) && entry.name.endsWith('.json')) {
+                engineKey = entry.name.slice(keyedPrefix.length, -'.json'.length);
+                if (!/^[0-9a-f]{64}$/.test(engineKey)) {
+                    continue;
+                }
+            } else if (!legacyNames.has(entry.name)) {
+                continue;
+            }
+            // Dirent and lstat checks deliberately reject symlinks. Cache retention must never
+            // follow a matching-looking entry outside the overlay.
+            if (!entry.isFile()) {
+                continue;
+            }
+            const candidatePath = resolve(cacheDirectory, entry.name);
+            const candidateRelative = relative(cacheDirectory, candidatePath);
+            if (
+                !candidateRelative ||
+                candidateRelative.startsWith('..') ||
+                isAbsolute(candidateRelative) ||
+                dirname(candidatePath) !== resolve(cacheDirectory)
+            ) {
+                continue;
+            }
+            const stat = fs.lstatSync(candidatePath, { throwIfNoEntry: false });
+            if (!stat?.isFile() || stat.isSymbolicLink()) {
+                continue;
+            }
+            const potential = {
+                path: candidatePath,
+                mtimeMs: stat.mtimeMs,
+                dev: stat.dev,
+                ino: stat.ino,
+                ...(engineKey === undefined ? {} : { engineKey })
+            };
+            (engineKey === undefined ? legacyPotential : keyedPotential).push(potential);
+        }
+
+        // The filename and regular-file checks are sufficient to prove the upper bound when no
+        // cleanup is needed. Avoid rereading and reparsing a potentially large freshly-written
+        // graph on the overwhelmingly common first- and second-engine publications.
+        if (
+            keyedPotential.length <= MAX_VALID_BATCH_GRAPH_ENGINE_CACHE_ENTRIES &&
+            legacyPotential.length === 0
+        ) {
+            return;
+        }
+
+        const keyed: ValidBatchGraphPlanCacheFile[] = [];
+        const legacy: ValidBatchGraphPlanCacheFile[] = [];
+        for (const potential of [...keyedPotential, ...legacyPotential]) {
+            const identity = readValidMaterialisationPlanIdentity(
+                potential.path,
+                MAX_RETAINED_BATCH_GRAPH_PLAN_REQUEST_BYTES
+            );
+            if (
+                !identity ||
+                identity.algorithm !== BATCH_GRAPH_ALGORITHM_VERSION ||
+                identity.project !== request.projectIdentity ||
+                (potential.engineKey !== undefined &&
+                    materialisationPlanEngineCacheKey(identity.engine) !== potential.engineKey)
+            ) {
+                continue;
+            }
+            (potential.engineKey === undefined ? legacy : keyed).push(potential);
+        }
+
+        const currentPath = resolve(request.cachePath);
+        keyed.sort(
+            (left, right) =>
+                Number(right.path === currentPath) - Number(left.path === currentPath) ||
+                right.mtimeMs - left.mtimeMs ||
+                left.path.localeCompare(right.path)
+        );
+        const currentIsValid = keyed.some((candidate) => candidate.path === currentPath);
+        for (const candidate of keyed.slice(MAX_VALID_BATCH_GRAPH_ENGINE_CACHE_ENTRIES)) {
+            unlinkUnchangedRegularCacheFile(candidate);
+        }
+        // A legacy single-file cache is redundant only once the just-written keyed replacement
+        // has itself passed full envelope and identity validation.
+        if (currentIsValid) {
+            for (const candidate of legacy) {
+                unlinkUnchangedRegularCacheFile(candidate);
+            }
+        }
+    } catch (error) {
+        Logger.debug('[tsgo] could not prune materialisation-plan engine caches', error);
+    }
+}
+
+function unlinkUnchangedRegularCacheFile(candidate: ValidBatchGraphPlanCacheFile): void {
+    try {
+        const current = fs.lstatSync(candidate.path, { throwIfNoEntry: false });
+        if (
+            current?.isFile() &&
+            !current.isSymbolicLink() &&
+            current.dev === candidate.dev &&
+            current.ino === candidate.ino
+        ) {
+            fs.unlinkSync(candidate.path);
+        }
+    } catch {
+        // Retention is best-effort. A later successful publication gets another safe attempt.
+    }
+}
+
+/** Child-process entry point; exported so it can reuse the production cache boundary. */
+export function publishBatchGraphPlanInProcess(
+    request: BatchGraphPlanProcessRequest
+): BatchMaterialisationPlanTelemetry {
+    const cache = new BatchGraphPlanCache(
+        request.engine,
+        { overlayPath: request.overlayPath } as ShadowManager,
+        request.project
+    );
+    // MaterialisationPlanCache.write revalidates every source, exact file and directory proof.
+    // Avoid doing the same complete filesystem pass twice inside the child process.
+    const publication = cache.prepare(request.plan, request.collisionFallbackReasons, false);
+    cache.publish(publication);
+    return cache.telemetry();
+}
+
+function batchGraphMissInvalidatesWorkspaceIndex(reason: MaterialisationPlanMissReason): boolean {
+    return (
+        reason === 'input-missing' ||
+        reason === 'input-presence-changed' ||
+        reason === 'input-kind-changed' ||
+        reason === 'source-signature-mismatch' ||
+        reason === 'exact-content-mismatch' ||
+        reason === 'validation-budget-exceeded' ||
+        reason === 'directory-membership-mismatch'
+    );
 }
 
 function kitFilesSettingsFromConfig(
@@ -297,10 +1364,8 @@ export class TsGoBatchOverlay {
     private readonly shadows: ShadowManager;
     private readonly shimFiles: string[];
     private readonly transformDiagnostics = new Map<string, Diagnostic>();
-    private planEligible = false;
-    private planWriteStatus: BatchMaterialisationPlanTelemetry['writeStatus'] = 'pending';
-    private planWriteFailureReason: MaterialisationPlanWriteFailureReason | undefined;
     private materialised = false;
+    private ignoreRestoredMaterialisationPlan = false;
 
     private constructor(
         readonly engine: ResolvedTsGoEngine,
@@ -309,34 +1374,15 @@ export class TsGoBatchOverlay {
         shadows: ShadowManager,
         shimFiles: string[],
         readonly creationTimings: BatchOverlayCreationTimings,
-        private readonly materialisationPlanCache: MaterialisationPlanCache<BatchGraphPlan>,
-        private readonly materialisationPlanHit: boolean,
-        private readonly materialisationPlanMissReason:
-            | MaterialisationPlanMissReason
-            | 'restore-rejected'
-            | undefined,
-        private readonly materialisationPlanMissDetail: string | undefined
+        private readonly materialisationPlanCache: BatchGraphPlanCache,
+        private readonly materialisationPlanLookup: BatchGraphPlanCacheLookup
     ) {
         this.shadows = shadows;
         this.shimFiles = shimFiles;
     }
 
     private materialisationPlanTelemetry(): BatchMaterialisationPlanTelemetry {
-        return {
-            hit: this.materialisationPlanHit,
-            ...(this.materialisationPlanMissReason
-                ? { missReason: this.materialisationPlanMissReason }
-                : {}),
-            ...(this.materialisationPlanMissDetail
-                ? { missDetail: this.materialisationPlanMissDetail }
-                : {}),
-            eligible: this.planEligible,
-            writeStatus: this.planWriteStatus,
-            ...(this.planWriteFailureReason
-                ? { writeFailureReason: this.planWriteFailureReason }
-                : {}),
-            counters: this.materialisationPlanCache.counters
-        };
+        return this.materialisationPlanCache.telemetry();
     }
 
     /** Compatibility for callers which only need to display the resolved executable path. */
@@ -558,49 +1604,15 @@ export class TsGoBatchOverlay {
             kitFiles
         });
         creationTimings.constructManagerMs = now() - phaseStarted;
-        const materialisationPlanCache = new MaterialisationPlanCache<BatchGraphPlan>(
-            join(shadows.overlayPath, BATCH_GRAPH_PLAN_FILE),
-            {
-                engine: {
-                    packageName: engine.packageName,
-                    version: engine.version,
-                    command: engine.command,
-                    argsPrefix: engine.argsPrefix,
-                    apiEntry: engine.apiEntry ?? null
-                },
-                algorithm: BATCH_GRAPH_ALGORITHM_VERSION,
-                project: batchGraphProjectIdentity({
-                    projectPath,
-                    sourceRoot,
-                    tsconfigPath,
-                    configPath: options.configPath
-                })
-            }
-        );
-        phaseStarted = now();
-        const planLookup = materialisationPlanCache.lookup({
-            sourceSignature: (filePath) =>
-                computeBatchGraphSourceSignature(fs.readFileSync(filePath, 'utf8')),
-            directoryMembership: batchGraphDirectoryMembership
+        const materialisationPlanCache = new BatchGraphPlanCache(engine, shadows, {
+            projectPath,
+            sourceRoot,
+            tsconfigPath,
+            configPath: options.configPath
         });
-        creationTimings.lookupPlanMs = now() - phaseStarted;
-        let materialisationPlanHit = false;
-        let materialisationPlanMissReason:
-            | MaterialisationPlanMissReason
-            | 'restore-rejected'
-            | undefined;
-        let materialisationPlanMissDetail: string | undefined;
-        phaseStarted = now();
-        if (planLookup.hit) {
-            materialisationPlanHit = shadows.restoreBatchGraphPlan(planLookup.payload);
-            if (!materialisationPlanHit) {
-                materialisationPlanMissReason = 'restore-rejected';
-            }
-        } else {
-            materialisationPlanMissReason = planLookup.reason;
-            materialisationPlanMissDetail = planLookup.detail;
-        }
-        creationTimings.restorePlanMs = now() - phaseStarted;
+        const materialisationPlanLookup = materialisationPlanCache.lookupAndRestore(shadows);
+        creationTimings.lookupPlanMs = materialisationPlanLookup.lookupMs;
+        creationTimings.restorePlanMs = materialisationPlanLookup.restoreMs;
         // Load only configs which own a component in the proven project/dependency graph. The
         // previous source-root crawl imported every Svelte/Vite config in a monorepo before the
         // graph was known (including unrelated applications); on an ambiguous graph,
@@ -635,9 +1647,7 @@ export class TsGoBatchOverlay {
             shimFiles,
             creationTimings,
             materialisationPlanCache,
-            materialisationPlanHit,
-            materialisationPlanMissReason,
-            materialisationPlanMissDetail
+            materialisationPlanLookup
         );
     }
 
@@ -652,6 +1662,12 @@ export class TsGoBatchOverlay {
      * a file, and the input is byte-identical, so the mapping is the same one that was written.
      */
     async materialise(): Promise<BatchMaterialiseResult> {
+        return this.materialiseAttempt(true);
+    }
+
+    private async materialiseAttempt(
+        retryIfCachedGraphChanges: boolean
+    ): Promise<BatchMaterialiseResult> {
         const now = () => performance.now();
         const started = now();
         const phases: BatchMaterialisePhaseTimings = {
@@ -677,61 +1693,56 @@ export class TsGoBatchOverlay {
             writePlanMs: 0
         };
         let phaseStarted = now();
-        const configuredProjectFiles = this.shadows.getProjectSvelteFileNames();
-        const discoveredProjectFiles = this.shadows.findProjectSvelteFiles();
-        phases.projectGraphMs = now() - phaseStarted;
-        phaseStarted = now();
-        const dependencyFiles = this.shadows.findDependencySvelteFiles();
-        phases.dependencyIndexMs = now() - phaseStarted;
-        phaseStarted = now();
-        this.shadows.prepareBatchModuleMirrors();
-        phases.prepareMirrorsMs = now() - phaseStarted;
+        let configuredProjectFiles: string[] = [];
+        let discoveredProjectFiles: string[] = [];
+        let dependencyFiles: string[] = [];
+        const discover = () => {
+            phaseStarted = now();
+            configuredProjectFiles = this.shadows.getProjectSvelteFileNames();
+            discoveredProjectFiles = this.shadows.findProjectSvelteFiles();
+            phases.projectGraphMs += now() - phaseStarted;
+            phaseStarted = now();
+            dependencyFiles = this.shadows.findDependencySvelteFiles();
+            phases.dependencyIndexMs += now() - phaseStarted;
+            phaseStarted = now();
+            this.shadows.prepareBatchModuleMirrors();
+            phases.prepareMirrorsMs += now() - phaseStarted;
+        };
+        discover();
+        // Freeze the payload and directory membership proof before the first asynchronous
+        // transform. Publication later recomputes every source signature and directory proof;
+        // an edit racing materialisation therefore rejects this plan instead of pairing the old
+        // graph with new input identities.
+        let discoveredPlan =
+            (!this.ignoreRestoredMaterialisationPlan && this.materialisationPlanLookup.plan) ||
+            this.shadows.exportBatchGraphPlan();
+        let planPublication = this.materialisationPlanCache.prepare(
+            discoveredPlan,
+            this.shadows.getBatchMirrorStats().fallbackReasons,
+            !this.materialisationPlanLookup.hit
+        );
+        if (
+            planPublication.discoveryStatus === 'stale' ||
+            (this.materialisationPlanLookup.hit && !planPublication.discoveryCurrent)
+        ) {
+            // A structural edit raced the validated restore. Rebuild once from uncached inputs so
+            // this run cannot serve the old graph; final guarded publication catches another race.
+            invalidateTsGoWorkspaceIndex();
+            this.ignoreRestoredMaterialisationPlan = true;
+            this.shadows.invalidateStructuralCaches();
+            discover();
+            discoveredPlan = this.shadows.exportBatchGraphPlan();
+            planPublication = this.materialisationPlanCache.prepare(
+                discoveredPlan,
+                this.shadows.getBatchMirrorStats().fallbackReasons
+            );
+        }
         const graph = {
             reachabilityFallbackReasons: [...this.shadows.reachabilityFallbackReasons],
             dependencyScope: this.shadows.getDependencyScopeStats(),
             collisionMirrors: this.shadows.getBatchMirrorStats(),
             materialisationPlan: this.materialisationPlanTelemetry()
         };
-        phaseStarted = now();
-        this.shadows.writeOverlayTsconfig(this.shimFiles);
-        phases.writeOverlayConfigMs = now() - phaseStarted;
-        // Freeze the payload and directory membership proof before the first asynchronous
-        // transform. Publication later recomputes every source signature and directory proof;
-        // an edit racing materialisation therefore rejects this plan instead of pairing the old
-        // graph with new input identities.
-        const discoveredPlan = this.shadows.exportBatchGraphPlan();
-        const safeDirectoryRoots = safeBatchGraphDirectoryRoots(discoveredPlan);
-        this.planEligible =
-            discoveredPlan.project.tsconfigPath !== null &&
-            discoveredPlan.configInputs.includes(discoveredPlan.project.tsconfigPath) &&
-            discoveredPlan.projectReachabilityFallbackReasons.length === 0 &&
-            discoveredPlan.dependencyScope?.mode === 'reachable' &&
-            discoveredPlan.dependencyScope.fallbackReasons.length === 0 &&
-            graph.collisionMirrors.fallbackReasons.length === 0 &&
-            discoveredPlan.baseConfigDiagnostics.length === 0 &&
-            safeDirectoryRoots !== undefined &&
-            safeDirectoryRoots.length > 0;
-        let discoveredDirectories:
-            | ReturnType<MaterialisationPlanCache<BatchGraphPlan>['snapshotDirectory']>[]
-            | undefined;
-        if (this.planEligible && safeDirectoryRoots) {
-            try {
-                discoveredDirectories = safeDirectoryRoots.map((path) =>
-                    this.materialisationPlanCache.snapshotDirectory(
-                        {
-                            path,
-                            validator: BATCH_GRAPH_DIRECTORY_VALIDATOR,
-                            allowMissing: true
-                        },
-                        batchGraphDirectoryMembership
-                    )
-                );
-            } catch {
-                // A directory disappearing during discovery makes the graph uncacheable. The
-                // current run still materialises from its in-memory graph and a later run retries.
-                this.planEligible = false;
-            }
-        }
 
         // parseBaseConfig is authoritative. The broad workspace scan is still needed for
         // components reached through package boundaries, but it must never be allowed to drop an
@@ -754,6 +1765,14 @@ export class TsGoBatchOverlay {
         );
         phases.collectRootsMs = now() - phaseStarted;
 
+        // The generated extension is a semantic parse boundary: JS output must be `.jsx` so
+        // native TypeScript consumes its JSDoc, while TS output remains `.tsx`. Resolve every
+        // file's effective Svelte config before the final root list is exposed to the child.
+        phaseStarted = now();
+        await this.shadows.refreshShadowKinds(files);
+        this.shadows.writeOverlayTsconfig(this.shimFiles);
+        phases.writeOverlayConfigMs += now() - phaseStarted;
+
         const written = new Set<string>();
         phaseStarted = now();
         const previousState = this.readBatchState();
@@ -766,9 +1785,10 @@ export class TsGoBatchOverlay {
         let svelteTransformedCount = 0;
         let svelteReusedCount = 0;
         let svelteWrittenCount = 0;
+        let overlayConfigNeedsRewrite = false;
         for (const filePath of files) {
             phaseStarted = now();
-            const shadowPath = normalizePath(this.shadows.getShadowPath(filePath));
+            let shadowPath = normalizePath(this.shadows.getShadowPath(filePath));
             const previous = previousState.entries[filePath];
             let currentStat: StoredSourceStat | undefined;
             try {
@@ -829,6 +1849,11 @@ export class TsGoBatchOverlay {
                 const document = new Document(pathToUrl(filePath), source.text);
                 await document.configPromise;
                 const snapshot = this.shadows.transform(document);
+                const transformedShadowPath = normalizePath(this.shadows.getShadowPath(filePath));
+                if (transformedShadowPath !== shadowPath) {
+                    shadowPath = transformedShadowPath;
+                    overlayConfigNeedsRewrite = true;
+                }
                 const generatedText = this.shadows.rewriteBatchModuleSpecifiers(
                     snapshot.getFullText(),
                     filePath
@@ -883,6 +1908,12 @@ export class TsGoBatchOverlay {
                     )
                 );
             }
+        }
+
+        if (overlayConfigNeedsRewrite) {
+            phaseStarted = now();
+            this.shadows.writeOverlayTsconfig(this.shimFiles);
+            phases.writeOverlayConfigMs += now() - phaseStarted;
         }
 
         // When a component has an adjacent rune module, ordinary source roots and barrels must
@@ -1000,6 +2031,37 @@ export class TsGoBatchOverlay {
             );
         }
 
+        if (batchGraphDiscoveryEvidenceIsComplete(discoveredPlan)) {
+            // Validate the exact discovery evidence again before committing ownership/state: a
+            // source, manifest, config or nested directory can change while transforms yield.
+            // Restored hits reuse their stored stat identities; fresh/retry attempts revalidate
+            // the complete discovery proof. Cache publication alone cannot repair diagnostics
+            // already computed from a stale graph.
+            const commitPublication =
+                this.materialisationPlanLookup.hit && !this.ignoreRestoredMaterialisationPlan
+                    ? this.materialisationPlanCache.revalidateHitAtCommit(
+                          discoveredPlan,
+                          this.shadows.getBatchMirrorStats().fallbackReasons
+                      )
+                    : this.materialisationPlanCache.prepare(
+                          discoveredPlan,
+                          this.shadows.getBatchMirrorStats().fallbackReasons
+                      );
+            if (!commitPublication.discoveryCurrent) {
+                invalidateTsGoWorkspaceIndex();
+                this.ignoreRestoredMaterialisationPlan = true;
+                this.shadows.invalidateStructuralCaches();
+                this.transformDiagnostics.clear();
+                if (!retryIfCachedGraphChanges) {
+                    throw new Error(
+                        'project graph changed repeatedly during materialisation; retry the check'
+                    );
+                }
+                return this.materialiseAttempt(false);
+            }
+            planPublication = commitPublication;
+        }
+
         // Stale shadows are still roots of the project, so a component that was deleted since
         // the last run would keep reporting errors from a file that no longer exists. Kit
         // shadows were written during `writeOverlayTsconfig` and are live too.
@@ -1049,32 +2111,7 @@ export class TsGoBatchOverlay {
         this.shadows.commitFingerprints();
         phases.commitFingerprintsMs = now() - phaseStarted;
         phaseStarted = now();
-        if (!this.planEligible || !safeDirectoryRoots || !discoveredDirectories) {
-            this.planWriteStatus = 'skipped';
-        } else {
-            const counters = this.materialisationPlanCache.counters;
-            const refreshInputStats =
-                counters.sourceSignatureFallbacks > 0 || counters.exactContentFallbacks > 0;
-            if (this.materialisationPlanHit && !refreshInputStats) {
-                this.planWriteStatus = 'unchanged';
-            } else {
-                const write = this.materialisationPlanCache.write({
-                    complete: true,
-                    payload: discoveredPlan,
-                    files: batchGraphPlanFileInputs(discoveredPlan, safeDirectoryRoots),
-                    directories: discoveredDirectories,
-                    sourceSignature: (filePath) =>
-                        computeBatchGraphSourceSignature(fs.readFileSync(filePath, 'utf8')),
-                    directoryMembership: batchGraphDirectoryMembership
-                });
-                if (write.ok) {
-                    this.planWriteStatus = write.written ? 'written' : 'unchanged';
-                } else {
-                    this.planWriteStatus = 'failed';
-                    this.planWriteFailureReason = write.reason;
-                }
-            }
-        }
+        this.materialisationPlanCache.publish(planPublication);
         phases.writePlanMs = now() - phaseStarted;
         graph.materialisationPlan = this.materialisationPlanTelemetry();
         phaseStarted = now();
@@ -1166,6 +2203,49 @@ export class TsGoBatchOverlay {
             svelte.push(original);
         }
         return { all, svelte };
+    }
+
+    /**
+     * Return generated-config roots which are absent from a native `--listFiles` result.
+     *
+     * A non-empty list is not by itself proof that the compiler completed program construction:
+     * a killed, truncated or otherwise broken adapter can print a prefix of the program and still
+     * exit successfully. The generated config's explicit `files` array is the authoritative root
+     * set. Compare through the same generated→source mappings used for diagnostics so Svelte,
+     * Kit and collision-mirror roots have one stable identity on both sides.
+     */
+    missingProgramRootFiles(programFiles: string[]): string[] {
+        if (!this.materialised) {
+            throw new Error('materialise() must run before program membership can be validated');
+        }
+
+        let config: unknown;
+        try {
+            config = JSON.parse(fs.readFileSync(this.overlayTsconfigPath, 'utf8'));
+        } catch (error) {
+            throw new Error(
+                `could not read the materialised overlay config: ${
+                    error instanceof Error ? error.message : String(error)
+                }`
+            );
+        }
+        const files = (config as { files?: unknown }).files;
+        if (!Array.isArray(files) || files.some((file) => typeof file !== 'string')) {
+            throw new Error('materialised overlay config has no valid explicit root file list');
+        }
+
+        const identity = (filePath: string): string => {
+            const absolute = isAbsolute(filePath)
+                ? normalizePath(filePath)
+                : normalizePath(resolve(dirname(this.overlayTsconfigPath), filePath));
+            return normalizePath(
+                this.shadows.getOriginalPath(absolute) ??
+                    this.shadows.getBatchSourceOriginalPath(absolute) ??
+                    absolute
+            );
+        };
+        const listed = new Set(programFiles.map(identity));
+        return [...new Set((files as string[]).map(identity).filter((file) => !listed.has(file)))];
     }
 
     /**
@@ -1282,28 +2362,6 @@ export class TsGoBatchOverlay {
     }
 
     /**
-     * Whether native tsgo independently reported a configuration error already found while
-     * parsing the user's config. The parser copy carries the exact user-file span; the native
-     * copy is commonly attributed to the generated overlay and therefore only has 0:0.
-     */
-    matchesBaseConfigurationDiagnostic(diagnostic: GeneratedDiagnostic): boolean {
-        return this.baseConfigurationDiagnostics().some(
-            (base) =>
-                base.severity === diagnostic.severity &&
-                base.code === diagnostic.code &&
-                base.message === diagnostic.message
-        );
-    }
-
-    /** The matching base diagnostic is an error, not a warning/suggestion. */
-    matchesBaseConfigurationError(diagnostic: GeneratedDiagnostic): boolean {
-        return (
-            diagnostic.severity === DiagnosticSeverity.Error &&
-            this.matchesBaseConfigurationDiagnostic(diagnostic)
-        );
-    }
-
-    /**
      * Map diagnostics on a SvelteKit shadow back onto the route file the user wrote.
      *
      * Kit shadows are not built by svelte2tsx and carry no source map — the transform is a list
@@ -1326,7 +2384,6 @@ export class TsGoBatchOverlay {
 
         const sourceLineOffsets = getLineOffsets(sourceText);
         const generatedLineOffsets = getLineOffsets(generatedText);
-        const source = /\.(ts|tsx|mts|cts)$/.test(kitShadow.originalPath) ? 'ts' : 'js';
 
         return {
             filePath: kitShadow.originalPath,
@@ -1338,18 +2395,21 @@ export class TsGoBatchOverlay {
                         generatedText,
                         generatedLineOffsets
                     );
-                    const { pos: start } = internalHelpers.toOriginalPos(
+                    const start = boundedKitOriginalOffset(
                         generatedOffset,
-                        kitShadow.addedCode
+                        kitShadow.addedCode,
+                        sourceText.length
                     );
-                    const { pos: end } = internalHelpers.toOriginalPos(
+                    const mappedEnd = boundedKitOriginalOffset(
                         generatedDiagnosticEndOffset(
                             diagnostic,
                             generatedText,
                             generatedLineOffsets
                         ),
-                        kitShadow.addedCode
+                        kitShadow.addedCode,
+                        sourceText.length
                     );
+                    const end = Math.max(start, mappedEnd);
                     return {
                         range: Range.create(
                             positionAt(start, sourceText, sourceLineOffsets),
@@ -1358,9 +2418,9 @@ export class TsGoBatchOverlay {
                         severity: diagnostic.severity,
                         code: diagnostic.code,
                         message: diagnostic.message,
-                        source,
                         relatedInformation: await this.mapRelatedInformation(
-                            diagnostic.relatedInformation
+                            diagnostic.relatedInformation,
+                            diagnostic.code
                         )
                     };
                 })
@@ -1414,7 +2474,8 @@ export class TsGoBatchOverlay {
         for (const { tsDiagnostic, generatedDiagnostic } of tsDiagnostics) {
             const mapped = mapAndFilterDiagnostics([tsDiagnostic], document, snapshot);
             const relatedInformation = await this.mapRelatedInformation(
-                generatedDiagnostic.relatedInformation
+                generatedDiagnostic.relatedInformation,
+                generatedDiagnostic.code
             );
             diagnostics.push(
                 ...mapped.map((diagnostic) => ({
@@ -1456,7 +2517,8 @@ export class TsGoBatchOverlay {
             diagnostics: await Promise.all(
                 fileDiagnostics.map(async (diagnostic): Promise<Diagnostic> => {
                     const relatedInformation = await this.mapRelatedInformation(
-                        diagnostic.relatedInformation
+                        diagnostic.relatedInformation,
+                        diagnostic.code
                     );
                     return {
                         range: Range.create(
@@ -1537,21 +2599,27 @@ export class TsGoBatchOverlay {
 
     /** Map related native locations with the same source/shadow rules as primary diagnostics. */
     private async mapRelatedInformation(
-        related: GeneratedDiagnosticRelatedInformation[] | undefined
+        related: GeneratedDiagnosticRelatedInformation[] | undefined,
+        diagnosticCode?: number
     ): Promise<Diagnostic['relatedInformation'] | undefined> {
         if (!related?.length) {
             return undefined;
         }
         const mapped = await Promise.all(
-            related.map(async (item) => {
-                const location = await this.mapGeneratedRelatedLocation(item);
-                return location
-                    ? {
-                          location,
-                          message: this.shadows.restoreBatchModuleSpecifiers(item.message)
-                      }
-                    : undefined;
-            })
+            related
+                .filter(
+                    (item) =>
+                        diagnosticCode !== 2741 || !isNativeOnlySveltePropsRelatedInformation(item)
+                )
+                .map(async (item) => {
+                    const location = await this.mapGeneratedRelatedLocation(item);
+                    return location
+                        ? {
+                              location,
+                              message: this.shadows.restoreBatchModuleSpecifiers(item.message)
+                          }
+                        : undefined;
+                })
         );
         const retained = mapped.filter((item): item is NonNullable<typeof item> => !!item);
         return retained.length ? retained : undefined;
@@ -1583,14 +2651,17 @@ export class TsGoBatchOverlay {
                 const generated = generatedRange(generatedText);
                 const generatedLineOffsets = getLineOffsets(generatedText);
                 const sourceLineOffsets = getLineOffsets(sourceText);
-                const start = internalHelpers.toOriginalPos(
+                const start = boundedKitOriginalOffset(
                     offsetAt(generated.start, generatedText, generatedLineOffsets),
-                    kitShadow.addedCode
-                ).pos;
-                const end = internalHelpers.toOriginalPos(
+                    kitShadow.addedCode,
+                    sourceText.length
+                );
+                const mappedEnd = boundedKitOriginalOffset(
                     offsetAt(generated.end, generatedText, generatedLineOffsets),
-                    kitShadow.addedCode
-                ).pos;
+                    kitShadow.addedCode,
+                    sourceText.length
+                );
+                const end = Math.max(start, mappedEnd);
                 return {
                     uri: pathToUrl(kitShadow.originalPath),
                     range: Range.create(
@@ -1667,7 +2738,8 @@ export class TsGoBatchOverlay {
             diagnostics: await Promise.all(
                 fileDiagnostics.map(async (diagnostic): Promise<Diagnostic> => {
                     const relatedInformation = await this.mapRelatedInformation(
-                        diagnostic.relatedInformation
+                        diagnostic.relatedInformation,
+                        diagnostic.code
                     );
                     return {
                         range: Range.create(
@@ -1695,49 +2767,76 @@ export class TsGoBatchOverlay {
         return this.tsconfigPath;
     }
 
+    /** Whether TypeScript read this file as part of the user's root/extended config graph. */
+    isBaseConfigurationFile(filePath: string): boolean {
+        return this.shadows.isBaseConfigInput(filePath);
+    }
+
+    /**
+     * Whether the bundled config parser independently classified this native diagnostic as a
+     * config-parse diagnostic. Compare code/category rather than wording because TS6 and TS7 can
+     * phrase the same option error differently. This is only used for diagnostics without a file;
+     * native TS7 remains the authority over whether a diagnostic exists at all.
+     */
+    matchesBaseConfigurationDiagnostic(diagnostic: GeneratedDiagnostic): boolean {
+        return this.shadows
+            .getBaseConfigDiagnostics()
+            .some(
+                (base) =>
+                    base.code === diagnostic.code &&
+                    mapTsDiagnosticSeverity(base.category) === diagnostic.severity
+            );
+    }
+
     /**
      * The overlay replaces the user's root `files` with resolved roots plus native shims. That
      * intentionally lets empty/solution configs own editor documents, but it also makes tsgo
      * stop reporting TS18002/TS18003 from a genuinely empty user config. Preserve the config
-     * parser's original diagnostics and merge them with native output against the user file.
+     * parser's no-input diagnostics and merge them with native output against the user file.
+     * All other option/configuration diagnostics are deliberately native-only: this package's
+     * bundled JavaScript TypeScript can lag the selected TS7 engine and must not reject options
+     * which are valid in that engine.
      */
     private baseConfigurationDiagnostics(): GeneratedDiagnostic[] {
-        return this.shadows.getBaseConfigDiagnostics().map((diagnostic) => {
-            const position =
-                diagnostic.file && diagnostic.start != null
-                    ? diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start)
-                    : { line: 0, character: 0 };
-            return {
-                filePath: diagnostic.file?.fileName ?? null,
-                line: position.line,
-                character: position.character,
-                length: diagnostic.length ?? 1,
-                severity: mapTsDiagnosticSeverity(diagnostic.category),
-                code: diagnostic.code,
-                message: ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'),
-                relatedInformation: diagnostic.relatedInformation
-                    ?.filter(
-                        (
-                            related
-                        ): related is ts.DiagnosticRelatedInformation & {
-                            file: ts.SourceFile;
-                            start: number;
-                        } => !!related.file && related.start != null
-                    )
-                    .map((related) => {
-                        const relatedPosition = related.file.getLineAndCharacterOfPosition(
-                            related.start
-                        );
-                        return {
-                            filePath: related.file.fileName,
-                            line: relatedPosition.line,
-                            character: relatedPosition.character,
-                            length: related.length ?? 1,
-                            message: ts.flattenDiagnosticMessageText(related.messageText, '\n')
-                        };
-                    })
-            };
-        });
+        return this.shadows
+            .getBaseConfigDiagnostics()
+            .filter((diagnostic) => diagnostic.code === 18002 || diagnostic.code === 18003)
+            .map((diagnostic) => {
+                const position =
+                    diagnostic.file && diagnostic.start != null
+                        ? diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start)
+                        : { line: 0, character: 0 };
+                return {
+                    filePath: diagnostic.file?.fileName ?? null,
+                    line: position.line,
+                    character: position.character,
+                    length: diagnostic.length ?? 1,
+                    severity: mapTsDiagnosticSeverity(diagnostic.category),
+                    code: diagnostic.code,
+                    message: ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'),
+                    relatedInformation: diagnostic.relatedInformation
+                        ?.filter(
+                            (
+                                related
+                            ): related is ts.DiagnosticRelatedInformation & {
+                                file: ts.SourceFile;
+                                start: number;
+                            } => !!related.file && related.start != null
+                        )
+                        .map((related) => {
+                            const relatedPosition = related.file.getLineAndCharacterOfPosition(
+                                related.start
+                            );
+                            return {
+                                filePath: related.file.fileName,
+                                line: relatedPosition.line,
+                                character: relatedPosition.character,
+                                length: related.length ?? 1,
+                                message: ts.flattenDiagnosticMessageText(related.messageText, '\n')
+                            };
+                        })
+                };
+            });
     }
 
     private get batchStatePath(): string {
@@ -1780,11 +2879,28 @@ export class TsGoBatchOverlay {
     }
 }
 
+/**
+ * TS7 adds this declaration-site note to missing component props while the classic TS6 oracle
+ * does not. It carries no source-specific context beyond the primary TS2741 and is the only
+ * compiler-version-only related record normalized at the adapter boundary.
+ */
+function isNativeOnlySveltePropsRelatedInformation(
+    related: GeneratedDiagnosticRelatedInformation
+): boolean {
+    const filePath = normalizePath(related.filePath).toLowerCase();
+    const message = related.message.toLowerCase();
+    return (
+        filePath.endsWith('/svelte/types/index.d.ts') &&
+        message.includes("expected type comes from property 'props'") &&
+        message.includes('componentconstructoroptions<')
+    );
+}
+
 function batchGraphProjectIdentity(input: {
     projectPath: string;
     sourceRoot: string;
     tsconfigPath: string | undefined;
-    configPath: string | undefined;
+    configPath?: string;
 }): string {
     return createHash('sha256')
         .update(
@@ -1798,6 +2914,19 @@ function batchGraphProjectIdentity(input: {
             })
         )
         .digest('base64url');
+}
+
+function batchGraphEngineIdentity(engine: ResolvedTsGoEngine): MaterialisationPlanEngineIdentity {
+    // Launch commands, argument prefixes and API entries drive execution and editor-only feature
+    // requests; none can change graph discovery, shadow layout or transform output. In
+    // particular, standalone svelte-check can run under another Node executable and has no API
+    // session, while the editor may use the verified bundled Effect API. Keeping those absolute
+    // paths here gave identical package versions different cache keys and made stock + Effect
+    // churn through the two-entry retention window.
+    return {
+        packageName: engine.packageName,
+        version: engine.version
+    };
 }
 
 function batchGraphLockfileInputs(plan: BatchGraphPlan): string[] {
@@ -1831,48 +2960,361 @@ function batchGraphLockfileInputs(plan: BatchGraphPlan): string[] {
 function batchGraphPlanFileInputs(
     plan: BatchGraphPlan,
     directoryRoots: readonly string[]
-): MaterialisationPlanFileInput[] {
+): {
+    files: MaterialisationPlanFileInput[];
+    validationOnlyFiles: MaterialisationPlanValidationOnlyFileInput[];
+} {
     const inputs: MaterialisationPlanFileInput[] = [];
-    const seen = new Set<string>(directoryRoots.map((path) => normalizePath(resolve(path))));
-    const claimedRealFiles = new Set<string>();
+    const validationOnlyInputs = new Map<
+        string,
+        { input: MaterialisationPlanValidationOnlyFileInput; aliasAnchor?: string }
+    >();
+    const exactProofs = new Map(
+        plan.exactInputProofs.map((input) => [
+            `${input.kind}\0${normalizePath(resolve(input.path))}`,
+            input
+        ])
+    );
+    const layoutInputPaths = new Set(plan.layoutInputs.map((path) => normalizePath(resolve(path))));
+    const sourceRealPaths = new Set<string>();
+    for (const input of plan.sourceInputs) {
+        try {
+            sourceRealPaths.add(normalizePath(fs.realpathSync.native(resolve(input.path))));
+        } catch {
+            // The exact lexical source input remains authoritative when realpath is unavailable.
+        }
+    }
+    const directoryPaths = new Set(directoryRoots.map((path) => normalizePath(resolve(path))));
+    const directoryCoveragePaths = new Set(directoryPaths);
+    const realDirectoryPaths = new Set<string>();
+    for (const path of directoryPaths) {
+        try {
+            const realPath = normalizePath(fs.realpathSync.native(path));
+            directoryCoveragePaths.add(realPath);
+            realDirectoryPaths.add(realPath);
+        } catch {
+            // The lexical proof remains authoritative when a root cannot be canonicalised.
+        }
+    }
+    const realPathByDirectory = new Map<string, string | null>();
+    const coveredByDirectoryMembership = (
+        filePath: string
+    ): { aliasAnchor?: string } | undefined => {
+        let current = normalizePath(dirname(filePath));
+        for (;;) {
+            if (
+                directoryCoveragePaths.has(current) &&
+                batchGraphDirectoryMembershipCoversPath(current, filePath)
+            ) {
+                return {};
+            }
+            let realCurrent = realPathByDirectory.get(current);
+            if (realCurrent === undefined) {
+                try {
+                    realCurrent = normalizePath(fs.realpathSync.native(current));
+                } catch {
+                    realCurrent = null;
+                }
+                realPathByDirectory.set(current, realCurrent);
+            }
+            // Multiple workspace/pnpm spellings can point at the exact package root whose
+            // membership was captured. Treat that alias as another root, but never infer
+            // coverage merely because an arbitrary nested symlink lands somewhere below it.
+            if (
+                realCurrent !== null &&
+                realDirectoryPaths.has(realCurrent) &&
+                layoutInputPaths.has(current) &&
+                typeof materialisationPlanLayoutTopologyProof(
+                    exactProofs.get(`layout\0${current}`)?.proof
+                ) === 'string' &&
+                batchGraphDirectoryMembershipCoversPath(current, filePath)
+            ) {
+                return { aliasAnchor: current };
+            }
+            const parent = normalizePath(dirname(current));
+            if (parent === current) {
+                return undefined;
+            }
+            current = parent;
+        }
+    };
+    const inputsByPath = new Map<string, number>();
     const add = (input: MaterialisationPlanFileInput) => {
         const path = normalizePath(resolve(input.path));
-        if (seen.has(path)) {
+        // A recursive proof owns membership below the root, but validator v3 does not bind the
+        // root's own lexical symlink spelling/kind. Retain an exact layout anchor for that root.
+        if (directoryPaths.has(path) && input.kind !== 'layout') {
             return;
         }
-        let realFile: string | undefined;
-        try {
-            if (fs.statSync(path).isFile()) {
-                realFile = normalizePath(fs.realpathSync(path));
+        validationOnlyInputs.delete(path);
+        const existingIndex = inputsByPath.get(path);
+        if (existingIndex !== undefined) {
+            const existing = inputs[existingIndex];
+            if (existing.kind === 'source' && input.kind === 'layout') {
+                inputs[existingIndex] = {
+                    ...existing,
+                    layoutTopologyProof: materialisationPlanLayoutTopologyProof(
+                        input.discoveryProof
+                    )
+                };
             }
-        } catch {
-            // Missing optional topology inputs retain their lexical identity below.
-        }
-        if (input.kind === 'layout' && realFile && claimedRealFiles.has(realFile)) {
             return;
         }
-        seen.add(path);
+        inputsByPath.set(path, inputs.length);
         inputs.push({ ...input, path } as MaterialisationPlanFileInput);
-        if (input.kind !== 'layout' && realFile) {
-            claimedRealFiles.add(realFile);
+    };
+    const addValidationOnly = (
+        input: MaterialisationPlanValidationOnlyFileInput,
+        aliasAnchor?: string
+    ) => {
+        const path = normalizePath(resolve(input.path));
+        if (!inputsByPath.has(path) && !validationOnlyInputs.has(path)) {
+            validationOnlyInputs.set(path, {
+                input: { ...input, path },
+                ...(aliasAnchor ? { aliasAnchor } : {})
+            });
         }
     };
     for (const { path, signature } of plan.sourceInputs) {
         add({ kind: 'source', path, signature });
     }
     for (const path of plan.configInputs) {
-        add({ kind: 'config', path });
+        add({
+            kind: 'config',
+            path,
+            discoveryProof: exactProofs.get(`config\0${normalizePath(resolve(path))}`)?.proof
+        });
     }
     for (const path of plan.manifestInputs) {
-        add({ kind: 'manifest', path, allowMissing: true });
+        const normalizedPath = normalizePath(resolve(path));
+        const discoveryProof = exactProofs.get(`manifest\0${normalizedPath}`)?.proof;
+        // Recursive membership is a stronger and dramatically cheaper proof for an absent
+        // descendant: creating the manifest necessarily changes that package-tree stamp. Keep
+        // present manifests exact because their bytes, not merely their presence, shape exports.
+        const coverage =
+            discoveryProof === null ? coveredByDirectoryMembership(normalizedPath) : undefined;
+        if (discoveryProof === null && coverage) {
+            addValidationOnly(
+                {
+                    kind: 'manifest',
+                    path: normalizedPath,
+                    allowMissing: true,
+                    discoveryProof
+                },
+                coverage.aliasAnchor
+            );
+            continue;
+        }
+        add({
+            kind: 'manifest',
+            path: normalizedPath,
+            allowMissing: true,
+            discoveryProof
+        });
     }
     for (const path of batchGraphLockfileInputs(plan)) {
         add({ kind: 'lockfile', path, allowMissing: true });
     }
     for (const path of plan.layoutInputs) {
-        add({ kind: 'layout', path, allowMissing: true });
+        const normalizedPath = normalizePath(resolve(path));
+        const discoveryProof = exactProofs.get(`layout\0${normalizedPath}`)?.proof;
+        let topologyOnly = false;
+        try {
+            topologyOnly = sourceRealPaths.has(
+                normalizePath(fs.realpathSync.native(normalizedPath))
+            );
+        } catch {
+            // Missing probes retain their ordinary exact/absence semantics.
+        }
+        // A missing descendant has no independent topology to retain: creating it necessarily
+        // changes the membership stamp. A present alias of an exact source is redundant too when
+        // the recursive proof sees every component below its retained root: membership proves the
+        // lexical path while the source input proves the bytes. Intermediate symlinks deliberately
+        // fail `coveredByDirectoryMembership` and remain exact.
+        const foldable =
+            discoveryProof === null || (topologyOnly && typeof discoveryProof === 'string');
+        const coverage = foldable ? coveredByDirectoryMembership(normalizedPath) : undefined;
+        if (foldable && coverage) {
+            addValidationOnly(
+                {
+                    kind: 'layout',
+                    path: normalizedPath,
+                    allowMissing: true,
+                    topologyOnly,
+                    discoveryProof
+                },
+                coverage.aliasAnchor
+            );
+            continue;
+        }
+        add({
+            kind: 'layout',
+            path: normalizedPath,
+            allowMissing: true,
+            topologyOnly,
+            discoveryProof
+        });
     }
-    return inputs;
+    // Alias-derived coverage is valid only while the alias itself remains an exact persisted
+    // topology anchor. Fall back to an ordinary stored exact input if a future input merge or
+    // filtering change fails to preserve that dependency.
+    for (const [path, folded] of validationOnlyInputs) {
+        if (!folded.aliasAnchor) {
+            continue;
+        }
+        const expectedTopology = materialisationPlanLayoutTopologyProof(
+            exactProofs.get(`layout\0${folded.aliasAnchor}`)?.proof
+        );
+        const anchorIndex = inputsByPath.get(folded.aliasAnchor);
+        const anchor = anchorIndex === undefined ? undefined : inputs[anchorIndex];
+        const retained =
+            typeof expectedTopology === 'string' &&
+            ((anchor?.kind === 'source' && anchor.layoutTopologyProof === expectedTopology) ||
+                (anchor?.kind === 'layout' &&
+                    materialisationPlanLayoutTopologyProof(anchor.discoveryProof) ===
+                        expectedTopology));
+        if (!retained) {
+            validationOnlyInputs.delete(path);
+            add(folded.input);
+        }
+    }
+    return {
+        files: inputs,
+        validationOnlyFiles: [...validationOnlyInputs.values()].map(({ input }) => input)
+    };
+}
+
+/**
+ * Prove that every fact used to construct the payload carries evidence from that same discovery
+ * pass. This check is intentionally filesystem-free: the detached publisher may skip a duplicate
+ * read pass, but it may never fill a missing discovery proof with whatever happens to exist later.
+ */
+function batchGraphDiscoveryEvidenceIsComplete(plan: BatchGraphPlan): boolean {
+    if (
+        plan.sourceInputs.some(
+            (input) =>
+                typeof input.path !== 'string' ||
+                input.path.length === 0 ||
+                typeof input.signature !== 'string' ||
+                input.signature.length === 0
+        )
+    ) {
+        return false;
+    }
+    const exactProofs = new Map(
+        plan.exactInputProofs.map((input) => [
+            `${input.kind}\0${normalizePath(resolve(input.path))}`,
+            input.proof
+        ])
+    );
+    const sourcePaths = new Set(
+        plan.sourceInputs.map((input) => normalizePath(resolve(input.path)))
+    );
+    const hasExactProof = (kind: 'config' | 'manifest' | 'layout', filePath: string) => {
+        const path = normalizePath(resolve(filePath));
+        const key = `${kind}\0${path}`;
+        if (!exactProofs.has(key)) {
+            return false;
+        }
+        const proof = exactProofs.get(key);
+        if (kind !== 'layout') {
+            return true;
+        }
+        const topologyProof = materialisationPlanLayoutTopologyProof(proof);
+        return sourcePaths.has(path)
+            ? typeof topologyProof === 'string'
+            : proof === null || typeof topologyProof === 'string';
+    };
+    if (
+        plan.configInputs.some((path) => !hasExactProof('config', path)) ||
+        plan.manifestInputs.some((path) => !hasExactProof('manifest', path)) ||
+        plan.layoutInputs.some((path) => !hasExactProof('layout', path))
+    ) {
+        return false;
+    }
+    const directoryProofs = new Set(
+        plan.directoryProofs.map((proof) => normalizePath(resolve(proof.path)))
+    );
+    return plan.directoryRoots.every((root) => directoryProofs.has(normalizePath(resolve(root))));
+}
+
+function batchGraphDiscoveryEvidenceStatus(
+    plan: BatchGraphPlan
+): BatchGraphDiscoveryEvidenceStatus {
+    if (!batchGraphDiscoveryEvidenceIsComplete(plan)) {
+        return 'incomplete';
+    }
+    const fileInputs = batchGraphPlanFileInputs(plan, plan.directoryRoots);
+    for (const input of fileInputs.files) {
+        if (input.kind !== 'source') {
+            continue;
+        }
+        try {
+            if (
+                computeBatchGraphSourceSignature(fs.readFileSync(input.path, 'utf8')) !==
+                input.signature
+            ) {
+                return 'stale';
+            }
+            if (
+                input.layoutTopologyProof !== undefined &&
+                materialisationPlanLayoutTopologyProof(
+                    materialisationPlanExactFileProof(input.path, 'layout')
+                ) !== input.layoutTopologyProof
+            ) {
+                return 'stale';
+            }
+        } catch {
+            return 'unverifiable';
+        }
+    }
+    for (const input of [...fileInputs.files, ...fileInputs.validationOnlyFiles]) {
+        if (input.kind === 'source' || input.kind === 'lockfile') {
+            continue;
+        }
+        if (input.discoveryProof === undefined) {
+            return 'incomplete';
+        }
+        try {
+            if (
+                materialisationPlanExactFileProof(input.path, input.kind) !== input.discoveryProof
+            ) {
+                return 'stale';
+            }
+        } catch {
+            return 'unverifiable';
+        }
+    }
+    const directoryProofs = new Map(
+        plan.directoryProofs.map((proof) => [normalizePath(resolve(proof.path)), proof])
+    );
+    const directoryBudget = createBatchGraphDirectoryMembershipBudget({
+        maxEntries: 500_000,
+        maxDurationMs: 3_000
+    });
+    for (const root of plan.directoryRoots) {
+        const path = normalizePath(resolve(root));
+        const expected = directoryProofs.get(path);
+        if (!expected) {
+            return 'incomplete';
+        }
+        try {
+            const current = batchGraphDirectoryMembership({
+                path,
+                validator: BATCH_GRAPH_DIRECTORY_VALIDATOR,
+                budget: directoryBudget
+            });
+            if (!current) {
+                return 'unverifiable';
+            }
+            if (current.stamp !== expected.stamp || current.entryCount !== expected.entryCount) {
+                return 'stale';
+            }
+        } catch {
+            return 'unverifiable';
+        }
+    }
+    return 'current';
 }
 
 /**
@@ -1886,7 +3328,7 @@ function safeBatchGraphDirectoryRoots(plan: BatchGraphPlan): string[] | undefine
         normalizePath(resolve(root))
     );
     const roots = [...new Set(plan.directoryRoots.map((root) => normalizePath(resolve(root))))];
-    if (roots.length > 512) {
+    if (roots.length > MAX_BATCH_GRAPH_DIRECTORY_ROOTS) {
         return undefined;
     }
     for (const root of roots) {
@@ -1901,6 +3343,159 @@ function safeBatchGraphDirectoryRoots(plan: BatchGraphPlan): string[] | undefine
     return roots.sort();
 }
 
+/**
+ * A reachable dependency scope is cacheable from its narrow source proof. A declared fallback is
+ * cacheable only when the broad closure itself completed and every package tree which supplied
+ * that answer has both exact manifest/layout evidence and recursive membership evidence.
+ *
+ * This is deliberately redundant with ShadowManager's collector. The persisted-plan boundary is
+ * where an accidentally incomplete future collector must fail closed instead of converting a
+ * one-run broad correctness fallback into a durable omission.
+ */
+function dependencyScopeHasCompleteCacheProof(
+    plan: BatchGraphPlan,
+    safeDirectoryRoots: readonly string[] | undefined
+): boolean {
+    const scope = plan.dependencyScope;
+    if (!scope || !scope.closureComplete || !safeDirectoryRoots) {
+        return false;
+    }
+    if (scope.mode === 'reachable') {
+        return scope.declaredRoot === null && scope.fallbackReasons.length === 0;
+    }
+    if (
+        scope.declaredRoot === null ||
+        scope.fallbackReasons.length === 0 ||
+        plan.dependencySvelteFileScan === null
+    ) {
+        return false;
+    }
+
+    const declaredRoots = [scope.declaredRoot, ...scope.roots].map((root) =>
+        normalizePath(resolve(root))
+    );
+    if (new Set(declaredRoots).size !== declaredRoots.length) {
+        return false;
+    }
+    const directoryRoots = new Set(safeDirectoryRoots.map((root) => normalizePath(resolve(root))));
+    const manifestInputs = new Set(
+        plan.manifestInputs.map((input) => normalizePath(resolve(input)))
+    );
+    const layoutInputs = new Set(plan.layoutInputs.map((input) => normalizePath(resolve(input))));
+    const sourceRoot = normalizePath(resolve(plan.project.sourceRoot));
+    let realSourceRoot = sourceRoot;
+    try {
+        realSourceRoot = normalizePath(fs.realpathSync(sourceRoot));
+    } catch {
+        // The lexical source-root proof remains authoritative when realpath is unavailable.
+    }
+    const workspaceAuthoredRoot = (root: string): string | undefined => {
+        try {
+            const realRoot = normalizePath(fs.realpathSync(root));
+            const ownedRelative = normalizePath(relative(realSourceRoot, realRoot));
+            if (
+                ownedRelative.startsWith('..') ||
+                isAbsolute(ownedRelative) ||
+                ownedRelative.split('/').includes('node_modules')
+            ) {
+                return undefined;
+            }
+            return normalizePath(join(sourceRoot, ownedRelative));
+        } catch {
+            return !root.includes('/node_modules/') && isWithinPath(sourceRoot, root)
+                ? root
+                : undefined;
+        }
+    };
+    const isCoveredByDirectoryProof = (root: string) => {
+        const authoredRoot = workspaceAuthoredRoot(root);
+        return (
+            directoryRoots.has(root) ||
+            (authoredRoot !== undefined && directoryRoots.has(authoredRoot)) ||
+            (authoredRoot !== undefined && directoryRoots.has(sourceRoot))
+        );
+    };
+    for (const root of declaredRoots) {
+        if (
+            !isCoveredByDirectoryProof(root) ||
+            !manifestInputs.has(normalizePath(join(root, 'package.json'))) ||
+            !layoutInputs.has(root)
+        ) {
+            return false;
+        }
+    }
+
+    const evidencedFiles = new Set([
+        ...plan.sourceInputs.map((input) => normalizePath(resolve(input.path))),
+        ...layoutInputs
+    ]);
+    const graphFiles = [
+        ...plan.projectSvelteFiles,
+        ...(plan.projectSvelteFileScan ?? []),
+        ...plan.batchReachableSourceFiles,
+        ...plan.batchRootSourceFiles,
+        ...plan.batchForwardSourceEdges.flatMap(([source, targets]) => [source, ...targets]),
+        ...plan.batchReachablePackageImports.flatMap((input) =>
+            input.resolvedFile ? [input.containingFile, input.resolvedFile] : [input.containingFile]
+        ),
+        ...plan.dependencySvelteFileScan
+    ].map((file) => normalizePath(resolve(file)));
+    if (graphFiles.some((file) => !evidencedFiles.has(file))) {
+        return false;
+    }
+
+    // A dependency file outside every declared package tree would have exact content evidence,
+    // but no membership proof to catch a sibling create/delete which changes the broad scan.
+    let realDeclaredRoots: Set<string>;
+    try {
+        realDeclaredRoots = new Set(
+            declaredRoots.map((root) => normalizePath(fs.realpathSync(root)))
+        );
+    } catch {
+        return false;
+    }
+    return plan.dependencySvelteFileScan.every((file) =>
+        isWithinAnyRealRoot(file, realDeclaredRoots)
+    );
+}
+
+/**
+ * Source reachability ambiguity is cacheable only after the broad workspace scan completed and
+ * the source root itself is recursively membership-validated. A narrow reachable graph needs no
+ * such fallback corpus.
+ */
+function projectScopeHasCompleteCacheProof(
+    plan: BatchGraphPlan,
+    safeDirectoryRoots: readonly string[] | undefined
+): boolean {
+    if (!plan.projectReachabilityFallbackReasons.length) {
+        return true;
+    }
+    if (plan.projectSvelteFileScan === null || !safeDirectoryRoots) {
+        return false;
+    }
+    const sourceRoot = normalizePath(resolve(plan.project.sourceRoot));
+    return safeDirectoryRoots.some((root) => normalizePath(resolve(root)) === sourceRoot);
+}
+
+function isWithinAnyRealRoot(filePath: string, realRoots: ReadonlySet<string>): boolean {
+    try {
+        let current = normalizePath(fs.realpathSync(filePath));
+        for (;;) {
+            if (realRoots.has(current)) {
+                return true;
+            }
+            const parent = normalizePath(dirname(current));
+            if (parent === current) {
+                return false;
+            }
+            current = parent;
+        }
+    } catch {
+        return false;
+    }
+}
+
 function isWithinPath(root: string, candidate: string): boolean {
     const rel = relative(root, candidate);
     return rel === '' || (!rel.startsWith('..') && !rel.startsWith('/') && !rel.startsWith('\\'));
@@ -1911,69 +3506,6 @@ function isWithinPath(root: string, candidate: string): boolean {
  * are validated separately; this catches creates, deletes, renames and symlink retargeting while
  * deliberately excluding dependency/VCS trees which have their own plan inputs.
  */
-function batchGraphDirectoryMembership(request: {
-    path: string;
-    validator: string;
-}): DirectoryMembershipProof | undefined {
-    if (request.validator !== BATCH_GRAPH_DIRECTORY_VALIDATOR) {
-        return undefined;
-    }
-    const root = normalizePath(resolve(request.path));
-    const entries: string[] = [];
-    const visited = new Set<string>();
-    const excluded = new Set(['node_modules', '.git', '.hg', '.svn', '.svelte-ls-overlay']);
-
-    const walk = (directory: string, prefix: string) => {
-        const realDirectory = normalizePath(fs.realpathSync(directory));
-        const repeated = visited.has(realDirectory);
-        entries.push(`@directory\0${prefix}\0${realDirectory}\0${repeated ? 'repeat' : 'first'}`);
-        if (repeated) {
-            return;
-        }
-        visited.add(realDirectory);
-        const children = fs
-            .readdirSync(directory, { withFileTypes: true })
-            .sort((left, right) => left.name.localeCompare(right.name));
-        for (const child of children) {
-            if (excluded.has(child.name)) {
-                continue;
-            }
-            const absolute = normalizePath(join(directory, child.name));
-            const name = prefix ? `${prefix}/${child.name}` : child.name;
-            if (child.isSymbolicLink()) {
-                const target = fs.readlinkSync(absolute);
-                let targetKind = 'missing';
-                try {
-                    const stat = fs.statSync(absolute);
-                    targetKind = stat.isDirectory()
-                        ? 'directory'
-                        : stat.isFile()
-                          ? 'file'
-                          : 'other';
-                } catch {
-                    // A dangling link is still exact graph topology and remains in the proof.
-                }
-                entries.push(`${name}\0symlink\0${target}\0${targetKind}`);
-                if (targetKind === 'directory') {
-                    walk(absolute, name);
-                }
-            } else if (child.isDirectory()) {
-                entries.push(`${name}\0directory`);
-                walk(absolute, name);
-            } else if (child.isFile()) {
-                entries.push(`${name}\0file`);
-            } else {
-                entries.push(`${name}\0other`);
-            }
-        }
-    };
-    walk(root, '');
-    return {
-        stamp: createHash('sha256').update(entries.join('\0')).digest('base64url'),
-        entryCount: entries.length
-    };
-}
-
 function readSourceStat(filePath: string): StoredSourceStat {
     const stat = fs.statSync(filePath, { bigint: true });
     if (!stat.isFile()) {
@@ -2136,6 +3668,24 @@ function generatedDiagnosticEndOffset(
     lineOffsets: number[]
 ): number {
     return offsetAt(generatedDiagnosticEnd(diagnostic), text, lineOffsets);
+}
+
+/**
+ * Map an offset from a SvelteKit upserted file back to authored text. `toOriginalPos` treats an
+ * offset exactly at an insertion's left edge as though the insertion had already been consumed;
+ * that is correct for a caret after generated code but wrong for a diagnostic end immediately
+ * before it (`ssr| : boolean`). Give insertion boundaries left affinity so authored token spans
+ * remain ordered and complete.
+ */
+function boundedKitOriginalOffset(
+    generatedOffset: number,
+    addedCode: InternalHelpers.AddedCode[],
+    sourceLength: number
+): number {
+    const boundary = addedCode.find((added) => added.generatedPos === generatedOffset);
+    const mapped =
+        boundary?.originalPos ?? internalHelpers.toOriginalPos(generatedOffset, addedCode).pos;
+    return Math.min(sourceLength, Math.max(0, mapped));
 }
 
 function mapTsDiagnosticSeverity(category: ts.DiagnosticCategory): DiagnosticSeverity {

@@ -497,7 +497,10 @@ async function runLifecycleAcceptance(options, packageName) {
                 `open overlays ended at ${finalStats.openOverlays}, baseline ${baselineStats.openOverlays}`
             );
         }
-        if (rssGrowth > 0.15) {
+        // Smoke mode intentionally runs only ten cycles, before the 64-entry snapshot LRU can
+        // warm and establish a meaningful plateau. It still proves that every overlay closes,
+        // while the release acceptance's required 200-cycle run owns the 15% RSS gate.
+        if (!options.smoke && rssGrowth > 0.15) {
             problems.push(`RSS grew ${(rssGrowth * 100).toFixed(1)}%, limit 15%`);
         }
         if (problems.length) {
@@ -519,6 +522,7 @@ async function runLifecycleAcceptance(options, packageName) {
             plateauBaselineRssBytes,
             finalRssBytes: finalResources.rssBytes,
             rssGrowth: +rssGrowth.toFixed(4),
+            rssPlateauEnforced: !options.smoke,
             rssSamples,
             peakRssBytes: measured.peakRssBytes,
             cpuMs: measured.cpuMs,

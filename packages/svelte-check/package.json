@@ -1,14 +1,15 @@
 {
     "name": "@reintersect/svelte-check",
     "description": "Svelte Code Checker Terminal Interface",
-    "version": "4.8.6",
+    "version": "4.8.7",
     "main": "./dist/src/index.js",
     "bin": "./bin/svelte-check",
     "author": "The Svelte Community",
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/sveltejs/language-tools.git"
+        "url": "git+https://github.com/reintersect/svelte-language-tools.git",
+        "directory": "packages/svelte-check"
     },
     "keywords": [
         "svelte",
@@ -16,12 +17,17 @@
     ],
     "files": [
         "bin",
-        "dist"
+        "dist",
+        "CHANGELOG.md",
+        "LICENSE"
     ],
     "bugs": {
-        "url": "https://github.com/sveltejs/language-tools/issues"
+        "url": "https://github.com/reintersect/svelte-language-tools/issues"
     },
-    "homepage": "https://github.com/sveltejs/language-tools#readme",
+    "homepage": "https://github.com/reintersect/svelte-language-tools/tree/master/packages/svelte-check#readme",
+    "publishConfig": {
+        "access": "public"
+    },
     "engines": {
         "node": ">= 18.0.0"
     },

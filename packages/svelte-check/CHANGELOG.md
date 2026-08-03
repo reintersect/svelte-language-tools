@@ -1,5 +1,20 @@
 # Changelog
 
+## 4.8.7
+
+### Patch Changes
+
+-   Reuse exact, engine-scoped materialisation plans across fresh checker processes. Graph inputs,
+    directory membership, transforms and native-engine identity are boundedly validated before reuse;
+    stale or incomplete evidence falls back to discovery, and auxiliary plan publication stays off the
+    diagnostic critical path.
+-   Tighten classic-versus-native diagnostic equivalence and expand malformed and niche template
+    coverage while preserving complete source-program membership and deterministic failure handling.
+-   Preserve JavaScript component JSDoc through `.jsx` shadows and reject partial native file lists,
+    malformed compiler output, and exit-zero runs which do not emit a complete terminal record.
+-   Updated dependencies:
+    -   @reintersect/svelte-load-config@0.2.5
+
 ## 4.8.6
 
 ### Patch Changes

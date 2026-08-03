@@ -61,11 +61,6 @@
                                 "uri": "workspace:src/_Button.svelte",
                                 "range": [1, 32, 1, 37],
                                 "message": "'label' is declared here."
-                            },
-                            {
-                                "uri": "dependency:svelte/types/index.d.ts",
-                                "range": [14, 2, 14, 7],
-                                "message": "The expected type comes from property 'props' which is declared here on type 'ComponentConstructorOptions<$$ComponentProps>'"
                             }
                         ]
                     },
@@ -454,6 +449,83 @@
                     "code": 18047,
                     "range": [8, 8, 8, 13],
                     "message": "'maybe' is possibly 'null'."
+                }
+            ]
+        },
+        {
+            "file": "src/34-key-block.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [4, 12, 4, 19],
+                    "message": "Property 'missing' does not exist on type '{ id: number; }'."
+                },
+                {
+                    "code": 2339,
+                    "range": [5, 17, 5, 28],
+                    "message": "Property 'toUpperCase' does not exist on type 'number'."
+                }
+            ]
+        },
+        {
+            "file": "src/35-dynamic-element.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [5, 30, 5, 37],
+                    "message": "Property 'missing' does not exist on type '{ tag: \"section\"; }'."
+                }
+            ]
+        },
+        {
+            "file": "src/36-animate-parameter.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [7, 23, 7, 31],
+                    "message": "Type 'string' is not assignable to type 'number | ((len: number) => number) | undefined'."
+                }
+            ]
+        },
+        {
+            "file": "src/37-component-spread.svelte",
+            "diagnostics": [
+                {
+                    "code": 2322,
+                    "range": [8, 6, 8, 6],
+                    "message": "Type '{ label: number; count: number; }' is not assignable to type '$$ComponentProps'.\n  Types of property 'label' are incompatible.\n    Type 'number' is not assignable to type 'string'.",
+                    "native": {
+                        "relatedInformation": [
+                            {
+                                "uri": "dependency:svelte/types/index.d.ts",
+                                "range": [14, 2, 14, 7],
+                                "message": "The expected type comes from property 'props' which is declared here on type 'ComponentConstructorOptions<$$ComponentProps>'"
+                            }
+                        ]
+                    },
+                    "nativeLsp": {
+                        "relatedInformation": []
+                    }
+                }
+            ]
+        },
+        {
+            "file": "src/38-boundary-failed-snippet.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [9, 21, 9, 28],
+                    "message": "Property 'missing' does not exist on type '{ status: number; }'."
+                }
+            ]
+        },
+        {
+            "file": "src/39-template-typescript-expression.svelte",
+            "diagnostics": [
+                {
+                    "code": 2339,
+                    "range": [4, 22, 4, 33],
+                    "message": "Property 'toUpperCase' does not exist on type 'number'."
                 }
             ]
         },

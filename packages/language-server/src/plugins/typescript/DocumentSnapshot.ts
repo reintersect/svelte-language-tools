@@ -280,12 +280,7 @@ function preprocessSvelteFile(document: Document, options: SvelteSnapshotOptions
     let exportedNames: IExportedNames = { has: () => false };
     let htmlAst: TemplateNode | undefined;
 
-    const scriptKind = [
-        getScriptKindFromAttributes(document.scriptInfo?.attributes ?? {}),
-        getScriptKindFromAttributes(document.moduleScriptInfo?.attributes ?? {})
-    ].includes(ts.ScriptKind.TSX)
-        ? ts.ScriptKind.TS
-        : ts.ScriptKind.JS;
+    const scriptKind = getSvelteDocumentScriptKind(document);
 
     try {
         const tsx =
@@ -354,6 +349,22 @@ function preprocessSvelteFile(document: Document, options: SvelteSnapshotOptions
         nrPrependedLines,
         scriptKind
     };
+}
+
+/**
+ * The authored language of a Svelte document after its effective config has supplied any
+ * `defaultLanguages.script` value. A module and instance script share one generated program, so
+ * either one opting into TypeScript makes the whole shadow TypeScript.
+ */
+export function getSvelteDocumentScriptKind(
+    document: Document
+): ts.ScriptKind.TS | ts.ScriptKind.JS {
+    return [
+        getScriptKindFromAttributes(document.scriptInfo?.attributes ?? {}),
+        getScriptKindFromAttributes(document.moduleScriptInfo?.attributes ?? {})
+    ].includes(ts.ScriptKind.TSX)
+        ? ts.ScriptKind.TS
+        : ts.ScriptKind.JS;
 }
 
 /**

@@ -8,8 +8,21 @@ import { Document } from '../../../lib/documents';
 import { configLoader, SvelteConfig } from '../../../lib/documents/configLoader';
 import { Logger } from '../../../logger';
 import { normalizePath, pathToUrl } from '../../../utils';
-import { DocumentSnapshot, SvelteDocumentSnapshot } from '../../typescript/DocumentSnapshot';
+import {
+    DocumentSnapshot,
+    getSvelteDocumentScriptKind,
+    SvelteDocumentSnapshot
+} from '../../typescript/DocumentSnapshot';
 import { SvelteSnapshotOptions } from '../../typescript/DocumentSnapshot';
+import {
+    BATCH_GRAPH_DIRECTORY_VALIDATOR,
+    batchGraphDirectoryMembership,
+    createBatchGraphDirectoryMembershipBudget
+} from './BatchGraphEvidence';
+import {
+    MaterialisationPlanExactFileKind,
+    materialisationPlanExactFileProof
+} from './MaterialisationPlanCache';
 
 /**
  * Directory each package gets for its generated twins, plus — in the package being checked —
@@ -28,7 +41,8 @@ const OVERLAY_DIR = 'node_modules/.cache/svelte-lsp';
 const LEGACY_OVERLAY_DIR = '.svelte-ls-overlay';
 const SHADOW_ROOT = 'svelte';
 /** Bump when the shadow tree's layout changes, to invalidate every shadow on disk. */
-const SHADOW_LAYOUT_VERSION = 4;
+const SHADOW_LAYOUT_VERSION = 5;
+type SvelteShadowExtension = '.tsx' | '.jsx';
 /**
  * A `.svelte` specifier and its collision-free batch spelling have exactly the same length.
  * Keeping that invariant means a copied TS/JS file and a generated TSX file retain every source
@@ -54,7 +68,23 @@ const NODE_BUILTIN_MODULES = new Set(builtinModules.map((name) => name.replace(/
  */
 const sharedPackageRootsByDir = new Map<string, string>();
 const sharedPackageManifests = new Map<string, any | null>();
-const sharedDependencyRoots = new Map<string, string[]>();
+const sharedPackageManifestProofs = new Map<string, string | null>();
+/** Manifest reads whose before/after identity changed; their parsed bytes have no stable proof. */
+const sharedUnstablePackageManifestProofs = new Set<string>();
+const sharedDependencyRoots = new Map<
+    string,
+    {
+        roots: string[];
+        complete: boolean;
+        fallbackReasons: string[];
+        sourceInputs: BatchGraphSourceInput[];
+        manifestInputs: string[];
+        layoutInputs: string[];
+        directoryRoots: string[];
+        exactInputProofs: BatchGraphExactInputProof[];
+        directoryProofs: BatchGraphDirectoryProof[];
+    }
+>();
 const sharedReachableDependencyRoots = new Map<
     string,
     {
@@ -64,10 +94,18 @@ const sharedReachableDependencyRoots = new Map<
         manifestInputs: string[];
         layoutInputs: string[];
         directoryRoots: string[];
+        exactInputProofs: BatchGraphExactInputProof[];
+        directoryProofs: BatchGraphDirectoryProof[];
     }
 >();
-const sharedDependencySvelteFiles = new Map<string, string[]>();
-const sharedSvelteFilesByPackage = new Map<string, string[]>();
+const sharedDependencySvelteFiles = new Map<
+    string,
+    { files: string[]; directoryProofs: BatchGraphDirectoryProof[] }
+>();
+const sharedSvelteFilesByPackage = new Map<
+    string,
+    { files: string[]; proof: BatchGraphDirectoryProof }
+>();
 const sharedDependencyScanMode = new Map<string, 'broad' | 'direct' | 'exports'>();
 /** Real package roots as TypeScript sees them -> import-visible roots under node_modules. */
 const sharedLexicalPackageRootsByReal = new Map<string, string>();
@@ -89,6 +127,8 @@ const MAX_PUBLIC_EXPORT_TARGETS = 4_000;
 export function invalidateTsGoWorkspaceIndex() {
     sharedPackageRootsByDir.clear();
     sharedPackageManifests.clear();
+    sharedPackageManifestProofs.clear();
+    sharedUnstablePackageManifestProofs.clear();
     sharedDependencyRoots.clear();
     sharedReachableDependencyRoots.clear();
     sharedDependencySvelteFiles.clear();
@@ -112,6 +152,22 @@ function realPathOrSelf(filePath: string): string {
     } catch {
         return normalized;
     }
+}
+
+/** Authored workspace spelling for a package root, including a node_modules symlink to it. */
+function workspaceOwnedPackagePath(packageRoot: string, sourceRoot: string): string | undefined {
+    const normalizedSourceRoot = normalizePath(sourceRoot);
+    const realSourceRoot = realPathOrSelf(normalizedSourceRoot);
+    const realPackageRoot = realPathOrSelf(packageRoot);
+    const ownedRelative = normalizePath(relative(realSourceRoot, realPackageRoot));
+    if (
+        ownedRelative.startsWith('..') ||
+        isAbsolute(ownedRelative) ||
+        ownedRelative.split('/').includes('node_modules')
+    ) {
+        return undefined;
+    }
+    return normalizePath(join(normalizedSourceRoot, ownedRelative));
 }
 
 function registerPackageRootAlias(packageRoot: string): string {
@@ -294,12 +350,28 @@ export interface BatchGraphDependencyScope {
     roots: string[];
     directImports: number;
     fallbackReasons: string[];
+    /** The package whose declared dependency closure was walked, only in fallback mode. */
+    declaredRoot: string | null;
+    /** False when the declared closure itself hit an ambiguity or deterministic safety bound. */
+    closureComplete: boolean;
 }
 
 export interface BatchGraphSourceInput {
     path: string;
     /** Import/re-export/glob semantics only; ordinary type/body edits do not invalidate the graph. */
     signature: string;
+}
+
+export interface BatchGraphExactInputProof {
+    kind: MaterialisationPlanExactFileKind;
+    path: string;
+    proof: string | null;
+}
+
+export interface BatchGraphDirectoryProof {
+    path: string;
+    stamp: string;
+    entryCount: number;
 }
 
 /**
@@ -311,7 +383,7 @@ export interface BatchGraphSourceInput {
  * cross-project or tampered plan is rejected atomically.
  */
 export interface BatchGraphPlan {
-    version: 1;
+    version: 3;
     signature: string;
     project: {
         projectPath: string;
@@ -344,6 +416,10 @@ export interface BatchGraphPlan {
     layoutInputs: string[];
     /** Directory trees/glob roots whose create/delete membership affects the graph. */
     directoryRoots: string[];
+    /** Exact bytes/topology captured by the reads which produced this graph. */
+    exactInputProofs: BatchGraphExactInputProof[];
+    /** Recursive membership captured before the scans which produced this graph. */
+    directoryProofs: BatchGraphDirectoryProof[];
 }
 
 type ParsedBaseConfig = BatchGraphParsedBaseConfig;
@@ -378,9 +454,11 @@ interface ReachabilityCache {
     sourceSignatures: Map<string, string>;
     resolutions: Map<string, string | null>;
     packageRoots: Map<string, string | null>;
-    manifestInputs: Set<string>;
-    layoutInputs: Set<string>;
-    directoryRoots: Set<string>;
+    manifestInputs: ExactInputEvidenceSet;
+    layoutInputs: ExactInputEvidenceSet;
+    directoryRoots: DirectoryEvidenceSet;
+    exactInputProofs: Map<string, BatchGraphExactInputProof>;
+    directoryProofs: Map<string, BatchGraphDirectoryProof>;
 }
 
 interface ReachableBarePackageImport {
@@ -395,11 +473,13 @@ interface DependencyScope {
     roots: string[];
     directImports: number;
     fallbackReasons: string[];
+    declaredRoot: string | null;
+    closureComplete: boolean;
 }
 
 /**
- * Owns the mapping between a real `.svelte` file and the generated `.tsx` shadow that tsgo
- * type-checks, plus the on-disk scaffolding the overlay needs.
+ * Owns the mapping between a real `.svelte` file and the generated `.tsx`/`.jsx` shadow that
+ * tsgo type-checks, plus the on-disk scaffolding the overlay needs.
  */
 export class ShadowManager {
     readonly overlayPath: string;
@@ -426,6 +506,8 @@ export class ShadowManager {
     private projectSvelteFileScan: string[] | undefined;
     private dependencySvelteFileScan: string[] | undefined;
     private dependencyScope: DependencyScope | undefined;
+    /** Freshness-validated persisted graph; reused verbatim until this manager is replaced. */
+    private restoredBatchGraphPlan: BatchGraphPlan | undefined;
     private owningPackages: string[] | undefined;
     /** Kit shadows by original path, and the reverse lookup by shadow path. */
     private readonly kitShadows = new Map<string, KitShadow>();
@@ -445,6 +527,13 @@ export class ShadowManager {
     private readonly mirrorRoots = new Map<string, string>();
     private readonly packageRootByDir = new Map<string, string>();
     private readonly originalByShadowPath = new Map<string, string>();
+    /** Native parse boundary per source. JS output must stay JSX so JSDoc remains semantic. */
+    private readonly shadowExtensionByOriginal = new Map<string, SvelteShadowExtension>();
+    /**
+     * Native preview resolves imported JSX shadows but does not promote them into the program.
+     * Naming them as roots is therefore required for both their own checks and importer types.
+     */
+    private readonly nativeJavaScriptShadowSources = new Set<string>();
     /** Batch-only mirrors of ordinary TS/JS sources and their resolved JSON modules. */
     private readonly batchSourceMirrorByOriginal = new Map<string, string>();
     private readonly batchSourceOriginalByMirror = new Map<string, string>();
@@ -464,6 +553,7 @@ export class ShadowManager {
     private batchCompilerOptions: ts.CompilerOptions = {};
     private batchConfigDirectory: string;
     private batchConfigInputs = new Set<string>();
+    private batchConfigProofs = new Map<string, BatchGraphExactInputProof>();
     private batchRestoredSourceInputs = new Map<string, string>();
     private reachabilityCache: ReachabilityCache | undefined;
     private projectReachabilityFallbackReasons: string[] = [];
@@ -539,6 +629,7 @@ export class ShadowManager {
         dependencyRoots: number;
         svelteFiles: number;
         fallbackReasons: readonly string[];
+        closureComplete: boolean;
     } {
         if (this.options.tsconfigPath && !this.projectConfigParsed) {
             this.parseBaseConfig();
@@ -551,12 +642,16 @@ export class ShadowManager {
             directImports: scope.directImports,
             dependencyRoots: roots.length,
             svelteFiles: files.length,
-            fallbackReasons: scope.fallbackReasons
+            fallbackReasons: scope.fallbackReasons,
+            closureComplete: scope.closureComplete
         };
     }
 
     /** Export the JSON-safe project graph after the caller has completed desired discovery. */
     exportBatchGraphPlan(): BatchGraphPlan {
+        if (this.restoredBatchGraphPlan) {
+            return this.restoredBatchGraphPlan;
+        }
         if (!this.parsedBaseConfig) {
             this.parseBaseConfig();
         }
@@ -565,9 +660,15 @@ export class ShadowManager {
         for (const [fileName, signature] of this.reachabilityCache?.sourceSignatures ?? []) {
             sourceInputs.set(normalizePath(fileName), signature);
         }
-        const manifestInputs = new Set(this.reachabilityCache?.manifestInputs ?? []);
-        const layoutInputs = new Set(this.reachabilityCache?.layoutInputs ?? []);
+        const discoveredManifestInputs = new Set(this.reachabilityCache?.manifestInputs ?? []);
+        const discoveredLayoutInputs = new Set(this.reachabilityCache?.layoutInputs ?? []);
+        const manifestInputs = new Set(discoveredManifestInputs);
+        const layoutInputs = new Set(discoveredLayoutInputs);
         const directoryRoots = new Set(this.reachabilityCache?.directoryRoots ?? []);
+        const exactInputProofs = new Map([
+            ...this.batchConfigProofs,
+            ...(this.reachabilityCache?.exactInputProofs ?? [])
+        ]);
         const addPackageEvidence = (fileName: string) => {
             const packageRoot = this.packageRootOf(fileName);
             manifestInputs.add(normalizePath(join(packageRoot, 'package.json')));
@@ -601,7 +702,14 @@ export class ShadowManager {
             const normalized = normalizePath(root);
             manifestInputs.add(normalizePath(join(normalized, 'package.json')));
             layoutInputs.add(normalized);
-            directoryRoots.add(normalized);
+            if (this.dependencyScope?.mode === 'declared-fallback') {
+                const authoredPackageRoot = workspaceOwnedPackagePath(normalized, this.sourceRoot);
+                if (authoredPackageRoot) {
+                    directoryRoots.add(authoredPackageRoot);
+                } else {
+                    directoryRoots.add(normalized);
+                }
+            }
         }
         if (
             !this.options.tsconfigPath ||
@@ -610,9 +718,34 @@ export class ShadowManager {
         ) {
             directoryRoots.add(this.sourceRoot);
         }
+        for (const path of manifestInputs) {
+            const normalized = normalizePath(path);
+            const proofKey = exactInputProofKey('manifest', normalized);
+            if (sharedUnstablePackageManifestProofs.has(normalized)) {
+                exactInputProofs.delete(proofKey);
+                continue;
+            }
+            const sharedProof = sharedPackageManifestProofs.get(normalized);
+            if (sharedProof !== undefined || sharedPackageManifestProofs.has(normalized)) {
+                exactInputProofs.set(exactInputProofKey('manifest', normalized), {
+                    kind: 'manifest',
+                    path: normalized,
+                    proof: sharedProof ?? null
+                });
+            } else if (!discoveredManifestInputs.has(normalized)) {
+                recordExactInputProof(exactInputProofs, 'manifest', normalized);
+            }
+        }
+        for (const path of layoutInputs) {
+            const normalized = normalizePath(path);
+            if (!discoveredLayoutInputs.has(normalized)) {
+                recordExactInputProof(exactInputProofs, 'layout', normalized);
+            }
+        }
+        const directoryProofs = new Map(this.reachabilityCache?.directoryProofs ?? []);
 
         const unsigned: Omit<BatchGraphPlan, 'signature'> = {
-            version: 1,
+            version: 3,
             project: {
                 projectPath: normalizePath(this.options.projectPath),
                 sourceRoot: this.sourceRoot,
@@ -660,7 +793,13 @@ export class ShadowManager {
             configInputs: sortedUnique(this.batchConfigInputs),
             manifestInputs: sortedUnique(manifestInputs),
             layoutInputs: sortedUnique(layoutInputs),
-            directoryRoots: sortedUnique(directoryRoots)
+            directoryRoots: sortedUnique(directoryRoots),
+            exactInputProofs: [...exactInputProofs.values()].sort((left, right) =>
+                `${left.kind}\0${left.path}`.localeCompare(`${right.kind}\0${right.path}`)
+            ),
+            directoryProofs: [...directoryProofs.values()].sort((left, right) =>
+                left.path.localeCompare(right.path)
+            )
         };
         return { ...unsigned, signature: batchGraphPlanSignature(unsigned) };
     }
@@ -691,6 +830,18 @@ export class ShadowManager {
             return false;
         }
 
+        // Dependency discovery normally records the import-visible spelling of each pnpm/npm
+        // package root alongside its realpath. overlayRootDirs uses that table to pair a native
+        // realpath with the package's authoritative mirror. A fresh process restoring a plan had
+        // an empty table, so its warm overlay silently lost those bridges (five program files in
+        // Reintersect, including virtua's raw Svelte components) even though the persisted graph
+        // itself was complete. These roots are freshness-validated members of the decoded plan;
+        // replaying them reconstructs exactly the generation-local derived state discovery made.
+        for (const root of plan.dependencyScope?.roots ?? []) {
+            registerPackageRootAlias(root);
+        }
+
+        this.restoredBatchGraphPlan = plan;
         this.projectSvelteFileScan = plan.projectSvelteFileScan ?? undefined;
         this.dependencySvelteFileScan = plan.dependencySvelteFileScan ?? undefined;
         this.dependencyScope = plan.dependencyScope
@@ -709,6 +860,11 @@ export class ShadowManager {
         this.batchCompilerOptions = cloneJsonValue(plan.batchCompilerOptions);
         this.batchConfigDirectory = plan.batchConfigDirectory;
         this.batchConfigInputs = new Set(plan.configInputs);
+        this.batchConfigProofs = new Map(
+            plan.exactInputProofs
+                .filter((input) => input.kind === 'config')
+                .map((input) => [exactInputProofKey(input.kind, input.path), input])
+        );
         this.batchRestoredSourceInputs = new Map(
             plan.sourceInputs.map((entry) => [entry.path, entry.signature])
         );
@@ -727,17 +883,28 @@ export class ShadowManager {
             this.batchCompilerOptions,
             this.batchConfigDirectory
         );
+        for (const input of plan.exactInputProofs) {
+            if (input.kind !== 'config') {
+                this.reachabilityCache.exactInputProofs.set(
+                    exactInputProofKey(input.kind, input.path),
+                    input
+                );
+            }
+        }
+        for (const proof of plan.directoryProofs) {
+            this.reachabilityCache.directoryProofs.set(proof.path, proof);
+        }
         for (const input of plan.sourceInputs) {
             this.reachabilityCache.sourceSignatures.set(input.path, input.signature);
         }
         for (const input of plan.manifestInputs) {
-            this.reachabilityCache.manifestInputs.add(input);
+            this.reachabilityCache.manifestInputs.restore(input);
         }
         for (const input of plan.layoutInputs) {
-            this.reachabilityCache.layoutInputs.add(input);
+            this.reachabilityCache.layoutInputs.restore(input);
         }
         for (const root of plan.directoryRoots) {
-            this.reachabilityCache.directoryRoots.add(root);
+            this.reachabilityCache.directoryRoots.restore(root);
         }
 
         // Collision allocations and output ownership are generation-local derived state.
@@ -754,6 +921,8 @@ export class ShadowManager {
         this.batchReverseClosureSize = 0;
         this.kitShadows.clear();
         this.kitShadowsByShadowPath.clear();
+        this.shadowExtensionByOriginal.clear();
+        this.nativeJavaScriptShadowSources.clear();
         this.fingerprintValidByPackage.clear();
         this.pendingFingerprints.clear();
         this.clearSnapshots();
@@ -1165,14 +1334,14 @@ export class ShadowManager {
                     try {
                         sourceStat = fs.statSync(original);
                     } catch {
-                        // Generated component twins resemble ordinary `.tsx` paths after the
+                        // Generated component twins resemble ordinary JSX/TSX paths after the
                         // layout is inverted, but do not have a same-spelled authored source.
                         // Every other missing source makes the owner record stale as a unit:
                         // redirecting a package entry while one of its relative mirror targets
                         // has disappeared would recreate the mixed real/mirror program.
                         if (
-                            relativePath.endsWith('.svelte.tsx') ||
-                            /\.(?:__svlt|__s[0-9a-z]{3})\.tsx$/.test(relativePath)
+                            /\.svelte\.[jt]sx$/.test(relativePath) ||
+                            /\.(?:__svlt|__s[0-9a-z]{3})\.[jt]sx$/.test(relativePath)
                         ) {
                             continue;
                         }
@@ -1485,6 +1654,53 @@ export class ShadowManager {
     }
 
     /**
+     * Resolve each component's native parse kind before an overlay config names its roots.
+     *
+     * A JavaScript transform contains meaningful JSDoc. Naming that output `.tsx` makes native
+     * TypeScript parse the comments as inert documentation and silently widens props to `any`.
+     * Reuse an unambiguous current output without reading the source; only a missing/stale output
+     * needs the cheap document parse which observes explicit `lang` and config default languages.
+     */
+    async refreshShadowKinds(svelteFilePaths: readonly string[]): Promise<void> {
+        const files = unique(
+            svelteFilePaths.filter(needsSvelteShadow).map((file) => this.canonicalSourcePath(file))
+        );
+        await Promise.all(files.map((file) => configLoader.awaitConfig(file)));
+
+        // Freshness is meaningful only after transform/config/compiler identities are loaded.
+        this.checkFingerprints();
+        for (const originalPath of files) {
+            const candidates: Array<[SvelteShadowExtension, string]> = [
+                ['.tsx', this.shadowPathWithExtension(originalPath, '.tsx')],
+                ['.jsx', this.shadowPathWithExtension(originalPath, '.jsx')]
+            ];
+            const current = candidates.filter(([, shadowPath]) =>
+                this.isShadowFresh(originalPath, shadowPath)
+            );
+            if (current.length === 1) {
+                this.recordShadowExtension(originalPath, current[0][0]);
+                continue;
+            }
+
+            try {
+                const document = new Document(
+                    pathToUrl(originalPath),
+                    fs.readFileSync(originalPath, 'utf8')
+                );
+                await document.configPromise;
+                this.recordShadowExtension(
+                    originalPath,
+                    getSvelteDocumentScriptKind(document) === ts.ScriptKind.TS ? '.tsx' : '.jsx'
+                );
+            } catch (error) {
+                // A create/delete race is owned by the materialisation pass. Keep the last known
+                // kind (or the conservative TSX fallback) so that pass can report/remove it.
+                Logger.debug(`[tsgo] could not determine shadow kind for ${originalPath}`, error);
+            }
+        }
+    }
+
+    /**
      * Where a `.svelte` file's generated twin lives.
      *
      * Deliberately *not* alongside the original: project selection in tsgo is decided purely by
@@ -1496,17 +1712,38 @@ export class ShadowManager {
      */
     getShadowPath(svelteFilePath: string): string {
         const originalPath = this.canonicalSourcePath(svelteFilePath);
+        const extension = this.shadowExtensionByOriginal.get(originalPath) ?? '.tsx';
+        const shadowPath = this.shadowPathWithExtension(originalPath, extension);
+        this.originalByShadowPath.set(shadowPath, originalPath);
+        this.registerReverseIndex?.(shadowPath, originalPath);
+        return shadowPath;
+    }
+
+    private shadowPathWithExtension(
+        originalPath: string,
+        extension: SvelteShadowExtension
+    ): string {
         const relativePath = this.mirrorRelFor(originalPath);
         const suffix = this.batchSvelteSpecifierSuffixes.get(originalPath);
         const batchRelativePath = suffix
             ? `${relativePath.slice(0, -SVELTE_SPECIFIER_LENGTH)}${suffix}`
             : relativePath;
-        const shadowPath = normalizePath(
-            join(this.mirrorRootFor(originalPath), `${batchRelativePath}.tsx`)
+        return normalizePath(
+            join(this.mirrorRootFor(originalPath), `${batchRelativePath}${extension}`)
         );
-        this.originalByShadowPath.set(shadowPath, originalPath);
-        this.registerReverseIndex?.(shadowPath, originalPath);
-        return shadowPath;
+    }
+
+    private recordShadowExtension(originalPath: string, extension: SvelteShadowExtension): void {
+        const previous = this.shadowExtensionByOriginal.get(originalPath);
+        if (previous && previous !== extension) {
+            this.originalByShadowPath.delete(this.shadowPathWithExtension(originalPath, previous));
+        }
+        this.shadowExtensionByOriginal.set(originalPath, extension);
+        if (extension === '.jsx') {
+            this.nativeJavaScriptShadowSources.add(originalPath);
+        } else {
+            this.nativeJavaScriptShadowSources.delete(originalPath);
+        }
     }
 
     /** Inverse of {@link getShadowPath}. Returns undefined for paths that aren't shadows. */
@@ -1520,7 +1757,12 @@ export class ShadowManager {
         if (known) {
             return known;
         }
-        if (!normalized.endsWith('.tsx')) {
+        const extension: SvelteShadowExtension | undefined = normalized.endsWith('.tsx')
+            ? '.tsx'
+            : normalized.endsWith('.jsx')
+              ? '.jsx'
+              : undefined;
+        if (!extension) {
             return undefined;
         }
         // Not seen this run — a shadow left over from a previous one, or a path arriving from
@@ -1530,13 +1772,34 @@ export class ShadowManager {
             if (!normalized.startsWith(mirror + '/')) {
                 continue;
             }
-            const rel = normalized.slice(mirror.length + 1, -'.tsx'.length);
+            const rel = normalized.slice(mirror.length + 1, -extension.length);
             // The mirror layout is authoritative and invertible. A resource operation often
             // names a *new* Svelte target which cannot exist or have a snapshot yet; requiring
-            // either would leak `.svelte.tsx` into the workspace edit sent to the client.
-            return this.originalForMirrorRel(mirror, rel);
+            // either would leak a generated `.svelte.[jt]sx` path into the workspace edit sent
+            // to the client.
+            return this.originalForMirrorRel(mirror, this.componentSourceRel(rel));
+        }
+        // A package-specific mirror may not have been discovered in this process yet (for
+        // example, a definition/resource operation arriving before dependency materialisation).
+        // The suffix after the canonical mirror marker is source-root-relative and remains fully
+        // invertible without probing the source or pre-registering that package.
+        const marker = `/${OVERLAY_DIR}/${SHADOW_ROOT}/`;
+        const markerIndex = normalized.lastIndexOf(marker);
+        if (markerIndex >= 0) {
+            const rel = normalized.slice(markerIndex + marker.length, -extension.length);
+            return this.originalForMirrorRel(
+                normalized.slice(0, markerIndex + marker.length - 1),
+                this.componentSourceRel(rel)
+            );
         }
         return undefined;
+    }
+
+    private componentSourceRel(rel: string): string {
+        if (/\.(?:__svlt|__s[0-9a-z]{3})$/.test(rel)) {
+            return rel.replace(/\.(?:__svlt|__s[0-9a-z]{3})$/, '.svelte');
+        }
+        return rel;
     }
 
     /** Invert {@link mirrorRelFor}: the original path a mirror-relative entry stands for. */
@@ -1754,10 +2017,15 @@ export class ShadowManager {
         ) {
             this.snapshots.delete(key);
             this.snapshots.set(key, previous);
+            this.recordShadowExtension(
+                key,
+                previous.snapshot.scriptKind === ts.ScriptKind.TS ? '.tsx' : '.jsx'
+            );
             return previous.snapshot;
         }
 
         const snapshot = DocumentSnapshot.fromDocument(document, options) as SvelteDocumentSnapshot;
+        this.recordShadowExtension(key, snapshot.scriptKind === ts.ScriptKind.TS ? '.tsx' : '.jsx');
         this.snapshots.set(key, { sourceText: text, transformIdentity, snapshot });
         this.evictNavigationSnapshots();
         return snapshot;
@@ -1796,6 +2064,7 @@ export class ShadowManager {
 
     /** Forget graph/config-derived state before rebuilding this manager's overlay. */
     invalidateStructuralCaches() {
+        this.restoredBatchGraphPlan = undefined;
         this.projectSvelteFileScan = undefined;
         this.dependencySvelteFileScan = undefined;
         this.dependencyScope = undefined;
@@ -1807,6 +2076,7 @@ export class ShadowManager {
         this.baseConfigDiagnostics = [];
         this.reachabilityCache = undefined;
         this.batchConfigInputs.clear();
+        this.batchConfigProofs.clear();
         this.batchRestoredSourceInputs.clear();
         this.projectReachabilityFallbackReasons = [];
         this.batchReachableSourceFiles = [];
@@ -1818,6 +2088,8 @@ export class ShadowManager {
         this.batchPackagePrivateSourceEdges.clear();
         this.batchCollisionFallbackReasons = [];
         this.batchReverseClosureSize = 0;
+        this.shadowExtensionByOriginal.clear();
+        this.nativeJavaScriptShadowSources.clear();
         this.fingerprintValidByPackage.clear();
         this.pendingFingerprints.clear();
         this.clearSnapshots();
@@ -2057,7 +2329,12 @@ export class ShadowManager {
                 }
                 const rel = normalized.slice(mirror.length + 1);
                 const exactOriginal = this.originalForMirrorRel(mirror, rel);
-                let componentRel = rel.endsWith('.tsx') ? rel.slice(0, -'.tsx'.length) : rel;
+                const shadowExtension = rel.endsWith('.tsx')
+                    ? '.tsx'
+                    : rel.endsWith('.jsx')
+                      ? '.jsx'
+                      : undefined;
+                let componentRel = shadowExtension ? rel.slice(0, -shadowExtension.length) : rel;
                 for (const suffix of new Set(this.batchSvelteSpecifierSuffixes.values())) {
                     if (componentRel.endsWith(suffix)) {
                         componentRel = `${componentRel.slice(0, -suffix.length)}.svelte`;
@@ -2121,11 +2398,11 @@ export class ShadowManager {
     /**
      * Write the overlay tsconfig. It extends the user's config so their compilerOptions, paths
      * and lib settings all apply, then adds exactly what the shadow scheme needs:
-     * `rootDirs` to bridge `src/Foo.svelte` to `<overlay>/svelte/src/Foo.svelte.tsx`, and
-     * `allowArbitraryExtensions` so the `.svelte.tsx` twin is a legal resolution target.
+     * `rootDirs` to bridge `src/Foo.svelte` to its `<overlay>/svelte/src/Foo.svelte.[jt]sx`
+     * twin, and `allowArbitraryExtensions` so that twin is a legal resolution target.
      *
      * Note there is deliberately no `.d.ts` re-export shim: over LSP, rootDirs plus
-     * allowArbitraryExtensions resolve `./Foo.svelte` straight to the `.tsx`.
+     * allowArbitraryExtensions resolve `./Foo.svelte` straight to the generated JSX/TSX.
      */
     writeOverlayTsconfig(fallbackShims: string[] = []) {
         fs.mkdirSync(this.overlayPath, { recursive: true });
@@ -2172,15 +2449,24 @@ export class ShadowManager {
                       return fileIsInside && !configIsInside;
                   })
                   .map((file) => this.getShadowPath(file));
+        const projectSources = new Set(this.projectSvelteFiles);
+        const nativeJavaScriptShadowFiles = [...this.nativeJavaScriptShadowSources]
+            // Dependency indexing can conservatively scan every raw component exported by a
+            // package. Root only configured/reachability-proven members; otherwise JS inclusion
+            // would recreate the broad-root bug and report unrelated dependency diagnostics.
+            .filter((file) => projectSources.has(file))
+            .map((file) => this.getShadowPath(file));
 
         const config: any = {
             compilerOptions: {
                 allowArbitraryExtensions: true,
                 allowImportingTsExtensions: true,
+                // JS Svelte output is deliberately `.jsx`: parsing its JSDoc as `.tsx` erases
+                // prop types at the native boundary. Explicit JS roots require allowJs.
+                allowJs: true,
                 noEmit: true,
-                // The shadows are .tsx, so JSX has to be on or every `.svelte` import reports
-                // TS6142 ("resolved to a .tsx file, but --jsx is not set"). `preserve` is what
-                // the JS engine's snapshots are checked under too.
+                // JSX has to be on or every generated component import reports TS6142.
+                // `preserve` is what the JS engine's snapshots are checked under too.
                 jsx: 'preserve',
                 rootDirs: this.overlayRootDirs(base)
             },
@@ -2191,7 +2477,14 @@ export class ShadowManager {
             // and workspace deps do not resolve. On one such package that turned 18 real errors into
             // 1277. Shadows for other packages still resolve when imported, because they exist
             // on disk and rootDirs bridges to them; they just are not roots.
-            files: unique([...base.fileNames, ...inferredShadowFiles, ...shimFiles]),
+            // Native preview resolves an imported `.svelte.jsx` but currently omits it from the
+            // program unless it is also a root. That erases its JSDoc props at every importer.
+            files: unique([
+                ...base.fileNames,
+                ...inferredShadowFiles,
+                ...nativeJavaScriptShadowFiles,
+                ...shimFiles
+            ]),
             // A child config inherits the base's `include` even when it declares `files`; the two
             // root sets are additive. Once ordinary sources are mirrored, inheriting `include`
             // would pull their real twins back into the same native program and reintroduce the
@@ -2242,7 +2535,7 @@ export class ShadowManager {
      * *longest* rootDir containing the importing file, so every base entry needs a twin inside
      * the mirror — `<mirror of B's package>/<B's path from the source root>` — or the base
      * entries' own suffix space is unreachable from a shadow. A route shadow at
-     * `<mirror>/apps/app/src/routes/+page.svelte.tsx` sits in the twin of SvelteKit's `".."`
+     * `<mirror>/apps/app/src/routes/+page.svelte.[jt]sx` sits in the twin of SvelteKit's `".."`
      * with suffix `src/routes/…`, which is exactly what its `./$types` import needs to land in
      * `.svelte-kit/types`. Without the twin the failed import would rebase against the whole
      * mirror instead and never pair with the base entries at all. Base entries come first: a
@@ -2300,8 +2593,13 @@ export class ShadowManager {
                 continue;
             }
             const mirror = this.mirrorRootIn(canonicalPackageRoot);
+            const mirroredPackageRoot = join(mirror, rel);
+            // The first materialisation has not written the nested package subtree yet. Create
+            // this root before realpathing it so cold and warm processes emit the same lexical +
+            // physical rootDirs set instead of adding another realpath only after shadows exist.
+            this.ensureMirror(mirroredPackageRoot);
             addRootDir(realPackageRoot);
-            addRootDir(join(mirror, rel));
+            addRootDir(mirroredPackageRoot);
         }
         return [...dirs];
     }
@@ -2502,6 +2800,7 @@ export class ShadowManager {
                 // anything the project already sets and this does not is untouched.
                 allowArbitraryExtensions: true,
                 allowImportingTsExtensions: true,
+                allowJs: true,
                 jsx: 'preserve',
                 // Replaces rather than merges, hence carrying the project's own entries through.
                 rootDirs: this.overlayRootDirs(base),
@@ -2702,9 +3001,11 @@ export class ShadowManager {
         }
         try {
             this.batchConfigInputs.clear();
+            this.batchConfigProofs.clear();
             this.batchRestoredSourceInputs.clear();
             const parseManifestInputs = new Set<string>();
             const parseDirectoryRoots = new Set<string>();
+            const parseDirectoryProofs = new Map<string, BatchGraphDirectoryProof>();
             const readConfigInput = (fileName: string) => {
                 const normalized = normalizePath(fileName);
                 if (basename(normalized).toLowerCase() === 'package.json') {
@@ -2712,7 +3013,39 @@ export class ShadowManager {
                 } else {
                     this.batchConfigInputs.add(normalized);
                 }
-                return ts.sys.readFile(fileName);
+                let before: string | null | undefined;
+                try {
+                    before = materialisationPlanExactFileProof(
+                        normalized,
+                        basename(normalized).toLowerCase() === 'package.json'
+                            ? 'manifest'
+                            : 'config'
+                    );
+                } catch {
+                    // Missing evidence makes the plan ineligible.
+                }
+                const contents = ts.sys.readFile(fileName);
+                try {
+                    const kind =
+                        basename(normalized).toLowerCase() === 'package.json'
+                            ? 'manifest'
+                            : 'config';
+                    const after = materialisationPlanExactFileProof(normalized, kind);
+                    if (before === after && before !== undefined) {
+                        if (kind === 'manifest') {
+                            sharedPackageManifestProofs.set(normalized, before);
+                        } else {
+                            this.batchConfigProofs.set(exactInputProofKey(kind, normalized), {
+                                kind,
+                                path: normalized,
+                                proof: before
+                            });
+                        }
+                    }
+                } catch {
+                    // Missing evidence makes the plan ineligible.
+                }
+                return contents;
             };
             const read = ts.readConfigFile(tsconfigPath, readConfigInput);
             if (read.error || !read.config) {
@@ -2731,7 +3064,21 @@ export class ShadowManager {
                     // Surface .svelte files so their *shadows* can stand in for them below;
                     // tsgo itself cannot parse a .svelte file.
                     readDirectory: (rootDir, extensions, excludes, includes, depth) => {
-                        parseDirectoryRoots.add(normalizePath(rootDir));
+                        const root = normalizePath(rootDir);
+                        parseDirectoryRoots.add(root);
+                        if (!parseDirectoryProofs.has(root)) {
+                            try {
+                                const proof = batchGraphDirectoryMembership({
+                                    path: root,
+                                    validator: BATCH_GRAPH_DIRECTORY_VALIDATOR
+                                });
+                                if (proof) {
+                                    parseDirectoryProofs.set(root, { path: root, ...proof });
+                                }
+                            } catch {
+                                // Missing evidence makes the plan ineligible.
+                            }
+                        }
                         return ts.sys.readDirectory(
                             rootDir,
                             [...(extensions ?? []), '.svelte'],
@@ -2771,7 +3118,11 @@ export class ShadowManager {
                 this.reachabilityCache.manifestInputs.add(manifest);
             }
             for (const directoryRoot of parseDirectoryRoots) {
-                this.reachabilityCache.directoryRoots.add(directoryRoot);
+                const proof = parseDirectoryProofs.get(directoryRoot);
+                if (proof) {
+                    this.reachabilityCache.directoryProofs.set(directoryRoot, proof);
+                }
+                this.reachabilityCache.directoryRoots.restore(directoryRoot);
             }
             const reachable = collectReachableProjectSvelteFiles(
                 parsed.fileNames,
@@ -2792,6 +3143,16 @@ export class ShadowManager {
                 file.endsWith('.svelte')
             );
             const reachableShadowSources = reachable.files.filter(needsSvelteShadow);
+            if (!reachable.complete) {
+                this.reachabilityCache.directoryRoots.add(this.sourceRoot);
+            }
+            this.projectSvelteFileScan = !reachable.complete
+                ? unique(
+                      scanWorkspaceSvelteFiles(this.sourceRoot)
+                          .filter(needsSvelteShadow)
+                          .map((file) => this.canonicalSourcePath(file))
+                  )
+                : undefined;
             this.projectSvelteFiles = unique(
                 [
                     // Explicit/configured roots remain independently checkable Svelte sources
@@ -2801,9 +3162,7 @@ export class ShadowManager {
                     // but the declaration is TypeScript's authoritative program member. Do not
                     // promote an imported (or explicitly excluded) raw sibling into the checker.
                     ...reachableShadowSources,
-                    ...(!reachable.complete
-                        ? scanWorkspaceSvelteFiles(this.sourceRoot).filter(needsSvelteShadow)
-                        : [])
+                    ...(this.projectSvelteFileScan ?? [])
                 ].map((file) => this.canonicalSourcePath(file))
             );
             if (!reachable.complete) {
@@ -2885,36 +3244,111 @@ export class ShadowManager {
             this.parseBaseConfig();
         }
         const dependencyRoots = this.dependencyRoots();
-        for (const packageRoot of dependencyRoots) {
-            this.reachabilityCache?.directoryRoots.add(normalizePath(packageRoot));
-        }
+        const dependencyScope = this.dependencyScope!;
+        const sourceRoot = normalizePath(this.sourceRoot);
+        const workspacePackageRoot = (packageRoot: string) =>
+            workspaceOwnedPackagePath(packageRoot, sourceRoot);
+        const isWorkspacePackage = (packageRoot: string) => !!workspacePackageRoot(packageRoot);
+        const sourceGraphIdentity = contentStamp(
+            JSON.stringify(
+                [...(this.reachabilityCache?.sourceSignatures ?? [])]
+                    .filter(([file]) =>
+                        dependencyRoots.some(
+                            (root) => file === root || file.startsWith(normalizePath(root) + '/')
+                        )
+                    )
+                    .sort(([left], [right]) => left.localeCompare(right))
+            )
+        );
         const cacheKey = `${normalizePath(this.packageRoot)}\0${this.dependencyScope!.mode}\0${dependencyRoots
             .slice()
             .sort()
-            .join('\0')}`;
+            .join('\0')}\0${sourceGraphIdentity}`;
         const cached = sharedDependencySvelteFiles.get(cacheKey);
-        if (cached) {
+        const currentDirectoryProofs = new Map<string, BatchGraphDirectoryProof>();
+        const scannedSvelteFilesByRoot = new Map<string, string[]>();
+        const proofRoots = new Set<string>();
+        const directoryBudget = createBatchGraphDirectoryMembershipBudget({
+            maxEntries: 500_000,
+            maxDurationMs: 3_000
+        });
+        for (const packageRoot of dependencyRoots) {
+            const path = normalizePath(packageRoot);
+            if (isWorkspacePackage(path)) {
+                if (dependencyScope.mode === 'declared-fallback') {
+                    proofRoots.add(workspacePackageRoot(path)!);
+                }
+                continue;
+            }
+            const manifest = readPackageManifest(path);
+            const scanMode = sharedDependencyScanMode.get(path);
+            const recursivelyScanned =
+                dependencyScope.mode === 'declared-fallback' ||
+                scanMode === 'broad' ||
+                scanMode === undefined ||
+                (scanMode === 'direct' && manifest?.exports === undefined);
+            if (recursivelyScanned || this.reachabilityCache?.directoryRoots.has(path)) {
+                proofRoots.add(path);
+            }
+        }
+        for (const path of proofRoots) {
+            const scannedSvelteFiles: string[] = [];
+            const proof = this.reachabilityCache?.directoryRoots.refresh(
+                path,
+                directoryBudget,
+                scannedSvelteFiles
+            );
+            if (proof) {
+                const current = proof;
+                currentDirectoryProofs.set(path, current);
+                scannedSvelteFilesByRoot.set(path, scannedSvelteFiles);
+            }
+        }
+        const cachedProofs = new Map(cached?.directoryProofs.map((proof) => [proof.path, proof]));
+        const cachedIsCurrent =
+            !!cached &&
+            [...proofRoots].every((path) => {
+                const current = currentDirectoryProofs.get(path);
+                const previous = cachedProofs.get(path);
+                return (
+                    !!current &&
+                    !!previous &&
+                    current.stamp === previous.stamp &&
+                    current.entryCount === previous.entryCount
+                );
+            });
+        if (cached && cachedIsCurrent) {
+            for (const proof of cached.directoryProofs) {
+                this.reachabilityCache?.directoryProofs.set(proof.path, proof);
+            }
             this.dependencySvelteFileScan = unique(
-                cached.map((file) => this.canonicalSourcePath(file))
+                cached.files.map((file) => this.canonicalSourcePath(file))
             );
             return this.dependencySvelteFileScan;
         }
+        if (cached) {
+            sharedDependencySvelteFiles.delete(cacheKey);
+        }
 
         const found = new Set<string>();
-        const sourceRoot = normalizePath(this.sourceRoot);
         let workspaceFiles: string[] | undefined;
         for (const packageRoot of dependencyRoots) {
             // Linked workspace packages are already covered by the one registry-shared workspace
             // scan. Walking their trees again was the dominant dependency-index cost in large
             // monorepos (and, in Reintersect, revisited hundreds of component files per manager).
-            if (
-                (packageRoot === sourceRoot || packageRoot.startsWith(sourceRoot + '/')) &&
-                !packageRoot.includes('/node_modules/')
-            ) {
-                workspaceFiles ??= this.findProjectSvelteFiles();
+            if (isWorkspacePackage(packageRoot)) {
+                const authoredPackageRoot = workspacePackageRoot(packageRoot)!;
+                workspaceFiles ??= unique(
+                    (
+                        scannedSvelteFilesByRoot.get(sourceRoot) ??
+                        this.options.workspaceSvelteFiles?.() ??
+                        scanWorkspaceSvelteFiles(sourceRoot)
+                    ).map((file) => this.canonicalSourcePath(file))
+                );
                 for (const file of workspaceFiles) {
                     if (
-                        (file === packageRoot || file.startsWith(packageRoot + '/')) &&
+                        (file === authoredPackageRoot ||
+                            file.startsWith(authoredPackageRoot + '/')) &&
                         needsSvelteShadow(file)
                     ) {
                         found.add(this.canonicalSourcePath(file));
@@ -2922,12 +3356,19 @@ export class ShadowManager {
                 }
                 continue;
             }
-            for (const file of scanDependencySvelteFiles(packageRoot)) {
+            for (const file of scanDependencySvelteFiles(
+                packageRoot,
+                currentDirectoryProofs.get(normalizePath(packageRoot)),
+                scannedSvelteFilesByRoot.get(normalizePath(packageRoot))
+            )) {
                 found.add(this.canonicalSourcePath(file));
             }
         }
         const result = [...found];
-        sharedDependencySvelteFiles.set(cacheKey, result);
+        sharedDependencySvelteFiles.set(cacheKey, {
+            files: result,
+            directoryProofs: [...currentDirectoryProofs.values()]
+        });
         this.dependencySvelteFileScan = result;
         return result;
     }
@@ -2938,6 +3379,16 @@ export class ShadowManager {
             return this.dependencyScope.roots;
         }
 
+        // A failed narrow dependency proof is discarded in favour of the authoritative declared
+        // closure below. Preserve exactly the project-source evidence which existed before that
+        // speculative walk so thousands of public-entry probes from the abandoned graph do not
+        // make every persisted fallback plan validate irrelevant files forever.
+        const projectEvidence = this.reachabilityCache
+            ? cloneReachabilityCacheAtCurrentEvidence(
+                  this.reachabilityCache,
+                  this.batchCompilerOptions
+              )
+            : undefined;
         const fallbackReasons = new Set<string>();
         const directRoots = new Set<string>();
         if (!this.options.tsconfigPath || !this.projectConfigParsed) {
@@ -3001,24 +3452,37 @@ export class ShadowManager {
                     mode: 'reachable',
                     roots: reachable.roots,
                     directImports: directRoots.size,
-                    fallbackReasons: []
+                    fallbackReasons: [],
+                    declaredRoot: null,
+                    closureComplete: true
                 };
                 return this.dependencyScope.roots;
             }
         }
 
-        const roots = collectDependencyRoots(this.packageRoot, this.reachabilityCache);
+        if (projectEvidence) {
+            this.reachabilityCache = projectEvidence;
+        }
+        const declared = collectDependencyRoots(
+            this.packageRoot,
+            this.batchCompilerOptions,
+            this.batchConfigDirectory,
+            this.sourceRoot,
+            this.reachabilityCache
+        );
         // Proof failed, so package exports are no longer a trustworthy reachability boundary.
         // Scan the declared closure authoritatively instead of repeating the same narrow public
         // walk that produced the ambiguity.
-        for (const root of roots) {
+        for (const root of declared.roots) {
             markDependencyScanMode(root, 'broad');
         }
         this.dependencyScope = {
             mode: 'declared-fallback',
-            roots,
+            roots: declared.roots,
             directImports: directRoots.size,
-            fallbackReasons: [...fallbackReasons]
+            fallbackReasons: [...fallbackReasons, ...declared.fallbackReasons],
+            declaredRoot: normalizePath(this.packageRoot),
+            closureComplete: declared.complete
         };
         return this.dependencyScope.roots;
     }
@@ -3053,6 +3517,14 @@ export class ShadowManager {
     /** User-config diagnostics which an overlay's replacement `files` list can otherwise mask. */
     getBaseConfigDiagnostics(): readonly ts.Diagnostic[] {
         return this.baseConfigDiagnostics;
+    }
+
+    /** Whether TypeScript read this JSON file as part of the root/extended config graph. */
+    isBaseConfigInput(filePath: string): boolean {
+        if (this.options.tsconfigPath && !this.projectConfigParsed) {
+            this.parseBaseConfig();
+        }
+        return this.batchConfigInputs.has(normalizePath(filePath));
     }
 
     /** The kit shadow standing in for a generated path, if that path is one. */
@@ -3209,12 +3681,123 @@ export function scanWorkspaceSvelteFiles(sourceRoot: string): string[] {
 
 const MAX_REACHABLE_SOURCE_FILES = 10_000;
 
+function exactInputProofKey(kind: MaterialisationPlanExactFileKind, filePath: string): string {
+    return `${kind}\0${normalizePath(filePath)}`;
+}
+
+function recordExactInputProof(
+    proofs: Map<string, BatchGraphExactInputProof>,
+    kind: MaterialisationPlanExactFileKind,
+    filePath: string
+): void {
+    const path = normalizePath(filePath);
+    const key = exactInputProofKey(kind, path);
+    if (proofs.has(key)) {
+        return;
+    }
+    try {
+        proofs.set(key, { kind, path, proof: materialisationPlanExactFileProof(path, kind) });
+    } catch {
+        // Missing evidence makes the plan ineligible; the current uncached run remains valid.
+    }
+}
+
+class ExactInputEvidenceSet extends Set<string> {
+    constructor(
+        private readonly kind: MaterialisationPlanExactFileKind,
+        private readonly proofs: Map<string, BatchGraphExactInputProof>
+    ) {
+        super();
+    }
+
+    override add(filePath: string): this {
+        const normalized = normalizePath(filePath);
+        if (!this.has(normalized)) {
+            // A failed first capture is a monotonic provenance failure for this graph generation.
+            // Retrying later could pair facts consumed at A with a proof captured at B.
+            recordExactInputProof(this.proofs, this.kind, normalized);
+        }
+        return super.add(normalized);
+    }
+
+    /** Replay evidence captured by the shared graph; never synthesize a later provenance proof. */
+    restore(filePath: string): this {
+        return super.add(normalizePath(filePath));
+    }
+}
+
+class DirectoryEvidenceSet extends Set<string> {
+    constructor(private readonly proofs: Map<string, BatchGraphDirectoryProof>) {
+        super();
+    }
+
+    override add(directory: string): this {
+        const path = normalizePath(directory);
+        if (!this.has(path)) {
+            try {
+                const proof = batchGraphDirectoryMembership({
+                    path,
+                    validator: BATCH_GRAPH_DIRECTORY_VALIDATOR
+                });
+                if (proof) {
+                    this.proofs.set(path, { path, ...proof });
+                }
+            } catch {
+                // Missing evidence makes the plan ineligible; discovery still proceeds normally.
+            }
+        }
+        return super.add(path);
+    }
+
+    /** Replay a shared proof without replacing it with a later filesystem observation. */
+    restore(directory: string): this {
+        return super.add(normalizePath(directory));
+    }
+
+    /** Replace a restored proof with a current one exactly once before reusing a shared scan. */
+    refresh(
+        directory: string,
+        budget: ReturnType<typeof createBatchGraphDirectoryMembershipBudget>,
+        svelteFiles?: string[]
+    ): BatchGraphDirectoryProof | undefined {
+        const path = normalizePath(directory);
+        const hadInput = this.has(path);
+        const previous = this.proofs.get(path);
+        super.add(path);
+        try {
+            const proof = batchGraphDirectoryMembership({
+                path,
+                validator: BATCH_GRAPH_DIRECTORY_VALIDATOR,
+                budget,
+                svelteFiles
+            });
+            if (proof) {
+                const captured = { path, ...proof };
+                if (
+                    !hadInput ||
+                    (previous &&
+                        previous.stamp === captured.stamp &&
+                        previous.entryCount === captured.entryCount)
+                ) {
+                    this.proofs.set(path, captured);
+                }
+                return captured;
+            }
+        } catch {
+            // The uncached directory scan remains authoritative.
+        }
+        return undefined;
+    }
+}
+
 function createReachabilityCache(
     compilerOptions: ts.CompilerOptions,
     configDirectory: string
 ): ReachabilityCache {
     const normalizedConfigDirectory = normalizePath(configDirectory);
-    const manifestInputs = new Set<string>();
+    const exactInputProofs = new Map<string, BatchGraphExactInputProof>();
+    const directoryProofs = new Map<string, BatchGraphDirectoryProof>();
+    const manifestInputs = new ExactInputEvidenceSet('manifest', exactInputProofs);
     const trackManifest = (fileName: string) => {
         if (basename(fileName).toLowerCase() === 'package.json') {
             manifestInputs.add(normalizePath(fileName));
@@ -3256,9 +3839,37 @@ function createReachabilityCache(
         resolutions: new Map(),
         packageRoots: new Map(),
         manifestInputs,
-        layoutInputs: new Set(),
-        directoryRoots: new Set()
+        layoutInputs: new ExactInputEvidenceSet('layout', exactInputProofs),
+        directoryRoots: new DirectoryEvidenceSet(directoryProofs),
+        exactInputProofs,
+        directoryProofs
     };
+}
+
+/** Fork only the evidence accumulated so far, with fresh TypeScript resolution caches. */
+function cloneReachabilityCacheAtCurrentEvidence(
+    cache: ReachabilityCache,
+    compilerOptions: ts.CompilerOptions
+): ReachabilityCache {
+    const clone = createReachabilityCache(compilerOptions, cache.configDirectory);
+    clone.sources = new Map(cache.sources);
+    clone.sourceSignatures = new Map(cache.sourceSignatures);
+    for (const input of cache.exactInputProofs.values()) {
+        clone.exactInputProofs.set(exactInputProofKey(input.kind, input.path), input);
+    }
+    for (const input of cache.manifestInputs) {
+        clone.manifestInputs.restore(input);
+    }
+    for (const input of cache.layoutInputs) {
+        clone.layoutInputs.restore(input);
+    }
+    for (const proof of cache.directoryProofs.values()) {
+        clone.directoryProofs.set(proof.path, proof);
+    }
+    for (const root of cache.directoryRoots) {
+        clone.directoryRoots.restore(root);
+    }
+    return clone;
 }
 
 function reachabilityStatKey(fileName: string): string {
@@ -3325,7 +3936,7 @@ function batchGraphSourceSignature(
         /\brequire\s*\(\s*(?!['"`])\S/.test(text) ||
         /\brequire\s*\(\s*`[^`]*\$\{/.test(text) ||
         globs.computed > 0;
-    const publicExports = collectPublicExportEdges('__batch_graph_source.ts', text);
+    const publicExports = collectPublicExportEdges('__batch_graph_source.ts', text, true);
     return sha256(
         JSON.stringify({
             imports: preprocessed.importedFiles.map((entry) => entry.fileName),
@@ -3824,6 +4435,9 @@ function resolveReachableImport(
     }
 
     for (const candidate of candidates) {
+        for (const probe of reachableFileCandidates(candidate)) {
+            cache?.layoutInputs.add(normalizePath(probe));
+        }
         const resolved = resolveReachableFile(candidate);
         if (resolved) {
             return rememberResolved(resolved);
@@ -4385,7 +4999,7 @@ function decodeBatchGraphPlan(
         ) {
             return undefined;
         }
-        if (raw.version !== 1) {
+        if (raw.version !== 3) {
             return undefined;
         }
 
@@ -4460,9 +5074,37 @@ function decodeBatchGraphPlan(
             raw.dependencyScope === null
                 ? null
                 : decodeBatchGraphDependencyScope(raw.dependencyScope);
+        const exactInputProofs = expectArray(raw.exactInputProofs).map((input) => {
+            const entry = expectRecord(input);
+            if (
+                entry.kind !== 'config' &&
+                entry.kind !== 'manifest' &&
+                entry.kind !== 'lockfile' &&
+                entry.kind !== 'layout'
+            ) {
+                throw new Error('invalid exact input proof kind');
+            }
+            const kind = entry.kind as MaterialisationPlanExactFileKind;
+            return {
+                kind,
+                path: expectAbsolutePath(entry.path),
+                proof: entry.proof === null ? null : expectNonEmptyString(entry.proof)
+            };
+        });
+        const directoryProofs = expectArray(raw.directoryProofs).map((input) => {
+            const entry = expectRecord(input);
+            if (!Number.isSafeInteger(entry.entryCount) || (entry.entryCount as number) < 0) {
+                throw new Error('invalid directory proof count');
+            }
+            return {
+                path: expectAbsolutePath(entry.path),
+                stamp: expectNonEmptyString(entry.stamp),
+                entryCount: entry.entryCount as number
+            };
+        });
 
         return {
-            version: 1,
+            version: 3,
             signature,
             project,
             parsedBaseConfig,
@@ -4497,7 +5139,9 @@ function decodeBatchGraphPlan(
             configInputs: expectPathArray(raw.configInputs),
             manifestInputs: expectPathArray(raw.manifestInputs),
             layoutInputs: expectPathArray(raw.layoutInputs),
-            directoryRoots: expectPathArray(raw.directoryRoots)
+            directoryRoots: expectPathArray(raw.directoryRoots),
+            exactInputProofs,
+            directoryProofs
         };
     } catch {
         return undefined;
@@ -4512,11 +5156,21 @@ function decodeBatchGraphDependencyScope(value: unknown): BatchGraphDependencySc
     if (!Number.isSafeInteger(raw.directImports) || (raw.directImports as number) < 0) {
         throw new Error('invalid dependency import count');
     }
+    const declaredRoot = raw.declaredRoot === null ? null : expectAbsolutePath(raw.declaredRoot);
+    const closureComplete = expectBoolean(raw.closureComplete);
+    if (
+        (raw.mode === 'reachable' && (declaredRoot !== null || !closureComplete)) ||
+        (raw.mode === 'declared-fallback' && declaredRoot === null)
+    ) {
+        throw new Error('invalid dependency closure proof');
+    }
     return {
         mode: raw.mode,
         roots: expectPathArray(raw.roots),
         directImports: raw.directImports as number,
-        fallbackReasons: expectStringArray(raw.fallbackReasons)
+        fallbackReasons: expectStringArray(raw.fallbackReasons),
+        declaredRoot,
+        closureComplete
     };
 }
 
@@ -4819,12 +5473,45 @@ function readPackageManifest(packageRoot: string): any | undefined {
     if (sharedPackageManifests.has(key)) {
         return sharedPackageManifests.get(key) ?? undefined;
     }
+    const manifestPath = normalizePath(join(key, 'package.json'));
+    let before: string | null | undefined;
     try {
-        const manifest = JSON.parse(fs.readFileSync(join(key, 'package.json'), 'utf8'));
-        sharedPackageManifests.set(key, manifest);
+        before = materialisationPlanExactFileProof(manifestPath, 'manifest');
+        const contents = fs.readFileSync(manifestPath, 'utf8');
+        const after = materialisationPlanExactFileProof(manifestPath, 'manifest');
+        if (before === after) {
+            sharedPackageManifestProofs.set(manifestPath, before);
+        } else {
+            sharedPackageManifestProofs.delete(manifestPath);
+            sharedUnstablePackageManifestProofs.add(manifestPath);
+        }
+        const manifest = JSON.parse(contents);
+        // An unstable read remains usable for this uncached discovery, but must not seed another
+        // manager or acquire a later proof for bytes it may not have parsed.
+        if (before === after) {
+            sharedPackageManifests.set(key, manifest);
+        }
         return manifest;
     } catch {
-        sharedPackageManifests.set(key, null);
+        try {
+            const after = materialisationPlanExactFileProof(manifestPath, 'manifest');
+            if (before !== undefined && before === after) {
+                sharedPackageManifestProofs.set(manifestPath, after);
+            } else if (before === undefined && after === null) {
+                // The initial proof itself failed, but an absent path is authoritative only after
+                // a read also failed and the final observation confirms absence.
+                sharedPackageManifestProofs.set(manifestPath, null);
+            } else {
+                sharedPackageManifestProofs.delete(manifestPath);
+                sharedUnstablePackageManifestProofs.add(manifestPath);
+            }
+        } catch {
+            sharedPackageManifestProofs.delete(manifestPath);
+            sharedUnstablePackageManifestProofs.add(manifestPath);
+        }
+        if (!sharedUnstablePackageManifestProofs.has(manifestPath)) {
+            sharedPackageManifests.set(key, null);
+        }
         return undefined;
     }
 }
@@ -4838,7 +5525,11 @@ function resolveDependencyRoot(
     const readTrackedManifest = (packageRoot: string) => {
         const normalized = normalizePath(packageRoot);
         cache?.manifestInputs.add(normalizePath(join(normalized, 'package.json')));
-        cache?.layoutInputs.add(normalized);
+        // The manifest input captures presence, bytes and the resolved target of every package
+        // probe, including through an intermediate pnpm/workspace symlink. Recording the package
+        // directory as a second exact input duplicates tens of thousands of absent resolution
+        // probes without proving any additional resolution state; admitted roots are tracked by
+        // the closure's own layout and recursive membership evidence below.
         return readPackageManifest(normalized);
     };
     // The node_modules path is dramatically cheaper than two failed `require.resolve` calls for
@@ -4897,21 +5588,25 @@ function publicPackageEntryFiles(
 ): { files: string[]; fallbackReasons: string[] } {
     const publicEntries = relevantPublicEntryTargets(manifest?.exports);
     const publicGraphEntries = preferredPublicGraphTargets(manifest?.exports);
-    const targets = unique([
+    const manifestTypeTargets = [
         ...(typeof manifest?.types === 'string' ? [manifest.types] : []),
-        ...(typeof manifest?.typings === 'string' ? [manifest.typings] : []),
+        ...(typeof manifest?.typings === 'string' ? [manifest.typings] : [])
+    ];
+    const legacyRuntimeTargets =
+        manifest?.exports === undefined && manifestTypeTargets.length === 0
+            ? [
+                  ...(typeof manifest?.main === 'string' ? [manifest.main] : []),
+                  ...(typeof manifest?.module === 'string' ? [manifest.module] : []),
+                  ...(typeof manifest?.browser === 'string' ? [manifest.browser] : []),
+                  './index.d.ts',
+                  './index.js'
+              ]
+            : [];
+    const targets = unique([
+        ...manifestTypeTargets,
         ...(typeof manifest?.svelte === 'string' ? [manifest.svelte] : []),
-        ...(manifest?.exports === undefined && typeof manifest?.main === 'string'
-            ? [manifest.main]
-            : []),
-        ...(manifest?.exports === undefined && typeof manifest?.module === 'string'
-            ? [manifest.module]
-            : []),
-        ...(manifest?.exports === undefined && typeof manifest?.browser === 'string'
-            ? [manifest.browser]
-            : []),
         ...publicGraphEntries.targets,
-        ...(manifest?.exports === undefined ? ['./index.d.ts', './index.js'] : [])
+        ...legacyRuntimeTargets
     ]).map(normalizeExportTarget);
     const files = new Set<string>();
     const fallbackReasons = new Set<string>();
@@ -4941,23 +5636,47 @@ function publicPackageEntryFiles(
         }
 
         const absolute = normalizePath(join(packageRoot, target));
-        const candidates = unique([
-            absolute,
-            ...declarationCandidates(absolute),
-            ...(/\.(?:js|mjs|cjs)$/.test(absolute)
-                ? declarationCandidates(absolute.replace(/\.(?:js|mjs|cjs)$/, ''))
-                : [])
-        ]);
-        for (const candidate of candidates) {
-            if (
-                fs.statSync(candidate, { throwIfNoEntry: false })?.isFile() &&
-                (SCRIPT_SOURCE_RE.test(candidate) || candidate.endsWith('.svelte'))
-            ) {
-                files.add(candidate);
-            }
+        for (const candidate of authoritativePublicTargetFiles(absolute, cache)) {
+            files.add(candidate);
         }
     }
     return { files: [...files], fallbackReasons: [...fallbackReasons] };
+}
+
+/**
+ * Files TypeScript can use for one public target, preferring declarations over its runtime body.
+ *
+ * A package export commonly points at a large generated JavaScript bundle while TypeScript
+ * resolves the adjacent declaration through extension substitution. Parsing both made an
+ * irrelevant peer look ambiguous whenever the runtime bundle used a computed export helper.
+ * Track every probe so a later declaration create/delete invalidates the graph, but inspect the
+ * runtime file only when no declaration is present.
+ */
+function authoritativePublicTargetFiles(
+    absoluteTarget: string,
+    cache?: ReachabilityCache
+): string[] {
+    const candidates = unique([
+        absoluteTarget,
+        ...declarationCandidates(absoluteTarget),
+        ...(/\.(?:js|mjs|cjs)$/.test(absoluteTarget)
+            ? declarationCandidates(absoluteTarget.replace(/\.(?:js|mjs|cjs)$/, ''))
+            : [])
+    ]);
+    const present: string[] = [];
+    for (const candidate of candidates) {
+        // Presence is part of the public surface: creating an adjacent declaration later must
+        // replace the runtime analysis instead of preserving a stale classification.
+        cache?.layoutInputs.add(candidate);
+        if (
+            fs.statSync(candidate, { throwIfNoEntry: false })?.isFile() &&
+            (SCRIPT_SOURCE_RE.test(candidate) || candidate.endsWith('.svelte'))
+        ) {
+            present.push(normalizePath(candidate));
+        }
+    }
+    const declarations = present.filter((candidate) => /\.d\.[cm]?ts$/.test(candidate));
+    return declarations.length ? declarations : present;
 }
 
 function preferredPublicGraphTargets(exportsField: unknown): {
@@ -4982,17 +5701,33 @@ function preferredPublicGraphTargets(exportsField: unknown): {
 }
 
 function preferredConditionalTargets(value: unknown): string[] {
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-        const conditions = value as Record<string, unknown>;
-        const preferred = [...stringTargets(conditions.types), ...stringTargets(conditions.svelte)];
-        if (preferred.length) {
-            return preferred;
-        }
+    if (typeof value === 'string') {
+        return [value];
     }
-    // Without an authoritative types/Svelte branch, the active entry depends on the importing
-    // file's module mode and custom conditions. This package graph is shared across projects, so
-    // conservatively visit every bounded branch instead of silently choosing object key order.
-    return stringTargets(value);
+    if (Array.isArray(value)) {
+        return unique(value.flatMap(preferredConditionalTargets));
+    }
+    if (value && typeof value === 'object') {
+        const conditions = value as Record<string, unknown>;
+        const preferred = [
+            ...preferredConditionalTargets(conditions.types),
+            ...preferredConditionalTargets(conditions.svelte)
+        ];
+        if (preferred.length) {
+            return unique(preferred);
+        }
+        const moduleBranches = ['import', 'require']
+            .filter((condition) => Object.prototype.hasOwnProperty.call(conditions, condition))
+            .flatMap((condition) => preferredConditionalTargets(conditions[condition]));
+        if (moduleBranches.length) {
+            // Every TypeScript source is resolved in either import or require mode. A sibling
+            // `default` runtime target is a JavaScript fallback for consumers which do not set
+            // either condition; it is not an additional TypeScript public surface.
+            return unique(moduleBranches);
+        }
+        return unique(Object.values(conditions).flatMap(preferredConditionalTargets));
+    }
+    return [];
 }
 
 interface PublicExportEdges {
@@ -5011,9 +5746,38 @@ interface PublicExportEdges {
  * implementation imports are still followed separately inside the current package so a public
  * source file can reach its own private Svelte components.
  */
-function collectPublicExportEdges(fileName: string, text: string): PublicExportEdges {
+function collectPublicExportEdges(
+    fileName: string,
+    text: string,
+    includeInferredExportReferences = false
+): PublicExportEdges {
     const specifiers = new Set<string>();
+    if (includeInferredExportReferences) {
+        // Most declaration/package barrels are only a list of direct ESM re-exports. Building a
+        // full TypeScript AST for hundreds of irrelevant peer entrypoints dominated cold editor
+        // startup (tens of seconds in Reintersect). Recognise that closed grammar lexically and
+        // reserve the AST for local indirection, exported inferred values and CommonJS helpers.
+        const directReexport =
+            /\bexport\s+(?:type\s+)?(?:\*\s*(?:as\s+[\w$]+\s*)?|\{[^}]*\})\s+from\s*(['"])([^'"]+)\1/g;
+        let directMatch: RegExpExecArray | null;
+        while ((directMatch = directReexport.exec(text))) {
+            specifiers.add(directMatch[2]!);
+        }
+        const residual = text.replace(directReexport, '');
+        const needsAst =
+            /\bexport\s+(?:default\b|\{[^}]*\}|(?:const|let|var|function|class)\b|declare\s+(?:const|let|var|function|class)\b)/.test(
+                residual
+            ) ||
+            /\b(?:module\s*\.\s*exports|exports\s*(?:\.|\[)|Object\s*\.\s*defineProperty|_+[\w$]*export)/.test(
+                text
+            );
+        if (!needsAst) {
+            return { specifiers: [...specifiers], computed: false };
+        }
+        specifiers.clear();
+    }
     const importedBindings = new Map<string, string>();
+    const localBindings = new Map<string, ts.Node>();
     let computed = false;
     const scriptKind = /\.[cm]?jsx$/i.test(fileName)
         ? ts.ScriptKind.JSX
@@ -5123,14 +5887,29 @@ function collectPublicExportEdges(fileName: string, text: string): PublicExportE
             }
         }
     };
+    // A generated barrel can expose the same helper through hundreds of exported values. Keep
+    // expansion state for the whole source file, not for one export statement, so following local
+    // aliases stays linear while imported bindings are still recorded at every public use.
+    const expandedLocals = new Set<string>();
     const collectReferencedBindings = (node: ts.Node): void => {
-        if (ts.isIdentifier(node)) {
-            const imported = importedBindings.get(node.text);
-            if (imported) {
-                specifiers.add(imported);
+        const visit = (current: ts.Node): void => {
+            if (ts.isIdentifier(current)) {
+                const imported = importedBindings.get(current.text);
+                if (imported) {
+                    specifiers.add(imported);
+                }
+                const local = localBindings.get(current.text);
+                if (local && !expandedLocals.has(current.text)) {
+                    // Keep this binding marked after the recursive visit too. Generated barrels
+                    // reuse helper locals hundreds of times; expanding the same declaration at
+                    // every reference turns an otherwise linear public-surface scan exponential.
+                    expandedLocals.add(current.text);
+                    visit(local);
+                }
             }
-        }
-        ts.forEachChild(node, collectReferencedBindings);
+            ts.forEachChild(current, visit);
+        };
+        visit(node);
     };
     const hasExportModifier = (node: ts.Node): boolean =>
         !!ts
@@ -5206,7 +5985,29 @@ function collectPublicExportEdges(fileName: string, text: string): PublicExportE
                         importedBindings.set(name, imported);
                     }
                 }
+                if (declaration.initializer) {
+                    for (const name of bindingNames(declaration.name)) {
+                        localBindings.set(name, declaration.initializer);
+                    }
+                }
             }
+            continue;
+        }
+        if (
+            (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+            statement.name
+        ) {
+            localBindings.set(statement.name.text, statement);
+            continue;
+        }
+        if (
+            (ts.isInterfaceDeclaration(statement) ||
+                ts.isTypeAliasDeclaration(statement) ||
+                ts.isEnumDeclaration(statement) ||
+                ts.isModuleDeclaration(statement)) &&
+            ts.isIdentifier(statement.name)
+        ) {
+            localBindings.set(statement.name.text, statement);
         }
     }
 
@@ -5221,6 +6022,13 @@ function collectPublicExportEdges(fileName: string, text: string): PublicExportE
                     const imported = importedBindings.get(local);
                     if (imported) {
                         specifiers.add(imported);
+                    } else if (includeInferredExportReferences) {
+                        const declaration = localBindings.get(local);
+                        if (declaration) {
+                            collectReferencedBindings(declaration);
+                        } else if (!statement.isTypeOnly && !element.isTypeOnly) {
+                            computed = true;
+                        }
                     }
                 }
             }
@@ -5233,7 +6041,21 @@ function collectPublicExportEdges(fileName: string, text: string): PublicExportE
         if (ts.isVariableStatement(statement) && hasExportModifier(statement)) {
             for (const declaration of statement.declarationList.declarations) {
                 collectDirectExpression(declaration.initializer);
+                if (includeInferredExportReferences && declaration.initializer) {
+                    // The inferred declaration of an exported factory/value can expose an
+                    // imported component even when it is referenced inside an arrow/function
+                    // body rather than exported as the direct initializer.
+                    collectReferencedBindings(declaration.initializer);
+                }
             }
+            continue;
+        }
+        if (
+            includeInferredExportReferences &&
+            ts.isFunctionDeclaration(statement) &&
+            hasExportModifier(statement)
+        ) {
+            collectReferencedBindings(statement);
             continue;
         }
         if (ts.isClassDeclaration(statement) && hasExportModifier(statement)) {
@@ -5243,6 +6065,9 @@ function collectPublicExportEdges(fileName: string, text: string): PublicExportE
                         collectDirectExpression(type.expression);
                     }
                 }
+            }
+            if (includeInferredExportReferences) {
+                collectReferencedBindings(statement);
             }
             continue;
         }
@@ -5278,6 +6103,7 @@ function collectPublicExportEdges(fileName: string, text: string): PublicExportE
             // narrow graph after ignoring one is unsafe; the declared-dependency fallback is
             // slower but cannot silently omit a component package.
             if (/^_+.*export/i.test(helper)) {
+                collectReferencedBindings(expression);
                 computed = true;
                 continue;
             }
@@ -5286,6 +6112,7 @@ function collectPublicExportEdges(fileName: string, text: string): PublicExportE
             ts.isPropertyAccessExpression(expression.expression) &&
             /^_+.*export/i.test(expression.expression.name.text)
         ) {
+            collectReferencedBindings(expression);
             computed = true;
             continue;
         }
@@ -5592,17 +6419,23 @@ function collectReachableDependencyRoots(
     const cacheKey = `${cache.optionsKey}\0${normalizedDirectRoots.join('\0')}`;
     const cached = sharedReachableDependencyRoots.get(cacheKey);
     if (cached) {
+        for (const input of cached.exactInputProofs) {
+            cache.exactInputProofs.set(exactInputProofKey(input.kind, input.path), input);
+        }
+        for (const proof of cached.directoryProofs) {
+            cache.directoryProofs.set(proof.path, proof);
+        }
         for (const input of cached.sourceInputs) {
             cache.sourceSignatures.set(input.path, input.signature);
         }
         for (const input of cached.manifestInputs) {
-            cache.manifestInputs.add(input);
+            cache.manifestInputs.restore(input);
         }
         for (const input of cached.layoutInputs) {
-            cache.layoutInputs.add(input);
+            cache.layoutInputs.restore(input);
         }
         for (const root of cached.directoryRoots) {
-            cache.directoryRoots.add(root);
+            cache.directoryRoots.restore(root);
         }
         return { roots: cached.roots, fallbackReasons: cached.fallbackReasons };
     }
@@ -5661,52 +6494,172 @@ function collectReachableDependencyRoots(
             .sort((left, right) => left.path.localeCompare(right.path)),
         manifestInputs: sortedUnique(cache.manifestInputs),
         layoutInputs: sortedUnique(cache.layoutInputs),
-        directoryRoots: sortedUnique(cache.directoryRoots)
+        directoryRoots: sortedUnique(cache.directoryRoots),
+        exactInputProofs: [...cache.exactInputProofs.values()],
+        directoryProofs: [...cache.directoryProofs.values()]
     };
     sharedReachableDependencyRoots.set(cacheKey, result);
     return { roots: result.roots, fallbackReasons: result.fallbackReasons };
 }
 
-/** Reachable Svelte-bearing dependency roots, cached across project managers. */
-function collectDependencyRoots(packageRoot: string, cache?: ReachabilityCache): string[] {
+const MAX_DECLARED_DEPENDENCY_ROOTS = 1_000;
+const MAX_DECLARED_PEER_INSPECTIONS = 1_000;
+const MAX_DECLARED_PEER_FORWARD_EDGES = 4_000;
+
+/**
+ * Complete declared dependency closure used after public-source reachability becomes ambiguous.
+ *
+ * Missing optional/peer packages are an authoritative absence: every lexical resolution probe is
+ * retained in the plan and a later installation invalidates it. An unreadable manifest or a
+ * closure which exceeds the deterministic bound is different — the current run can still use
+ * the best-effort broad scan, but that result must never be persisted as a complete graph.
+ */
+function collectDependencyRoots(
+    packageRoot: string,
+    compilerOptions: ts.CompilerOptions = {},
+    configDirectory = packageRoot,
+    sourceRoot = packageRoot,
+    cache?: ReachabilityCache
+): { roots: string[]; complete: boolean; fallbackReasons: string[] } {
     const key = normalizePath(packageRoot);
+    const priorSourceInputs = new Set(cache?.sourceSignatures.keys() ?? []);
+    const priorManifestInputs = new Set(cache?.manifestInputs ?? []);
+    const priorLayoutInputs = new Set(cache?.layoutInputs ?? []);
+    const priorDirectoryRoots = new Set(cache?.directoryRoots ?? []);
     const trackRoot = (root: string) => {
         const normalized = normalizePath(root);
         cache?.manifestInputs.add(normalizePath(join(normalized, 'package.json')));
         cache?.layoutInputs.add(normalized);
-        cache?.directoryRoots.add(normalized);
     };
     trackRoot(key);
-    const cached = sharedDependencyRoots.get(key);
+    const sharedKey = `${key}\0${cache?.optionsKey ?? ''}\0${normalizePath(sourceRoot)}`;
+    const cached = sharedDependencyRoots.get(sharedKey);
     if (cached) {
-        for (const root of cached) {
-            trackRoot(root);
+        for (const input of cached.sourceInputs) {
+            cache?.sourceSignatures.set(input.path, input.signature);
         }
-        return cached;
+        for (const input of cached.exactInputProofs) {
+            cache?.exactInputProofs.set(exactInputProofKey(input.kind, input.path), input);
+        }
+        for (const proof of cached.directoryProofs) {
+            cache?.directoryProofs.set(proof.path, proof);
+        }
+        for (const input of cached.manifestInputs) {
+            cache?.manifestInputs.restore(input);
+        }
+        for (const input of cached.layoutInputs) {
+            cache?.layoutInputs.restore(input);
+        }
+        for (const root of cached.directoryRoots) {
+            cache?.directoryRoots.restore(root);
+        }
+        return {
+            roots: [...cached.roots],
+            complete: cached.complete,
+            fallbackReasons: [...cached.fallbackReasons]
+        };
     }
 
-    const manifest = readPackageManifest(key);
-    if (!manifest) {
-        sharedDependencyRoots.set(key, []);
-        return [];
+    const fallbackReasons = new Set<string>();
+    const rootDependencies = declaredDependencyNames(key, true);
+    for (const reason of rootDependencies.fallbackReasons) {
+        fallbackReasons.add(reason);
     }
-    const names = new Set<string>([
-        ...Object.keys(manifest.dependencies ?? {}),
-        ...Object.keys(manifest.optionalDependencies ?? {}),
-        ...Object.keys(manifest.peerDependencies ?? {}),
-        ...Object.keys(manifest.devDependencies ?? {})
-    ]);
     const roots: string[] = [];
     const seen = new Set<string>([key]);
-    const queue: string[] = [];
-    for (const name of names) {
-        const root = resolveDependencyRoot(name, key, cache);
-        if (!root || seen.has(root)) {
-            continue;
+    const irrelevantPeerRoots = new Set<string>();
+    const inspectedPeerRoots = new Set<string>();
+    const peerClassificationsByRealRoot = new Map<
+        string,
+        { includeRoot: boolean; forwardedPackageNames: string[]; ambiguous: boolean }
+    >();
+    const fullyQueuedRoots = new Set<string>();
+    const queue: Array<{ root: string; peerDerived: boolean }> = [];
+    const pendingPeerEdges: Array<{ name: string; fromRoot: string }> = [];
+    let peerEdgeCursor = 0;
+    let truncated = false;
+    const enqueuePeerEdge = (name: string, fromRoot: string) => {
+        if (pendingPeerEdges.length >= MAX_DECLARED_PEER_FORWARD_EDGES) {
+            truncated = true;
+            return;
+        }
+        pendingPeerEdges.push({ name, fromRoot });
+    };
+    const enqueue = (name: string, fromRoot: string, peerOnly: boolean) => {
+        if (roots.length >= MAX_DECLARED_DEPENDENCY_ROOTS) {
+            truncated = true;
+            return;
+        }
+        const root = resolveDependencyRoot(name, fromRoot, cache);
+        if (!root) {
+            return;
+        }
+        if (seen.has(root)) {
+            if (!peerOnly && !fullyQueuedRoots.has(root)) {
+                fullyQueuedRoots.add(root);
+                queue.push({ root, peerDerived: false });
+            }
+            return;
+        }
+        if (peerOnly && irrelevantPeerRoots.has(root)) {
+            return;
+        }
+        const dependencyManifest = readPackageManifest(root);
+        const likelySveltePeer = isLikelySveltePackage(dependencyManifest);
+        if (
+            peerOnly &&
+            !likelySveltePeer &&
+            !peerRootSurfaceNeedsInspection(
+                root,
+                dependencyManifest,
+                compilerOptions,
+                configDirectory,
+                sourceRoot,
+                cache
+            )
+        ) {
+            irrelevantPeerRoots.add(root);
+            return;
+        }
+        if (peerOnly && !inspectedPeerRoots.has(root)) {
+            if (inspectedPeerRoots.size >= MAX_DECLARED_PEER_INSPECTIONS) {
+                truncated = true;
+                return;
+            }
+            inspectedPeerRoots.add(root);
+            const realPeerRoot = realPathOrSelf(root);
+            let peer = peerClassificationsByRealRoot.get(realPeerRoot);
+            if (!peer) {
+                peer = classifyPeerPublicSvelteSurface(
+                    root,
+                    dependencyManifest,
+                    compilerOptions,
+                    configDirectory,
+                    sourceRoot,
+                    cache
+                );
+                peer.includeRoot ||= likelySveltePeer;
+                peerClassificationsByRealRoot.set(realPeerRoot, peer);
+            }
+            if (!peer.includeRoot) {
+                irrelevantPeerRoots.add(root);
+            }
+            for (const forwardedPackageName of peer.forwardedPackageNames) {
+                enqueuePeerEdge(forwardedPackageName, root);
+            }
+            if (!peer.includeRoot) {
+                // Peer graphs are enormous in real workspaces because ordinary
+                // framework/tooling packages advertise every integration as a peer. Resolve and
+                // inspect each peer so its manifest, symlink and public-entry facts still
+                // invalidate the plan, but only traverse peers which can supply/re-export Svelte
+                // or whose public graph is ambiguous.
+                return;
+            }
+        } else if (peerOnly && irrelevantPeerRoots.has(root)) {
+            return;
         }
         seen.add(root);
         trackRoot(root);
-        const dependencyManifest = readPackageManifest(root);
         roots.push(root);
         if (isLikelySveltePackage(dependencyManifest)) {
             markDependencyScanMode(root, 'direct');
@@ -5717,43 +6670,526 @@ function collectDependencyRoots(packageRoot: string, cache?: ReachabilityCache):
             // ordinary dependency directory.
             markDependencyScanMode(root, 'exports');
         }
-        queue.push(root);
+        if (!peerOnly) {
+            fullyQueuedRoots.add(root);
+        }
+        queue.push({ root, peerDerived: peerOnly });
+    };
+    for (const name of rootDependencies.names) {
+        enqueue(name, key, false);
+    }
+    for (const name of rootDependencies.peerNames) {
+        enqueuePeerEdge(name, key);
     }
 
     // Published Svelte packages frequently re-export components from a companion package. Walk
     // the Svelte-bearing closure (without scanning every ordinary tooling dependency) so those
     // raw sources and modern declaration conditions are indexed too.
-    while (queue.length && seen.size <= 1_000) {
-        const current = queue.shift()!;
-        trackRoot(current);
-        const currentManifest = readPackageManifest(current);
-        if (!currentManifest) {
+    let cursor = 0;
+    while ((cursor < queue.length || peerEdgeCursor < pendingPeerEdges.length) && !truncated) {
+        if (peerEdgeCursor < pendingPeerEdges.length) {
+            const edge = pendingPeerEdges[peerEdgeCursor++]!;
+            enqueue(edge.name, edge.fromRoot, true);
             continue;
         }
-        const transitiveNames = new Set<string>([
-            ...Object.keys(currentManifest.dependencies ?? {}),
-            ...Object.keys(currentManifest.optionalDependencies ?? {})
-        ]);
-        for (const name of transitiveNames) {
-            const root = resolveDependencyRoot(name, current, cache);
-            if (!root || seen.has(root)) {
-                continue;
+        const { root: current, peerDerived } = queue[cursor++]!;
+        if (peerDerived && fullyQueuedRoots.has(current)) {
+            continue;
+        }
+        trackRoot(current);
+        // Public relative/bare re-exports were already followed by the peer classifier. Do not
+        // admit or even enumerate the package's private runtime/tooling dependency tree: those
+        // packages cannot add an importable raw component unless the public surface named them.
+        if (peerDerived) {
+            continue;
+        }
+        const dependencies = declaredDependencyNames(current, false);
+        for (const reason of dependencies.fallbackReasons) {
+            fallbackReasons.add(reason);
+        }
+        for (const name of dependencies.names) {
+            enqueue(name, current, false);
+            if (truncated) {
+                break;
             }
-            seen.add(root);
-            trackRoot(root);
-            const dependencyManifest = readPackageManifest(root);
-            roots.push(root);
-            if (isLikelySveltePackage(dependencyManifest)) {
-                markDependencyScanMode(root, 'direct');
-            } else {
-                markDependencyScanMode(root, 'exports');
+        }
+        if (dependencies.peerNames.length) {
+            const manifest = readPackageManifest(current);
+            const likelySveltePackage = isLikelySveltePackage(manifest);
+            let peerSurface:
+                | { includeRoot: boolean; forwardedPackageNames: string[]; ambiguous: boolean }
+                | undefined;
+            if (
+                !likelySveltePackage &&
+                peerRootSurfaceNeedsInspection(
+                    current,
+                    manifest,
+                    compilerOptions,
+                    configDirectory,
+                    sourceRoot,
+                    cache
+                )
+            ) {
+                const realCurrent = realPathOrSelf(current);
+                peerSurface = peerClassificationsByRealRoot.get(realCurrent);
+                if (!peerSurface) {
+                    peerSurface = classifyPeerPublicSvelteSurface(
+                        current,
+                        manifest,
+                        compilerOptions,
+                        configDirectory,
+                        sourceRoot,
+                        cache
+                    );
+                    peerClassificationsByRealRoot.set(realCurrent, peerSurface);
+                }
             }
-            queue.push(root);
+            const forwardedPeers = new Set(peerSurface?.forwardedPackageNames ?? []);
+            for (const name of dependencies.peerNames) {
+                // Peer metadata is integration compatibility, not necessarily a source edge.
+                // Traverse it when the package is Svelte-bearing, its public surface explicitly
+                // forwards that peer, or the surface was ambiguous enough that no narrower
+                // proof is safe. The peer itself still goes through the root-entry prefilter.
+                if (likelySveltePackage || peerSurface?.ambiguous || forwardedPeers.has(name)) {
+                    enqueuePeerEdge(name, current);
+                }
+                if (truncated) {
+                    break;
+                }
+            }
         }
     }
+    if (truncated || cursor < queue.length || peerEdgeCursor < pendingPeerEdges.length) {
+        fallbackReasons.add(
+            `declared-dependency-root-closure-limit:${MAX_DECLARED_DEPENDENCY_ROOTS}`
+        );
+    }
+    const result = {
+        roots,
+        complete: fallbackReasons.size === 0,
+        fallbackReasons: [...fallbackReasons].sort(),
+        sourceInputs: [...(cache?.sourceSignatures ?? [])]
+            .filter(([path]) => !priorSourceInputs.has(path))
+            .map(([path, signature]) => ({ path, signature }))
+            .sort((left, right) => left.path.localeCompare(right.path)),
+        manifestInputs: sortedUnique(
+            [...(cache?.manifestInputs ?? [])].filter((input) => !priorManifestInputs.has(input))
+        ),
+        layoutInputs: sortedUnique(
+            [...(cache?.layoutInputs ?? [])].filter((input) => !priorLayoutInputs.has(input))
+        ),
+        directoryRoots: sortedUnique(
+            [...(cache?.directoryRoots ?? [])].filter((root) => !priorDirectoryRoots.has(root))
+        ),
+        exactInputProofs: [...(cache?.exactInputProofs.values() ?? [])].filter(
+            (input) =>
+                (input.kind === 'manifest' && !priorManifestInputs.has(input.path)) ||
+                (input.kind === 'layout' && !priorLayoutInputs.has(input.path))
+        ),
+        directoryProofs: [...(cache?.directoryProofs.values() ?? [])].filter(
+            (proof) => !priorDirectoryRoots.has(proof.path)
+        )
+    };
+    sharedDependencyRoots.set(sharedKey, result);
+    return {
+        roots: [...result.roots],
+        complete: result.complete,
+        fallbackReasons: [...result.fallbackReasons]
+    };
+}
 
-    sharedDependencyRoots.set(key, roots);
-    return roots;
+/**
+ * Cheap, fail-closed peer classification for the declared fallback. Walking every peer's complete
+ * public source graph turns framework integration metadata into a thousand-package closure. The
+ * public entry files are sufficient evidence here: explicit Svelte markers win immediately,
+ * literal raw-component re-exports are visible in their source, and computed/oversized surfaces
+ * remain included rather than becoming a silent omission.
+ */
+const MAX_PEER_PUBLIC_SOURCE_FILES = 256;
+const MAX_PEER_ROOT_PREFILTER_FILES = 32;
+
+/**
+ * Determine whether an installed metadata-only peer can possibly contribute a Svelte public
+ * surface before paying for its complete exports graph. Only the root entry matters at this
+ * stage: explicit Svelte subpath targets are already identity markers, while a peer which is
+ * publicly forwarded by another package is discovered from that package's own public graph.
+ *
+ * The negative answer is proof-backed rather than heuristic. We follow every relative root
+ * barrel, retain every file/probe used by the decision, and fail open to the full classifier for
+ * missing, computed, oversized, path-mapped, or package-forwarding edges.
+ */
+function peerRootSurfaceNeedsInspection(
+    packageRoot: string,
+    manifest: any,
+    compilerOptions: ts.CompilerOptions,
+    configDirectory: string,
+    sourceRoot: string,
+    cache?: ReachabilityCache
+): boolean {
+    if (!manifest) {
+        return true;
+    }
+    const exportsField = manifest.exports;
+    let rootExport: unknown = exportsField;
+    if (
+        exportsField &&
+        typeof exportsField === 'object' &&
+        !Array.isArray(exportsField) &&
+        Object.keys(exportsField).some((key) => key.startsWith('.'))
+    ) {
+        rootExport = (exportsField as Record<string, unknown>)['.'];
+    }
+    const manifestTypes = [
+        ...(typeof manifest.types === 'string' ? [manifest.types] : []),
+        ...(typeof manifest.typings === 'string' ? [manifest.typings] : [])
+    ];
+    const legacyTargets =
+        exportsField === undefined && manifestTypes.length === 0
+            ? [
+                  ...(typeof manifest.main === 'string' ? [manifest.main] : []),
+                  ...(typeof manifest.module === 'string' ? [manifest.module] : []),
+                  ...(typeof manifest.browser === 'string' ? [manifest.browser] : []),
+                  './index.d.ts',
+                  './index.js'
+              ]
+            : [];
+    const targets = unique([
+        ...manifestTypes,
+        ...preferredConditionalTargets(rootExport),
+        ...legacyTargets
+    ]).map(normalizeExportTarget);
+    if (
+        targets.length > MAX_PEER_ROOT_PREFILTER_FILES ||
+        targets.some((target) => target.includes('*'))
+    ) {
+        return true;
+    }
+
+    const normalizedPackageRoot = normalizePath(packageRoot);
+    const realPackageRoot = realPathOrSelf(packageRoot);
+    const insidePackage = (fileName: string) => {
+        const normalized = normalizePath(fileName);
+        const real = realPathOrSelf(normalized);
+        return (
+            normalized === normalizedPackageRoot ||
+            normalized.startsWith(normalizedPackageRoot + '/') ||
+            real === realPackageRoot ||
+            real.startsWith(realPackageRoot + '/')
+        );
+    };
+    const queue = targets.flatMap((target) =>
+        authoritativePublicTargetFiles(normalizePath(join(packageRoot, target)), cache)
+    );
+    const seen = new Set<string>();
+    let cursor = 0;
+    while (cursor < queue.length && seen.size < MAX_PEER_ROOT_PREFILTER_FILES) {
+        const file = canonicalSourcePath(queue[cursor++]!, sourceRoot);
+        if (seen.has(file)) {
+            continue;
+        }
+        seen.add(file);
+        if (file.endsWith('.svelte')) {
+            return true;
+        }
+        const text = readExactPeerEntry(file, cache);
+        if (text === undefined || /svelte/i.test(text)) {
+            return true;
+        }
+        const smallEntry = Buffer.byteLength(text, 'utf8') <= 64 * 1024;
+        const analysis = smallEntry ? analyzeReachabilitySource(file, cache, text) : undefined;
+        let publicEdges: PublicExportEdges;
+        if (smallEntry) {
+            publicEdges = collectPublicExportEdges(file, text, true);
+        } else {
+            const specifiers = new Set<string>();
+            const directReexport =
+                /\bexport\s+(?:type\s+)?(?:\*\s*(?:as\s+[\w$]+\s*)?|\{[^}]*\})\s+from\s*(['"])([^'"]+)\1/g;
+            let directMatch: RegExpExecArray | null;
+            while ((directMatch = directReexport.exec(text))) {
+                specifiers.add(directMatch[2]!);
+            }
+            publicEdges = {
+                specifiers: [...specifiers],
+                computed:
+                    /\bimport\s*\(\s*(?!['"`])\S/.test(text) ||
+                    /\brequire\s*\(\s*(?!['"`])\S/.test(text) ||
+                    /\b_+[\w$]*export\s*\(/.test(text)
+            };
+        }
+        if (publicEdges.computed) {
+            return true;
+        }
+        for (const specifier of publicEdges.specifiers) {
+            if (packageNameFromSpecifier(specifier)) {
+                return true;
+            }
+            if (specifier.startsWith('node:') || NODE_BUILTIN_MODULES.has(specifier)) {
+                continue;
+            }
+            if (!isRelativeModuleSpecifier(specifier)) {
+                return true;
+            }
+            const resolved = resolveReachableImport(
+                specifier,
+                file,
+                compilerOptions,
+                configDirectory,
+                cache
+            );
+            if (!resolved) {
+                trackUnresolvedRelativePublicEdge(specifier, file, cache);
+                return true;
+            }
+            const canonical = canonicalSourcePath(resolved, sourceRoot);
+            if (canonical.endsWith('.svelte')) {
+                return true;
+            }
+            if (!insidePackage(canonical) || !SCRIPT_SOURCE_RE.test(canonical)) {
+                return true;
+            }
+            queue.push(canonical);
+        }
+        for (const reference of analysis?.preprocessed.referencedFiles ?? []) {
+            const resolved = resolveReachablePathReference(reference, file, cache);
+            if (!resolved) {
+                return true;
+            }
+            const canonical = canonicalSourcePath(resolved, sourceRoot);
+            if (canonical.endsWith('.svelte')) {
+                return true;
+            }
+            if (!insidePackage(canonical) || !SCRIPT_SOURCE_RE.test(canonical)) {
+                return true;
+            }
+            queue.push(canonical);
+        }
+        if ((analysis?.preprocessed.typeReferenceDirectives.length ?? 0) > 0) {
+            // Type package lookup can cross the peer boundary. Let the full classifier retain
+            // all of its resolution probes and forwarded package names.
+            return true;
+        }
+    }
+    return cursor < queue.length;
+}
+
+/**
+ * Inspect only a peer's public re-export barrels. This is much narrower than its complete source
+ * graph, but unlike the previous direct-entry substring check it cannot miss a component behind
+ * a relative barrel or a marker-free companion package. Every file/probe read here is retained in
+ * the graph evidence, so changing a skipped peer's public surface invalidates the cached plan.
+ */
+function classifyPeerPublicSvelteSurface(
+    packageRoot: string,
+    manifest: any,
+    compilerOptions: ts.CompilerOptions,
+    configDirectory: string,
+    sourceRoot: string,
+    cache?: ReachabilityCache
+): { includeRoot: boolean; forwardedPackageNames: string[]; ambiguous: boolean } {
+    const explicitlySvelte = isLikelySveltePackage(manifest);
+    let includeRoot = explicitlySvelte;
+    let ambiguous = false;
+    const entries = publicPackageEntryFiles(packageRoot, manifest, cache);
+    if (entries.fallbackReasons.length > 0) {
+        includeRoot = true;
+        ambiguous = true;
+    }
+    const normalizedPackageRoot = normalizePath(packageRoot);
+    const realPackageRoot = realPathOrSelf(packageRoot);
+    const insidePackage = (fileName: string) => {
+        const normalized = normalizePath(fileName);
+        const real = realPathOrSelf(normalized);
+        return (
+            normalized === normalizedPackageRoot ||
+            normalized.startsWith(normalizedPackageRoot + '/') ||
+            real === realPackageRoot ||
+            real.startsWith(realPackageRoot + '/')
+        );
+    };
+    const queue = [...entries.files];
+    const seen = new Set<string>();
+    const forwardedPackageNames = new Set<string>();
+    let cursor = 0;
+    while (cursor < queue.length && seen.size < MAX_PEER_PUBLIC_SOURCE_FILES) {
+        const file = canonicalSourcePath(queue[cursor++]!, sourceRoot);
+        if (seen.has(file)) {
+            continue;
+        }
+        seen.add(file);
+        if (file.endsWith('.svelte')) {
+            includeRoot = true;
+            continue;
+        }
+        const text = readExactPeerEntry(file, cache);
+        if (text === undefined) {
+            includeRoot = true;
+            ambiguous = true;
+            continue;
+        }
+        // Small handwritten/barrel entries get the full public-binding analysis and a semantic
+        // source signature. Large generated declarations are almost always a closed list of
+        // direct re-exports; recognise that grammar lexically and keep an exact byte/topology
+        // proof instead of constructing a multi-megabyte AST for framework peer metadata.
+        const smallEntry = Buffer.byteLength(text, 'utf8') <= 64 * 1024;
+        const analysis = smallEntry ? analyzeReachabilitySource(file, cache, text) : undefined;
+        let publicEdges: PublicExportEdges;
+        if (smallEntry) {
+            publicEdges = collectPublicExportEdges(file, text, true);
+        } else {
+            const specifiers = new Set<string>();
+            const directReexport =
+                /\bexport\s+(?:type\s+)?(?:\*\s*(?:as\s+[\w$]+\s*)?|\{[^}]*\})\s+from\s*(['"])([^'"]+)\1/g;
+            let directMatch: RegExpExecArray | null;
+            while ((directMatch = directReexport.exec(text))) {
+                specifiers.add(directMatch[2]!);
+            }
+            publicEdges = {
+                specifiers: [...specifiers],
+                computed:
+                    /\bimport\s*\(\s*(?!['"`])\S/.test(text) ||
+                    /\brequire\s*\(\s*(?!['"`])\S/.test(text) ||
+                    /\b_+[\w$]*export\s*\(/.test(text)
+            };
+        }
+        if (/svelte/i.test(text)) {
+            includeRoot = true;
+        }
+        if (publicEdges.computed) {
+            includeRoot = true;
+            ambiguous = true;
+        }
+        for (const specifier of publicEdges.specifiers) {
+            const forwardedPackageName = packageNameFromSpecifier(specifier);
+            if (forwardedPackageName) {
+                forwardedPackageNames.add(forwardedPackageName);
+                continue;
+            }
+            if (specifier.startsWith('node:') || NODE_BUILTIN_MODULES.has(specifier)) {
+                continue;
+            }
+            if (!isRelativeModuleSpecifier(specifier) && !specifier.startsWith('#')) {
+                // Absolute/path-mapped edges can escape this peer. Their ownership is not
+                // provable from the package boundary, so retain the whole root rather than omit.
+                includeRoot = true;
+                ambiguous = true;
+                continue;
+            }
+            const resolved = resolveReachableImport(
+                specifier,
+                file,
+                compilerOptions,
+                configDirectory,
+                cache
+            );
+            if (!resolved) {
+                if (isRelativeModuleSpecifier(specifier)) {
+                    trackUnresolvedRelativePublicEdge(specifier, file, cache);
+                }
+                includeRoot = true;
+                ambiguous = true;
+                continue;
+            }
+            const canonical = canonicalSourcePath(resolved, sourceRoot);
+            if (canonical.endsWith('.svelte')) {
+                includeRoot = true;
+                continue;
+            }
+            if (!insidePackage(canonical) || !SCRIPT_SOURCE_RE.test(canonical)) {
+                includeRoot = true;
+                ambiguous = true;
+                continue;
+            }
+            queue.push(canonical);
+        }
+        for (const reference of analysis?.preprocessed.referencedFiles ?? []) {
+            const resolved = resolveReachablePathReference(reference, file, cache);
+            if (!resolved) {
+                includeRoot = true;
+                ambiguous = true;
+                continue;
+            }
+            const canonical = canonicalSourcePath(resolved, sourceRoot);
+            if (canonical.endsWith('.svelte')) {
+                includeRoot = true;
+            } else if (insidePackage(canonical) && SCRIPT_SOURCE_RE.test(canonical)) {
+                queue.push(canonical);
+            } else {
+                includeRoot = true;
+                ambiguous = true;
+            }
+        }
+        for (const reference of analysis?.preprocessed.typeReferenceDirectives ?? []) {
+            const forwardedPackageName = packageNameFromSpecifier(reference.fileName);
+            if (forwardedPackageName) {
+                forwardedPackageNames.add(forwardedPackageName);
+            }
+        }
+    }
+    return {
+        includeRoot: includeRoot || cursor < queue.length,
+        forwardedPackageNames: [...forwardedPackageNames],
+        ambiguous: ambiguous || cursor < queue.length
+    };
+}
+
+function declaredDependencyNames(
+    packageRoot: string,
+    includeDevDependencies: boolean
+): { names: string[]; peerNames: string[]; fallbackReasons: string[] } {
+    const manifestPath = normalizePath(join(packageRoot, 'package.json'));
+    const manifest = readPackageManifest(packageRoot);
+    if (!manifest) {
+        return {
+            names: [],
+            peerNames: [],
+            fallbackReasons: fs.statSync(manifestPath, { throwIfNoEntry: false })?.isFile()
+                ? [`invalid-declared-dependency-manifest:${manifestPath}`]
+                : []
+        };
+    }
+
+    const names = new Set<string>();
+    const peerNames = new Set<string>();
+    const fallbackReasons: string[] = [];
+    const fields = [
+        'dependencies',
+        'optionalDependencies',
+        ...(includeDevDependencies ? ['devDependencies'] : [])
+    ];
+    for (const field of fields) {
+        const value = manifest[field];
+        if (value === undefined) {
+            continue;
+        }
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+            fallbackReasons.push(`invalid-declared-dependency-field:${manifestPath}:${field}`);
+            continue;
+        }
+        for (const name of Object.keys(value)) {
+            if (name) {
+                names.add(name);
+            }
+        }
+    }
+    const peers = manifest.peerDependencies;
+    if (peers !== undefined) {
+        if (!peers || typeof peers !== 'object' || Array.isArray(peers)) {
+            fallbackReasons.push(
+                `invalid-declared-dependency-field:${manifestPath}:peerDependencies`
+            );
+        } else {
+            for (const name of Object.keys(peers)) {
+                if (name && !names.has(name)) {
+                    peerNames.add(name);
+                }
+            }
+        }
+    }
+    return {
+        names: [...names].sort(),
+        peerNames: [...peerNames].sort(),
+        fallbackReasons
+    };
 }
 
 function markDependencyScanMode(root: string, mode: 'broad' | 'direct' | 'exports') {
@@ -5805,11 +7241,48 @@ function hasExplicitSvelteSources(manifest: any): boolean {
     );
 }
 
-function scanDependencySvelteFiles(packageRoot: string): string[] {
+function readExactPeerEntry(fileName: string, cache?: ReachabilityCache): string | undefined {
+    const path = normalizePath(fileName);
+    let before: string | null;
+    let text: string;
+    try {
+        before = materialisationPlanExactFileProof(path, 'layout');
+        text = fs.readFileSync(path, 'utf8');
+        const after = materialisationPlanExactFileProof(path, 'layout');
+        if (before !== after) {
+            return undefined;
+        }
+    } catch {
+        return undefined;
+    }
+    if (cache) {
+        const key = exactInputProofKey('layout', path);
+        const existing = cache.exactInputProofs.get(key);
+        if (existing && existing.proof !== before) {
+            return undefined;
+        }
+        cache.layoutInputs.restore(path);
+        cache.exactInputProofs.set(key, { kind: 'layout', path, proof: before });
+    }
+    return text;
+}
+
+function scanDependencySvelteFiles(
+    packageRoot: string,
+    currentProof?: BatchGraphDirectoryProof,
+    currentSvelteFiles?: readonly string[]
+): string[] {
     const key = normalizePath(packageRoot);
     const cached = sharedSvelteFilesByPackage.get(key);
-    if (cached) {
-        return cached;
+    if (cached && currentProof) {
+        const current = currentProof;
+        if (
+            current?.stamp === cached.proof.stamp &&
+            current.entryCount === cached.proof.entryCount
+        ) {
+            return cached.files;
+        }
+        sharedSvelteFilesByPackage.delete(key);
     }
 
     const manifest = readPackageManifest(key);
@@ -5820,17 +7293,35 @@ function scanDependencySvelteFiles(packageRoot: string): string[] {
         sharedDependencyScanMode.get(key) !== 'broad' &&
         (sharedDependencyScanMode.get(key) === 'exports' || manifest?.exports !== undefined)
     ) {
-        const result = scanPublicSvelteFiles(key, manifest);
-        sharedSvelteFilesByPackage.set(key, result);
+        const result = scanPublicSvelteFiles(key, manifest, currentSvelteFiles);
+        const proof = currentProof;
+        if (proof) {
+            sharedSvelteFilesByPackage.set(key, { files: result, proof });
+        }
         return result;
     }
 
-    const found = scanDependencyDirectory(key);
-    sharedSvelteFilesByPackage.set(key, found);
+    const found = currentSvelteFiles
+        ? currentSvelteFiles
+              .filter(
+                  (file) =>
+                      !normalizePath(relative(key, file)).split('/').includes('.cache') &&
+                      needsSvelteShadow(file)
+              )
+              .map(normalizePath)
+        : scanDependencyDirectory(key);
+    const proof = currentProof;
+    if (proof) {
+        sharedSvelteFilesByPackage.set(key, { files: found, proof });
+    }
     return found;
 }
 
-function scanPublicSvelteFiles(packageRoot: string, manifest: any): string[] {
+function scanPublicSvelteFiles(
+    packageRoot: string,
+    manifest: any,
+    currentSvelteFiles?: readonly string[]
+): string[] {
     const found = new Set<string>();
     const targets = [
         ...(typeof manifest?.svelte === 'string' ? [manifest.svelte] : []),
@@ -5849,7 +7340,13 @@ function scanPublicSvelteFiles(packageRoot: string, manifest: any): string[] {
     // its first entries would make reachability depend on JSON key order. Fall back to the raw
     // package scan instead. `needsSvelteShadow` still excludes modern `.d.svelte.ts` declarations.
     if (!publicEntries.complete) {
-        for (const file of scanDependencyDirectory(packageRoot)) {
+        for (const file of currentSvelteFiles ?? scanDependencyDirectory(packageRoot)) {
+            if (normalizePath(relative(packageRoot, file)).split('/').includes('.cache')) {
+                continue;
+            }
+            if (!needsSvelteShadow(file)) {
+                continue;
+            }
             found.add(file);
         }
     }
@@ -5864,7 +7361,18 @@ function scanPublicSvelteFiles(packageRoot: string, manifest: any): string[] {
         }
         const prefix = target.slice(0, target.indexOf('*'));
         const directory = normalizePath(join(packageRoot, dirname(prefix)));
-        for (const file of scanDependencyDirectory(directory)) {
+        const candidates = currentSvelteFiles
+            ? currentSvelteFiles.filter(
+                  (file) => file === directory || file.startsWith(directory + '/')
+              )
+            : scanDependencyDirectory(directory);
+        for (const file of candidates) {
+            if (normalizePath(relative(packageRoot, file)).split('/').includes('.cache')) {
+                continue;
+            }
+            if (!needsSvelteShadow(file)) {
+                continue;
+            }
             const relativeFile = normalizePath(relative(packageRoot, file));
             if (matchExportTarget(target, relativeFile) !== undefined) {
                 found.add(file);
@@ -5968,6 +7476,9 @@ function declarationCandidates(target: string): string[] {
 function scanDependencyDirectory(root: string): string[] {
     const found: string[] = [];
     const walk = (dir: string) => {
+        if (normalizePath(dir) !== normalizePath(root) && fs.existsSync(join(dir, '.git'))) {
+            return;
+        }
         let entries: fs.Dirent[];
         try {
             entries = fs.readdirSync(dir, { withFileTypes: true });

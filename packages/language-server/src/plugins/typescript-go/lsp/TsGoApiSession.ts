@@ -25,6 +25,36 @@ interface TsGoApiModule {
     TypeFlags: Record<string, number>;
 }
 
+/** The stable, serialisable subset returned by the preview checker's completion API. */
+export interface TsGoApiCompletionEntry {
+    name: string;
+    kind?: number;
+    sortText?: string;
+    insertText?: string;
+    filterText?: string;
+    detail?: string;
+    labelDetails?: { detail?: string; description?: string };
+    commitCharacters?: string[];
+}
+
+export interface TsGoApiCompletionInfo {
+    isIncomplete: boolean;
+    isNewIdentifierLocation?: boolean;
+    defaultCommitCharacters?: string[];
+    entries: TsGoApiCompletionEntry[];
+    timings: { projectMs: number; checkerMs: number };
+}
+
+interface SnapshotState {
+    snapshot: any;
+    generation: number;
+    leases: number;
+    retired: boolean;
+    projectsByFile: Map<string, Promise<any | undefined>>;
+    disposePromise?: Promise<void>;
+    releaseDrain?: () => void;
+}
+
 /**
  * An in-process TypeScript **checker** attached to the same programs the LSP session is using.
  *
@@ -40,11 +70,11 @@ export class TsGoApiSession {
     private api: any;
     private module: TsGoApiModule | undefined;
     private connecting: Promise<boolean> | undefined;
-    private snapshot: any;
-    /** The server generation the current snapshot reflects; see {@link getProjectForFile}. */
-    private snapshotGeneration = -1;
+    private snapshotState: SnapshotState | undefined;
     /** In-flight refresh, so concurrent callers share one instead of double-disposing. */
     private refreshing: Promise<void> | undefined;
+    /** Retired snapshots stay alive until every checker operation which leased them finishes. */
+    private readonly snapshotDisposals = new Set<Promise<void>>();
     private failed = false;
     /** Invalidates every continuation still awaiting the previous child/API pipe. */
     private epoch = 0;
@@ -53,6 +83,11 @@ export class TsGoApiSession {
         private readonly server: TsGoServer,
         private readonly engine: ResolvedTsGoEngine
     ) {}
+
+    /** Whether this exact engine package shipped its matching async client. */
+    get available(): boolean {
+        return !!this.engine.apiEntry;
+    }
 
     get signatureKind() {
         return this.module?.SignatureKind;
@@ -135,7 +170,7 @@ export class TsGoApiSession {
      * previous snapshot is released on each refresh: they are ref-counted server-side and
      * holding every one of them leaks the whole AST cache over an editing session.
      */
-    async getProjectForFile(shadowPath: string): Promise<any | undefined> {
+    private async acquireSnapshot(): Promise<SnapshotState | undefined> {
         if (!(await this.connect())) {
             return undefined;
         }
@@ -145,14 +180,17 @@ export class TsGoApiSession {
             return undefined;
         }
         try {
-            while (!this.snapshot || this.server.generation !== this.snapshotGeneration) {
+            while (
+                !this.snapshotState ||
+                this.snapshotState.retired ||
+                this.server.generation !== this.snapshotState.generation
+            ) {
                 // Single-flight: two feature requests racing here would each capture the same
-                // `previous` and dispose it twice — the server-side refcount underflows and a
-                // snapshot still in use gets released.
+                // previous state. The old snapshot is retired atomically and disposed only after
+                // its active checker leases drain.
                 if (!this.refreshing) {
                     const generation = this.server.generation;
                     const refresh = (async () => {
-                        const previous = this.snapshot;
                         const next = await api.updateSnapshot();
                         if (epoch !== this.epoch || api !== this.api) {
                             await next?.dispose?.();
@@ -161,10 +199,16 @@ export class TsGoApiSession {
                         if (!next) {
                             throw new Error('tsgo checker API returned no snapshot');
                         }
-                        this.snapshot = next;
-                        this.snapshotGeneration = generation;
-                        if (previous && previous !== next) {
-                            await previous.dispose?.();
+                        const previous = this.snapshotState;
+                        this.snapshotState = {
+                            snapshot: next,
+                            generation,
+                            leases: 0,
+                            retired: false,
+                            projectsByFile: new Map()
+                        };
+                        if (previous && previous.snapshot !== next) {
+                            this.retireSnapshot(previous);
                         }
                     })();
                     const tracked = refresh.finally(() => {
@@ -179,9 +223,129 @@ export class TsGoApiSession {
                     return undefined;
                 }
             }
-            return await this.snapshot.getDefaultProjectForFile(shadowPath);
+            const state = this.snapshotState;
+            if (!state || state.retired) {
+                return undefined;
+            }
+            // No await between selecting and leasing: a refresh cannot retire/dispose this state
+            // in the middle of acquisition.
+            state.leases++;
+            return state;
         } catch (e) {
-            Logger.debug('[tsgo] could not obtain a checker project', e);
+            Logger.debug('[tsgo] could not obtain a checker snapshot', e);
+            return undefined;
+        }
+    }
+
+    /**
+     * Run an entire checker operation against one leased snapshot.
+     *
+     * A newer native generation may publish concurrently. It cannot dispose this operation's
+     * Project/Checker handles until the callback settles, but its result is no longer valid: an
+     * edit in another file can change the member/type answer without changing the requesting
+     * document. Project lookup is also single-flight per snapshot so eager warmup and the first
+     * foreground completion join the same request.
+     */
+    async withProjectForFile<T>(
+        shadowPath: string,
+        operation: (project: any) => T | Promise<T>,
+        isCurrent: () => boolean = () => true
+    ): Promise<T | undefined> {
+        if (!isCurrent()) {
+            return undefined;
+        }
+        const state = await this.acquireSnapshot();
+        if (!state) {
+            return undefined;
+        }
+        const isSnapshotCurrent = () =>
+            !state.retired && state.generation === this.server.generation && isCurrent();
+        try {
+            if (!isSnapshotCurrent()) {
+                return undefined;
+            }
+            let project = state.projectsByFile.get(shadowPath);
+            if (!project) {
+                project = Promise.resolve(state.snapshot.getDefaultProjectForFile(shadowPath));
+                state.projectsByFile.set(shadowPath, project);
+            }
+            const resolved = await project;
+            if (!resolved || !isSnapshotCurrent()) {
+                return undefined;
+            }
+            const result = await operation(resolved);
+            return isSnapshotCurrent() ? result : undefined;
+        } catch (e) {
+            Logger.debug('[tsgo] checker project operation failed', e);
+            return undefined;
+        } finally {
+            this.releaseSnapshot(state);
+        }
+    }
+
+    async warmProjectForFile(shadowPath: string): Promise<boolean> {
+        return (await this.withProjectForFile(shadowPath, () => true)) === true;
+    }
+
+    /**
+     * Ask the checker attached to the running LSP process for lightweight completions.
+     *
+     * The API deliberately does not expose completion-entry resolution or auto-import edits, so
+     * callers must reserve this for contexts (currently member access) where the entry itself is
+     * the complete answer. It is dramatically cheaper there because it avoids the LSP server's
+     * completion-list construction and opaque resolve payloads while sharing the exact program.
+     */
+    async getCompletionsAtPosition(
+        shadowPath: string,
+        offset: number,
+        triggerCharacter?: string,
+        isCurrent: () => boolean = () => true
+    ): Promise<TsGoApiCompletionInfo | undefined> {
+        try {
+            const projectStarted = performance.now();
+            let projectMs = 0;
+            let checkerMs = 0;
+            const result = await this.withProjectForFile(
+                shadowPath,
+                async (project) => {
+                    projectMs = performance.now() - projectStarted;
+                    const checkerStarted = performance.now();
+                    const completion = await project.checker?.getCompletionsAtPosition(
+                        shadowPath,
+                        offset,
+                        triggerCharacter ? { triggerCharacter } : undefined
+                    );
+                    checkerMs = performance.now() - checkerStarted;
+                    return completion;
+                },
+                isCurrent
+            );
+            if (
+                !isRecord(result) ||
+                typeof result.isIncomplete !== 'boolean' ||
+                !Array.isArray(result.entries) ||
+                !result.entries.every(isTsGoApiCompletionEntry) ||
+                !optionalBoolean(result.isNewIdentifierLocation) ||
+                !optionalStringArray(result.defaultCommitCharacters)
+            ) {
+                Logger.debug('[tsgo] checker API returned a malformed completion entry');
+                return undefined;
+            }
+            return {
+                isIncomplete: result.isIncomplete,
+                ...(result.isNewIdentifierLocation !== undefined
+                    ? { isNewIdentifierLocation: result.isNewIdentifierLocation }
+                    : {}),
+                ...(result.defaultCommitCharacters
+                    ? { defaultCommitCharacters: [...result.defaultCommitCharacters] }
+                    : {}),
+                entries: result.entries.map(copyTsGoApiCompletionEntry),
+                timings: { projectMs, checkerMs }
+            };
+        } catch (e) {
+            // The LSP completion route remains the fail-closed fallback for a preview API which
+            // can disappear or reject a context between native builds.
+            Logger.debug('[tsgo] checker API completion failed', e);
             return undefined;
         }
     }
@@ -197,7 +361,6 @@ export class TsGoApiSession {
         this.connecting = undefined;
         this.refreshing = undefined;
         this.failed = false;
-        this.snapshotGeneration = -1;
     }
 
     async dispose() {
@@ -206,8 +369,33 @@ export class TsGoApiSession {
         this.connecting = undefined;
         this.refreshing = undefined;
         this.failed = false;
-        this.snapshotGeneration = -1;
         await this.disposeCurrent();
+    }
+
+    private releaseSnapshot(state: SnapshotState): void {
+        state.leases = Math.max(0, state.leases - 1);
+        if (state.leases === 0) {
+            state.releaseDrain?.();
+            state.releaseDrain = undefined;
+        }
+    }
+
+    private retireSnapshot(state: SnapshotState): Promise<void> {
+        state.retired = true;
+        if (!state.disposePromise) {
+            const dispose = (async () => {
+                if (state.leases > 0) {
+                    await new Promise<void>((resolve) => (state.releaseDrain = resolve));
+                }
+                try {
+                    await state.snapshot?.dispose?.();
+                } catch {}
+            })();
+            const tracked = dispose.finally(() => this.snapshotDisposals.delete(tracked));
+            state.disposePromise = tracked;
+            this.snapshotDisposals.add(tracked);
+        }
+        return state.disposePromise;
     }
 
     private async disposeCurrent() {
@@ -215,14 +403,96 @@ export class TsGoApiSession {
         // next doConnect after a restart, and a late continuation must not null out a freshly
         // attached api.
         const api = this.api;
-        const snapshot = this.snapshot;
+        const snapshotState = this.snapshotState;
         this.api = undefined;
-        this.snapshot = undefined;
-        try {
-            await snapshot?.dispose?.();
-        } catch {}
+        this.snapshotState = undefined;
+        if (snapshotState) {
+            this.retireSnapshot(snapshotState);
+        }
+        await Promise.all([...this.snapshotDisposals]);
         try {
             await api?.close?.();
         } catch {}
     }
+}
+
+function isTsGoApiCompletionEntry(entry: unknown): entry is TsGoApiCompletionEntry {
+    if (!isRecord(entry)) {
+        return false;
+    }
+    const value = entry;
+    if (
+        typeof value.name !== 'string' ||
+        !optionalCompletionItemKind(value.kind) ||
+        !optionalString(value.sortText) ||
+        !optionalString(value.insertText) ||
+        !optionalString(value.filterText) ||
+        !optionalString(value.detail) ||
+        !optionalStringArray(value.commitCharacters)
+    ) {
+        return false;
+    }
+    if (value.labelDetails !== undefined) {
+        if (!isRecord(value.labelDetails)) {
+            return false;
+        }
+        const details = value.labelDetails;
+        if (!optionalString(details.detail) || !optionalString(details.description)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function copyTsGoApiCompletionEntry(entry: TsGoApiCompletionEntry): TsGoApiCompletionEntry {
+    return {
+        name: entry.name,
+        ...(entry.kind !== undefined ? { kind: entry.kind } : {}),
+        ...(entry.sortText !== undefined ? { sortText: entry.sortText } : {}),
+        ...(entry.insertText !== undefined ? { insertText: entry.insertText } : {}),
+        ...(entry.filterText !== undefined ? { filterText: entry.filterText } : {}),
+        ...(entry.detail !== undefined ? { detail: entry.detail } : {}),
+        ...(entry.labelDetails !== undefined
+            ? {
+                  labelDetails: {
+                      ...(entry.labelDetails.detail !== undefined
+                          ? { detail: entry.labelDetails.detail }
+                          : {}),
+                      ...(entry.labelDetails.description !== undefined
+                          ? { description: entry.labelDetails.description }
+                          : {})
+                  }
+              }
+            : {}),
+        ...(entry.commitCharacters !== undefined
+            ? { commitCharacters: [...entry.commitCharacters] }
+            : {})
+    };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): value is string | undefined {
+    return value === undefined || typeof value === 'string';
+}
+
+function optionalCompletionItemKind(value: unknown): value is number | undefined {
+    // LSP 3.17 CompletionItemKind: Text (1) through TypeParameter (25).
+    return (
+        value === undefined ||
+        (typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= 25)
+    );
+}
+
+function optionalBoolean(value: unknown): value is boolean | undefined {
+    return value === undefined || typeof value === 'boolean';
+}
+
+function optionalStringArray(value: unknown): value is string[] | undefined {
+    return (
+        value === undefined ||
+        (Array.isArray(value) && value.every((entry) => typeof entry === 'string'))
+    );
 }

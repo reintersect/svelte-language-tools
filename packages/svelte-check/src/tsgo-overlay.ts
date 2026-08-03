@@ -62,46 +62,89 @@ export async function runTsGoCheck(opts: SvelteCheckCliOptions): Promise<FileDia
     const { diagnostics: parsed, files } = await runTsGo(overlay, opts, wantsTypeScript);
     const nativeDurationMs = Date.now() - nativeStarted;
     const mappingStarted = Date.now();
-    const remappedDiagnostics = parsed.map((original) => ({
-        original,
-        remapped: remapOverlayConfigDiagnostic(original, overlay)
-    }));
-    // Parsing the user config gives us its exact source span, while native tsgo reports the same
-    // inherited error against the generated overlay (which remaps to an imprecise 0:0). Keep the
-    // parser copy when both engines agree on code/message/severity. This only removes the adapter
-    // duplicate; the overlay continues to extend the user's config unchanged.
-    const nativeConfirmedInvalidConfig = remappedDiagnostics.some(
-        ({ remapped }) =>
-            isConfigurationDiagnostic(remapped) && overlay.matchesBaseConfigurationError(remapped)
+    const classifiedDiagnostics = parsed.map((original) => {
+        let remapped = remapOverlayConfigDiagnostic(original, overlay);
+        const isConfiguration = isConfigurationDiagnostic(original, remapped, overlay);
+        // Classic svelte-check deliberately downgrades program global/options errors while still
+        // checking every source file. Native CLI output has no diagnostic-origin field, but a
+        // non-config diagnostic without a file is exactly that global/options stream.
+        if (
+            !isConfiguration &&
+            original.filePath === null &&
+            remapped.severity === DiagnosticSeverity.Error
+        ) {
+            remapped = { ...remapped, severity: DiagnosticSeverity.Warning };
+        }
+        return {
+            remapped,
+            isConfiguration
+        };
+    });
+    // Native TS7 is the authority for option/configuration semantics. The JavaScript TypeScript
+    // bundled with the adapter may reject newer valid options, so BatchOverlay only contributes
+    // the no-input diagnostics which its explicit roots necessarily mask.
+    const nativeConfirmedInvalidConfig = classifiedDiagnostics.some(
+        ({ remapped, isConfiguration }) =>
+            isConfiguration && remapped.severity === DiagnosticSeverity.Error
     );
-    const deduplicatedDiagnostics = remappedDiagnostics
-        .filter(
-            ({ original, remapped }) =>
-                // Only discard the copy whose real path was a generated overlay config. Keep a
-                // native diagnostic already attributed to the user tsconfig: unlike the parser
-                // fallback, it carries the exact value span.
-                original.filePath === remapped.filePath ||
-                remapped.filePath !== null ||
-                !overlay.matchesBaseConfigurationDiagnostic(remapped)
-        )
-        .map(({ remapped }) => remapped);
+    // Stock tsgo can stop semantic checking after a nonfatal global/options diagnostic (TS2688
+    // is the concrete case), and its CLI output omits the related config span that classic
+    // svelte-check publishes. Recover the complete TypeScript diagnostic stream through the
+    // JavaScript service only for this already-invalid, rare project state. Healthy projects keep
+    // the native-only fast path.
+    const needsClassicTypeScriptFallback =
+        !nativeConfirmedInvalidConfig &&
+        wantsTypeScript &&
+        classifiedDiagnostics.some(
+            ({ remapped, isConfiguration }) => !isConfiguration && remapped.filePath === null
+        );
+    if (!nativeConfirmedInvalidConfig) {
+        const missingRoots = overlay.missingProgramRootFiles(files);
+        if (missingRoots.length) {
+            const preview = missingRoots.slice(0, 10).join('\n');
+            const remainder =
+                missingRoots.length > 10 ? `\n... and ${missingRoots.length - 10} more` : '';
+            throw new Error(
+                `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) produced an incomplete program file list; ` +
+                    `${missingRoots.length} configured root(s) were missing:\n${preview}${remainder}`
+            );
+        }
+    }
     // Classic TypeScript does not construct a source program after a native-confirmed fatal
     // configuration error. Do not let the overlay's explicit shadow roots manufacture one.
     const program = nativeConfirmedInvalidConfig
         ? { all: [] as string[], svelte: [] as string[] }
         : overlay.mapProgramFiles(files);
-    const diagnosticsForMapping = wantsTypeScript
-        ? deduplicatedDiagnostics
-        : deduplicatedDiagnostics.filter(isConfigurationDiagnostic);
+    const classicTypeScriptDiagnostics = needsClassicTypeScriptFallback
+        ? await getClassicTypeScriptDiagnostics(opts)
+        : undefined;
+    const classicDiagnosticFacts = new Set(
+        (classicTypeScriptDiagnostics ?? []).flatMap((entry) =>
+            entry.diagnostics.map(diagnosticFact)
+        )
+    );
+    const diagnosticsForMapping = classifiedDiagnostics
+        .filter(({ isConfiguration }) => wantsTypeScript || isConfiguration)
+        .filter(
+            ({ remapped, isConfiguration }) =>
+                !classicTypeScriptDiagnostics ||
+                isConfiguration ||
+                remapped.filePath !== null ||
+                !classicDiagnosticFacts.has(diagnosticFact(remapped))
+        )
+        .map(({ remapped }) => remapped);
     // Materialisation/parser failures are owned by the overlay rather than by the native
     // TypeScript diagnostic source. mapDiagnostics merges those even when JS diagnostics are
     // disabled, so `--diagnostic-sources css` cannot accidentally turn a broken component into
     // a clean run.
-    const tsDiagnostics = await overlay.mapDiagnostics(
+    const mappedNativeDiagnostics = await overlay.mapDiagnostics(
         diagnosticsForMapping,
         opts.tsconfig,
         program.all
     );
+    const tsDiagnostics = classicTypeScriptDiagnostics
+        ? merge(program.all, mappedNativeDiagnostics, classicTypeScriptDiagnostics)
+        : mappedNativeDiagnostics;
     const mappingDurationMs = Date.now() - mappingStarted;
 
     const svelteFiles = nativeConfirmedInvalidConfig
@@ -219,13 +262,20 @@ function emitTsGoStats(stats: TsGoCheckStats): void {
 
 const diagnosticHeader = /^((.+):(\d+):(\d+) - )?(error|warning|suggestion|message) TS(\d+): /;
 const diagnosticSummary = /^(?:Found \d+ errors?|Errors\s+Files?)\b/i;
+// Effect's compiler embeds the standard library and prints those virtual program members with
+// this URI scheme. Keep the accepted shape exact: arbitrary bundled URIs must not become a way
+// for malformed output to satisfy the terminal file-count proof.
+const bundledLibraryProgramMember = /^bundled:\/\/\/libs\/lib(?:\.[A-Za-z0-9_-]+)+\.d\.ts$/;
 // eslint-disable-next-line no-control-regex
 const ansiEscape = /\x1b\[[0-9;]*m/g;
 
 interface NativeOutputParseResult {
     diagnostics: ParsedDiagnostic[];
     files: string[];
+    bundledFiles: string[];
     terminalErrorCount?: number;
+    terminalFileCount?: number;
+    terminalCompletionSeen: boolean;
     outputTail: string;
 }
 
@@ -241,9 +291,14 @@ class NativeCompilerStreamParser {
     private readonly diagnostics: ParsedDiagnostic[] = [];
     private readonly files: string[] = [];
     private readonly seenFiles = new Set<string>();
+    private readonly bundledFiles: string[] = [];
+    private readonly seenBundledFiles = new Set<string>();
     private tail = '';
     private inSummaryTable = false;
+    private inCompilerDiagnostics = false;
     private terminalErrorCount: number | undefined;
+    private terminalFileCount: number | undefined;
+    private terminalCompletionSeen = false;
 
     constructor(private readonly baseDir: string) {}
 
@@ -265,7 +320,10 @@ class NativeCompilerStreamParser {
     finish(): {
         diagnostics: ParsedDiagnostic[];
         files: string[];
+        bundledFiles: string[];
         terminalErrorCount?: number;
+        terminalFileCount?: number;
+        terminalCompletionSeen: boolean;
         tail: string;
     } {
         if (this.pending) {
@@ -274,10 +332,16 @@ class NativeCompilerStreamParser {
             this.acceptLine(line);
         }
         this.flushDiagnostic();
+        if (this.inCompilerDiagnostics) {
+            throw new Error('native compiler emitted an incomplete compiler-diagnostics footer');
+        }
         return {
             diagnostics: this.diagnostics,
             files: this.files,
+            bundledFiles: this.bundledFiles,
             terminalErrorCount: this.terminalErrorCount,
+            terminalFileCount: this.terminalFileCount,
+            terminalCompletionSeen: this.terminalCompletionSeen,
             tail: this.tail.trimEnd()
         };
     }
@@ -291,16 +355,30 @@ class NativeCompilerStreamParser {
         const trimmed = line.trim();
         const isHeader = diagnosticHeader.test(trimmed);
         const listed = parseListedFiles(line)[0];
+        const bundledFile = bundledLibraryProgramMember.test(trimmed) ? trimmed : undefined;
         const isSummary = diagnosticSummary.test(trimmed);
         const terminalSummary = /^Found (\d+) errors?\b/i.exec(trimmed);
         const isSummaryRow = this.inSummaryTable && /^\d+\s{2,}.+:\d+$/.test(trimmed);
-        if (isHeader || listed || isSummary) {
+        const compilerDiagnosticsStart = /^Files:\s+(\d+)$/.exec(trimmed);
+        const isCompilerDiagnosticsStart = !!compilerDiagnosticsStart;
+        const isCompilerDiagnosticsRow =
+            this.inCompilerDiagnostics &&
+            /^[A-Za-z][A-Za-z /]+:\s+\d+(?:\.\d+)?(?:s|K)?$/.test(trimmed);
+        if (isHeader || listed || bundledFile || isSummary || isCompilerDiagnosticsStart) {
             this.flushDiagnostic();
         }
-        if (isHeader || listed) {
+        if (isHeader || listed || bundledFile) {
             this.inSummaryTable = false;
         } else if (isSummary) {
             this.inSummaryTable = /^Errors\s+Files?\b/i.test(trimmed);
+        }
+        if (isCompilerDiagnosticsStart) {
+            const count = Number(compilerDiagnosticsStart![1]);
+            if (this.terminalFileCount !== undefined) {
+                throw new Error('native compiler emitted multiple compiler-diagnostics footers');
+            }
+            this.terminalFileCount = count;
+            this.inCompilerDiagnostics = true;
         }
         if (isHeader) {
             this.block = [line];
@@ -315,11 +393,26 @@ class NativeCompilerStreamParser {
                 this.seenFiles.add(listed);
                 this.files.push(listed);
             }
+        } else if (bundledFile) {
+            if (this.terminalErrorCount !== undefined) {
+                throw new Error(
+                    `native compiler emitted a program file after its terminal summary: ${bundledFile}`
+                );
+            }
+            if (!this.seenBundledFiles.has(bundledFile)) {
+                this.seenBundledFiles.add(bundledFile);
+                this.bundledFiles.push(bundledFile);
+            }
         } else if (this.block.length) {
             this.block.push(line);
             this.blockBytes += Buffer.byteLength(line) + 1;
             if (this.blockBytes > 16 * 1024 * 1024) {
                 throw new Error('native compiler emitted a diagnostic block larger than 16 MiB');
+            }
+        } else if (isCompilerDiagnosticsStart || isCompilerDiagnosticsRow) {
+            if (/^Total time:/.test(trimmed)) {
+                this.inCompilerDiagnostics = false;
+                this.terminalCompletionSeen = true;
             }
         } else if (trimmed && !isSummary && !isSummaryRow) {
             throw new Error(`native compiler emitted an unrecognized output line: ${trimmed}`);
@@ -332,6 +425,7 @@ class NativeCompilerStreamParser {
                 );
             }
             this.terminalErrorCount = count;
+            this.terminalCompletionSeen = true;
         }
         this.tail = `${this.tail}${line}\n`.slice(-64 * 1024);
     }
@@ -379,6 +473,12 @@ export class NativeCompilerOutputCollector {
             seen.add(file);
             return true;
         });
+        const seenBundledFiles = new Set<string>();
+        const bundledFiles = [...stdout.bundledFiles, ...stderr.bundledFiles].filter((file) => {
+            if (seenBundledFiles.has(file)) return false;
+            seenBundledFiles.add(file);
+            return true;
+        });
         const terminalCounts = [stdout.terminalErrorCount, stderr.terminalErrorCount].filter(
             (count): count is number => count !== undefined
         );
@@ -387,10 +487,30 @@ export class NativeCompilerOutputCollector {
                 `native compiler streams emitted conflicting terminal summaries: ${terminalCounts.join(' and ')}`
             );
         }
+        const terminalFileCounts = [stdout.terminalFileCount, stderr.terminalFileCount].filter(
+            (count): count is number => count !== undefined
+        );
+        if (terminalFileCounts.length > 1) {
+            throw new Error(
+                'native compiler streams emitted multiple compiler-diagnostics footers'
+            );
+        }
+        const parsedProgramMemberCount = files.length + bundledFiles.length;
+        if (
+            terminalFileCounts[0] !== undefined &&
+            terminalFileCounts[0] !== parsedProgramMemberCount
+        ) {
+            throw new Error(
+                `native compiler footer reported ${terminalFileCounts[0]} files but ${parsedProgramMemberCount} complete program members were parsed`
+            );
+        }
         return {
             diagnostics: [...stdout.diagnostics, ...stderr.diagnostics],
             files,
+            bundledFiles,
             terminalErrorCount: terminalCounts[0],
+            terminalFileCount: terminalFileCounts[0],
+            terminalCompletionSeen: stdout.terminalCompletionSeen || stderr.terminalCompletionSeen,
             outputTail: [stdout.tail, stderr.tail].filter(Boolean).join('\n')
         };
     }
@@ -420,6 +540,13 @@ async function runTsGo(
         // native semantic check whose diagnostics would immediately be discarded.
         wantsTypeScript ? '--listFiles' : '--listFilesOnly'
     ];
+
+    // A successful TypeScript CLI emits no `Found 0 errors` line. Request its bounded performance
+    // footer so `Total time` provides an explicit end-of-result marker; this works with both
+    // `--listFiles` and the non-checking `--listFilesOnly` path. Without it, an exit-0 child
+    // truncated immediately after a plausible file prefix is indistinguishable from a complete
+    // program-membership result.
+    compilerArgs.push('--diagnostics');
 
     if (opts.incremental && wantsTypeScript) {
         compilerArgs.push('--incremental');
@@ -593,6 +720,11 @@ async function runTsGo(
             `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) exited with code ${exitCode} before emitting its terminal error summary${formatCompilerOutput(parsed.outputTail)}`
         );
     }
+    if (!parsed.terminalCompletionSeen) {
+        throw new Error(
+            `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) completed without a terminal completion summary${formatCompilerOutput(parsed.outputTail)}`
+        );
+    }
     if (parsed.terminalErrorCount !== undefined && parsed.terminalErrorCount !== errorCount) {
         throw new Error(
             `tsgo (${overlay.engine.packageName}@${overlay.engine.version}) terminal summary reported ${parsed.terminalErrorCount} errors but ${errorCount} complete error diagnostics were parsed${formatCompilerOutput(parsed.outputTail)}`
@@ -712,8 +844,50 @@ function remapOverlayConfigDiagnostic(
     };
 }
 
-function isConfigurationDiagnostic(diagnostic: GeneratedDiagnostic): boolean {
-    return diagnostic.filePath === null || /\.json$/i.test(diagnostic.filePath);
+function isConfigurationDiagnostic(
+    original: GeneratedDiagnostic,
+    remapped: GeneratedDiagnostic,
+    overlay: TsGoBatchOverlay
+): boolean {
+    // A diagnostic attributed to one of our generated config files is remapped to the user's
+    // config. Compare before/after instead of treating every fileless diagnostic as config: global
+    // diagnostics such as TS2688 intentionally have no file but do not prevent program creation.
+    if (original.filePath !== remapped.filePath) {
+        return true;
+    }
+    // Configs may have arbitrary names (`@scope/tsconfig/base.json`), while imported JSON source
+    // files may contain ordinary syntax/type diagnostics. The graph recorded by TypeScript's own
+    // config parser is the discriminator, not the `.json` extension.
+    if (original.filePath) {
+        return overlay.isBaseConfigurationFile(original.filePath);
+    }
+    // Some config-parser diagnostics have no source span. Accept those only when the parser saw
+    // the same diagnostic code/category in the exact user config; native TS7 still decides whether
+    // the diagnostic exists, so newer valid options are never rejected by bundled TypeScript.
+    return overlay.matchesBaseConfigurationDiagnostic(original);
+}
+
+/** Complete recovery for native's rare nonfatal global/options-error short circuit. */
+function getClassicTypeScriptDiagnostics(opts: SvelteCheckCliOptions): Promise<FileDiagnostics[]> {
+    const svelteCheck = new SvelteCheck(opts.workspaceUri.fsPath, {
+        diagnosticSources: ['js'],
+        tsconfig: opts.tsconfig,
+        configPath: opts.config,
+        watch: false
+    });
+    return svelteCheck.getDiagnostics();
+}
+
+function diagnosticFact(diagnostic: {
+    severity?: DiagnosticSeverity;
+    code?: number | string;
+    message: string;
+}): string {
+    return JSON.stringify([
+        diagnostic.severity ?? null,
+        diagnostic.code ?? null,
+        diagnostic.message
+    ]);
 }
 
 /**

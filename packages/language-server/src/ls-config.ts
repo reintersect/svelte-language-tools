@@ -400,8 +400,21 @@ export class LSConfigManager {
     /**
      * Register a listener which is invoked when the config changed.
      */
-    onChange(callback: (config: LSConfigManager) => void): void {
+    onChange(callback: (config: LSConfigManager) => void): { dispose(): void } {
         this.listeners.push(callback);
+        let active = true;
+        return {
+            dispose: () => {
+                if (!active) {
+                    return;
+                }
+                active = false;
+                const index = this.listeners.indexOf(callback);
+                if (index !== -1) {
+                    this.listeners.splice(index, 1);
+                }
+            }
+        };
     }
 
     updateEmmetConfig(config: VSCodeEmmetConfig): void {

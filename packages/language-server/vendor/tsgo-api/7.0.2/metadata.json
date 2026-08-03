@@ -1,0 +1,9 @@
+{
+    "sourcePackage": "typescript",
+    "effectPackage": "@reintersect/effect-tsgo",
+    "effectPackageVersions": ["0.27.3"],
+    "tsVersion": "7.0.2",
+    "tsGitHead": "2bd066d87f5bafd315be9f40889d0a60b9e58e0b",
+    "sourceTarballSha256": "da2513f4b95176d6dde8b51aab7afe8a927656c9d277369793f77f7e59371c08",
+    "bundleSha256": "cdc2f4e48a2dfe569bdac486b9f37daffd07353644ad13b65dc218c084c41c98"
+}

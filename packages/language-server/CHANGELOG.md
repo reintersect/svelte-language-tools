@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.19.8
+
+### Patch Changes
+
+-   Persist exact, engine-scoped materialisation plans across editor and checker runs. Cached graphs
+    now validate configuration, filesystem topology, transforms and native-engine identity within
+    bounded budgets, publish outside the interactive request path, and fail closed when evidence is
+    stale, corrupt, incomplete or concurrently changed.
+-   Make template definitions and component completions faster and current across unsaved edits.
+    Member completions can use a bounded isolated type slice while tsgo warms; component definition
+    and checker work is single-flight, cancellable and version-guarded; parser-diagnostic
+    reconciliation no longer suppresses unrelated template errors. Supported Effect tsgo builds can
+    use the server's exact, identity-verified bundled API client when the engine package omits it.
+-   Keep interactive completion off whole-project materialisation. A valid first completion that
+    tsgo cannot answer yet lazily starts a completion-only classic resolver; unsupported contexts and
+    requests after native readiness do no classic work. Dirty TypeScript-family buffers are replayed
+    into that resolver without delaying their native lifecycle events, and both engines are disposed
+    with the server.
+-   Serialize open/change/close transitions, reject stale native feature responses before mapping,
+    preserve current Svelte document versions in mapped edits, and partition diagnostic generations
+    and cancellation by project so an edit in one workspace does not invalidate unrelated projects.
+-   Preserve JavaScript component JSDoc at the native boundary with `.jsx` shadows, while retaining
+    `.tsx` shadows for TypeScript components and the matching generated-document language ID.
+-   Updated dependencies:
+    -   @reintersect/svelte-load-config@0.2.5
+
 ## 0.19.7
 
 ### Patch Changes

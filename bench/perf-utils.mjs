@@ -10,8 +10,11 @@ export const uri = (filePath) => pathToFileURL(filePath).href;
 export function summarize(samples) {
     if (!samples.length) return null;
     const sorted = [...samples].sort((left, right) => left - right);
+    // Nearest-rank quantiles are deliberately one-based. Using floor(n * q) as a zero-based
+    // index made p95 equal the maximum for exactly 20 samples and biased every even-sized p50
+    // upward, which turned one scheduler hiccup into a false acceptance failure.
     const at = (quantile) =>
-        sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * quantile))];
+        sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * quantile) - 1))];
     const mean = sorted.reduce((sum, value) => sum + value, 0) / sorted.length;
     return {
         n: sorted.length,
@@ -362,6 +365,25 @@ export function validateLanguageServerStats(value) {
     const engine = requireRecord(stats.engine, 'language server stats.engine');
     requireNonEmptyString(engine.packageName, 'language server stats.engine.packageName');
     requireNonEmptyString(engine.version, 'language server stats.engine.version');
+    if (typeof engine.apiAvailable !== 'boolean') {
+        throw new Error(`language server stats.engine.apiAvailable must be a boolean`);
+    }
+    if (engine.compilerVersion !== undefined) {
+        requireNonEmptyString(
+            engine.compilerVersion,
+            'language server stats.engine.compilerVersion'
+        );
+        requireNonEmptyString(
+            engine.compilerGitHead,
+            'language server stats.engine.compilerGitHead'
+        );
+        if (!/^[0-9a-f]{40}$/i.test(engine.compilerGitHead)) {
+            throw new Error(`language server stats.engine.compilerGitHead must be a git commit`);
+        }
+        if (!['tsc', 'tsc-next'].includes(engine.channel)) {
+            throw new Error(`language server stats.engine.channel is invalid`);
+        }
+    }
     if (
         stats.nativeProcessId !== null &&
         (!Number.isSafeInteger(stats.nativeProcessId) || stats.nativeProcessId <= 0)
@@ -381,6 +403,10 @@ export function validateLanguageServerStats(value) {
             'reusedShadows',
             'projectChecks',
             'cancellations',
+            'completionApiHits',
+            'completionApiFallbacks',
+            'syncCoalesced',
+            'syncReused',
             'materialisationCleanupRuns',
             'materialisationCleanupSkips'
         ],
@@ -613,7 +639,7 @@ export function snapshotShadowMtimes(workspaceRoot) {
         for (const entry of entries) {
             const full = path.join(directory, entry.name);
             if (entry.isDirectory()) collectCache(full);
-            else if (entry.isFile() && entry.name.endsWith('.svelte.tsx')) {
+            else if (entry.isFile() && /\.svelte\.[jt]sx$/.test(entry.name)) {
                 mtimes.set(full, fs.statSync(full, { bigint: true }).mtimeNs.toString());
             }
         }

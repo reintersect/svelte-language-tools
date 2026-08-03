@@ -1,5 +1,16 @@
 # @reintersect/svelte-load-config
 
+## 0.2.5
+
+### Patch Changes
+
+-   Isolate nested SvelteKit packages even when older Kit, `graceful-fs`, PostCSS or Tailwind cache
+    process-relative state. The loader now combines the authored Svelte config with a clean,
+    package-rooted Vite CSS config, binds that config to `vitePreprocess`, and reasserts async-local
+    `process.cwd`/`path.resolve` dispatchers without changing the operating-system working directory.
+    Resolutions sharing one imported Vite module remain serialized so mutable plugin state cannot
+    overlap.
+
 ## 0.2.4
 
 ### Patch Changes

@@ -17,11 +17,12 @@
 > | editor: keystroke → diagnostics       | 948ms    | **420ms** |
 >
 > These figures predate the current correctness and lifecycle hardening and are historical context,
-> not current performance claims. The post-fix 1 August 2026 acceptance run found editor
-> fresh-process p50/p95 of 6.41s/7.97s classic versus 4.59s/5.40s stock tsgo. A separate strict
-> whole-project checker oracle completed in 17.3s classic versus 6.7s stock. Fail-fast dependency
-> discovery reduced the native adapter phase from roughly 13-17s to 1.45s; a warm checker reused all
-> 663 Svelte shadows in 148ms with zero transforms or writes.
+> not current performance claims. In the validated 2 August 2026 Reintersect run, paired fresh
+> editor processes over already-materialised disk state measured pull-diagnostic p50/p95 of
+> 5407ms/6490ms classic, 2960ms/3655ms stock tsgo, and 2926ms/3648ms Effect tsgo. First-dropdown
+> completion was 179.3ms stock and 233.4ms Effect; script and template member p95 stayed at 13-16ms.
+> See the measured cold-cache cost and full methodology below rather than treating those warm-disk
+> editor numbers as a universal startup claim.
 >
 > `pnpm test:tsgo-oracle` compares meaningful editor features against the classic engine, and the
 > whole-project checker oracle compares diagnostics plus normalized program membership. Exact parity
@@ -48,7 +49,7 @@ engine on — without it the fork behaves exactly like upstream.
 A language server (implementing the [language server protocol](https://microsoft.github.io/language-server-protocol/))
 for Svelte.
 
-Requires Node 12 or later.
+Requires Node 18 or later.
 
 ## Using this fork in VS Code
 
@@ -105,22 +106,56 @@ and even repaired they lose template-level positions, so diagnostics on markup (
 `<Component>`, a bad prop) can silently disappear. Turn it on only if that trade is acceptable;
 the default JS transform reports everything.
 
-### Historical performance context
+### Validated performance context
 
-An earlier build measured diagnostics after a keystroke at roughly 400ms instead of roughly 950ms,
-and a large-project open at roughly 3.5s instead of roughly 7.5s. The current paired editor run
-measured stock tsgo at 4.59s p50 against classic's 6.41s after aborting dependency proof work as soon
-as the conservative fallback became inevitable. The 80ms pull-diagnostic candidate improved
-p50/p95 latency by 10.2%/11.6%, but raised CPU by 31.4% and native checks by 46.7%, so the tested
-default remains 150ms. Hover, completion, go-to-definition and rename are all routed through tsgo
-when the engine is enabled.
+The 2 August 2026 Reintersect acceptance used 10 paired fresh editor processes per engine over
+already-materialised disk state. Lower is better:
+
+| Fresh-process editor pull | Classic TypeScript | Stock tsgo | Effect tsgo |
+| ------------------------- | -----------------: | ---------: | ----------: |
+| p50                       |             5407ms |     2960ms |      2926ms |
+| p95                       |             6490ms |     3655ms |      3648ms |
+
+Completion has a separate latency budget because a dropdown should not wait for whole-project
+materialisation:
+
+| Completion measurement | Stock tsgo | Effect tsgo |
+| ---------------------- | ---------: | ----------: |
+| First dropdown         |    179.3ms |     233.4ms |
+| Script member p95      |      ~15ms |        16ms |
+| Template member p95    |     14.2ms |      13.5ms |
+| Auto-import p95        |    190.4ms |     196.3ms |
+
+A valid completion requested before the native project is ready may lazily start a classic
+completion-only resolver so the first dropdown is useful instead of blank. It does not provide
+diagnostics or any other editor feature, unsupported completion contexts start neither engine, and
+native-ready completion stays on tsgo. Dirty TypeScript-family buffers are mirrored into this
+resolver when it exists.
+
+Those editor numbers are warm-disk, not clean-cache startup results. A checker run after deleting
+the materialisation cache took 14.304s classic, 33.058s stock and 35.044s Effect. The immediate warm
+rerun took 13.299s classic, 8.205s stock and 8.240s Effect. Each native warm rerun reused 675 Svelte
+shadows with zero transforms or writes, kept every shadow mtime stable, and returned field-for-field
+the same diagnostics as its corresponding cold run.
+
+The warm native profile still spent about 1.62s in materialisation. The dominant recorded work was
+about 0.90s looking up a persisted plan across 20,510 stat inputs, 0.57s loading SvelteKit state,
+0.185s loading configs and 0.099s restoring the plan. These timings are rounded and nested rather
+than additive. Actual source freshness checks took only 7-8ms, so hashing or transforming unchanged
+Svelte files is not the remaining bottleneck.
+
+The tested pull-diagnostic quiescence remains 150ms. At 80ms, stock p50/p95 improved 14.6%/12.8%,
+but process-tree CPU rose 24.1% and native-check count rose 33.3%. Effect p50 improved 14.4%, but p95
+regressed 59.2%, CPU rose 27.3%, and checks rose 29.8%. Hover, completion, go-to-definition and
+rename are routed through tsgo when the engine is enabled.
 
 ### What to expect that is different
 
 -   **No refactorings.** TypeScript 7 does not implement `refactor` code actions yet, so "Extract to
     function", "Move to file" and friends are absent. Quickfixes work, but not all of them.
 -   **A `node_modules/.cache/svelte-lsp` directory** appears in each package that has components. It
-    holds the generated `.tsx` twins tsgo type-checks; being under `node_modules/.cache` it is
+    holds generated `.tsx` twins for TypeScript components and `.jsx` twins for JavaScript
+    components; being under `node_modules/.cache` it is
     already ignored by git and search tools. Deleting it is always safe. (Older builds used a
     visible `.svelte-ls-overlay` directory instead — the server removes those on sight.)
 -   **The separate TypeScript plugin is unchanged.** `typescript-svelte-plugin` has no tsgo
@@ -140,10 +175,11 @@ installed in the workspace being edited. The server resolves the binary from the
 itself, so each project controls its exact installed version; `SVELTE_LS_TSGO_PACKAGE` selects one
 package for A/B runs. Repository CI asserts that the root, language-server and checker manifests all
 name the same exact stock-engine version and verifies the resolved package and version. With no
-supported engine present it logs an error and falls back to the JavaScript engine. Component-props
-completions additionally need the selected engine package's matching checker API client
-(`dist/api/async/api.js`). The server verifies that entry instead of borrowing another package's
-API; without it, component-level features are limited and everything else keeps working.
+supported engine present it logs an error and falls back to the JavaScript engine. Fast
+component/member completions additionally need a checker API client matching that exact native
+engine. Stock packages provide their own entry; tested Effect builds use the bundled official API
+client only after package version, TypeScript version, git identity and bundle hash all match. A
+mismatch fails closed to ordinary LSP completion instead of borrowing another engine's API.
 
 In an untrusted workspace the native path is disabled before package resolution: workspace engine
 code and configuration are neither imported nor spawned, and the server logs that it is using the

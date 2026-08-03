@@ -127,7 +127,11 @@ function checkerStats(materialise = materialiseResult()) {
 
 function languageServerStats() {
     return {
-        engine: { packageName: '@typescript/native-preview', version: '7.0.0-dev.test' },
+        engine: {
+            packageName: '@typescript/native-preview',
+            version: '7.0.0-dev.test',
+            apiAvailable: true
+        },
         nativeProcessId: 123,
         generation: 1,
         served: 10,
@@ -140,6 +144,10 @@ function languageServerStats() {
         reusedShadows: 3,
         projectChecks: 2,
         cancellations: 1,
+        completionApiHits: 4,
+        completionApiFallbacks: 1,
+        syncCoalesced: 3,
+        syncReused: 8,
         materialisationCleanupRuns: 1,
         materialisationCleanupSkips: 2,
         phaseTimings: { materialise: { count: 2, totalMs: 12.5 } }
@@ -154,6 +162,14 @@ test('summarize reports the acceptance quantiles', () => {
         p95: 5,
         max: 5,
         mean: 3
+    });
+    assert.deepEqual(summarize(Array.from({ length: 20 }, (_, index) => index + 1)), {
+        n: 20,
+        min: 1,
+        p50: 10,
+        p95: 19,
+        max: 20,
+        mean: 10.5
     });
 });
 
@@ -216,6 +232,10 @@ test('language server stats validation rejects missing counters and malformed ti
         () => validateLanguageServerStats(missingCleanupCounter),
         /materialisationCleanupSkips/
     );
+
+    const missingCompletionCounter = structuredClone(valid);
+    delete missingCompletionCounter.completionApiHits;
+    assert.throws(() => validateLanguageServerStats(missingCompletionCounter), /completionApiHits/);
 
     const invalidPhase = structuredClone(valid);
     invalidPhase.phaseTimings.materialise.totalMs = Number.NaN;
@@ -280,7 +300,7 @@ test('overlay creation summaries report every phase', () => {
     const second = Object.fromEntries(BATCH_CREATION_PHASES.map((phase) => [phase, 3]));
     const summary = summarizeBatchOverlayCreationTimings([first, second]);
 
-    assert.equal(summary.discoverProjectGraphMs.p50, 3);
+    assert.equal(summary.discoverProjectGraphMs.p50, 1);
     assert.equal(summary.totalMs.p95, 3);
 });
 
@@ -318,6 +338,7 @@ test('shadow mtime scan includes build/dist roots and prunes dependencies and ne
     };
     try {
         const rootShadow = writeShadow('node_modules/.cache/svelte-lsp/root.svelte.tsx');
+        const rootJsShadow = writeShadow('node_modules/.cache/svelte-lsp/root-js.svelte.jsx');
         const buildShadow = writeShadow(
             'build/pkg/node_modules/.cache/svelte-lsp/build.svelte.tsx'
         );
@@ -329,7 +350,7 @@ test('shadow mtime scan includes build/dist roots and prunes dependencies and ne
         fs.writeFileSync(path.join(root, 'nested-worktree', '.git'), 'gitdir: elsewhere');
 
         const files = [...snapshotShadowMtimes(root).keys()].sort();
-        assert.deepEqual(files, [rootShadow, buildShadow, distShadow].sort());
+        assert.deepEqual(files, [rootShadow, rootJsShadow, buildShadow, distShadow].sort());
         assert.ok(!files.includes(nested));
     } finally {
         fs.rmSync(root, { recursive: true, force: true });

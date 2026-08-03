@@ -2,6 +2,25 @@ import { ComponentPartInfo } from '../../typescript/ComponentInfoProvider';
 import { Logger } from '../../../logger';
 import { TsGoApiSession } from './TsGoApiSession';
 
+type ComponentDefinition = { filePath: string; offset: number } | undefined;
+
+type DefinitionLookup =
+    | { ok: true; definition: ComponentDefinition }
+    | { ok: false; definition?: never };
+
+type PartLookup = {
+    definition: ComponentDefinition;
+    /** Only a successfully enumerated carrier is safe to memoise, including an empty one. */
+    cacheable: boolean;
+    parts: ComponentPartInfo;
+    token?: string;
+};
+
+type InFlightPartLookup = {
+    promise: Promise<PartLookup | undefined>;
+    waiters: Set<() => boolean>;
+};
+
 /**
  * Port of `ComponentInfoProvider` onto tsgo's checker.
  *
@@ -26,10 +45,13 @@ export class TsGoComponentInfo {
      * inside one file only changes when imports change — a watched-file event — while the
      * definition lookup is an LSP round trip paid on every keystroke inside the tag otherwise.
      */
-    private readonly definitionCache = new Map<
-        string,
-        { filePath: string; offset: number } | undefined
-    >();
+    private readonly definitionCache = new Map<string, ComponentDefinition>();
+    /** Concurrent requests for the same tag occurrence share its native definition request. */
+    private readonly definitionLookups = new Map<string, Promise<DefinitionLookup>>();
+    /** Concurrent completion and hover requests share the checker walk as well. */
+    private readonly partLookups = new Map<string, InFlightPartLookup>();
+    /** Prevent an in-flight request from repopulating caches after any invalidation boundary. */
+    private invalidationEpoch = 0;
 
     constructor(
         private readonly session: TsGoApiSession,
@@ -48,6 +70,7 @@ export class TsGoComponentInfo {
 
     /** Drop every memoised answer — a watched file changed, or tsgo restarted. */
     clearCache() {
+        this.invalidationEpoch++;
         this.cache.clear();
         this.definitionCache.clear();
     }
@@ -58,6 +81,7 @@ export class TsGoComponentInfo {
      * fail closed by re-resolving tag definitions while retaining declaration type descriptions.
      */
     invalidateResolutionGraph() {
+        this.invalidationEpoch++;
         this.definitionCache.clear();
     }
 
@@ -74,10 +98,17 @@ export class TsGoComponentInfo {
      * file event. Declaration-side entries are removed as well so open TS/Svelte edits cannot
      * leave stale prop types behind.
      */
-    invalidateFile(filePath: string) {
+    invalidateFile(filePath: string, preserveUsageDefinitions = false) {
+        this.invalidationEpoch++;
         const usagePrefix = `${filePath}::`;
         for (const [key, definition] of this.definitionCache) {
-            if (key.startsWith(usagePrefix) || definition?.filePath === filePath) {
+            if (
+                (!preserveUsageDefinitions && key.startsWith(usagePrefix)) ||
+                (preserveUsageDefinitions &&
+                    key.startsWith(usagePrefix) &&
+                    definition === undefined) ||
+                definition?.filePath === filePath
+            ) {
                 this.definitionCache.delete(key);
             }
         }
@@ -92,25 +123,53 @@ export class TsGoComponentInfo {
     async getProps(
         shadowPath: string,
         generatedOffset: number,
-        tagName?: string
+        tagName?: string,
+        resolutionKey?: string,
+        isCurrent: () => boolean = () => true
     ): Promise<ComponentPartInfo> {
-        return this.getPart(shadowPath, generatedOffset, 'props', undefined, tagName);
+        return this.getPart(
+            shadowPath,
+            generatedOffset,
+            'props',
+            undefined,
+            tagName,
+            resolutionKey,
+            isCurrent
+        );
     }
 
     async getEvents(
         shadowPath: string,
         generatedOffset: number,
-        tagName?: string
+        tagName?: string,
+        isCurrent: () => boolean = () => true
     ): Promise<ComponentPartInfo> {
-        return this.getPart(shadowPath, generatedOffset, 'events', undefined, tagName);
+        return this.getPart(
+            shadowPath,
+            generatedOffset,
+            'events',
+            undefined,
+            tagName,
+            undefined,
+            isCurrent
+        );
     }
 
     async getSlotLets(
         shadowPath: string,
         generatedOffset: number,
-        slot = 'default'
+        slot = 'default',
+        isCurrent: () => boolean = () => true
     ): Promise<ComponentPartInfo> {
-        return this.getPart(shadowPath, generatedOffset, 'slots', slot);
+        return this.getPart(
+            shadowPath,
+            generatedOffset,
+            'slots',
+            slot,
+            undefined,
+            undefined,
+            isCurrent
+        );
     }
 
     private async getPart(
@@ -118,9 +177,14 @@ export class TsGoComponentInfo {
         generatedOffset: number,
         part: 'props' | 'events' | 'slots',
         slot?: string,
-        tagName?: string
+        tagName?: string,
+        resolutionKey?: string,
+        isCurrent: () => boolean = () => true
     ): Promise<ComponentPartInfo> {
         try {
+            if (!isCurrent()) {
+                return [];
+            }
             // Resolve the declaration first: it is both the anchor for the type walk and the
             // cache key. Memoised per (usage file, tag name) so a keystroke inside the tag
             // costs no LSP round trip at all once the component is known.
@@ -129,83 +193,216 @@ export class TsGoComponentInfo {
             // `<Button>` occurrences in one file may legitimately resolve to different symbols.
             // Include the generated usage position so each lexical occurrence retains its own
             // definition while repeated requests at that occurrence still share the lookup.
-            const definitionKey = tagName
-                ? `${shadowPath}::${tagName}::${generatedOffset}`
+            const definitionKey = resolutionKey
+                ? `${shadowPath}::${resolutionKey}`
+                : tagName
+                  ? `${shadowPath}::${tagName}::${generatedOffset}`
+                  : undefined;
+            const epoch = this.invalidationEpoch;
+            const hasCachedDefinition = !!definitionKey && this.definitionCache.has(definitionKey);
+            const cachedDefinition = hasCachedDefinition
+                ? this.definitionCache.get(definitionKey!)
                 : undefined;
-            let definition = definitionKey ? this.definitionCache.get(definitionKey) : undefined;
-            if (
-                definition === undefined &&
-                (!definitionKey || !this.definitionCache.has(definitionKey))
-            ) {
-                definition = await this.definitionAt(shadowPath, generatedOffset);
-                if (definitionKey) {
-                    if (this.definitionCache.size >= 200) {
-                        this.definitionCache.delete(this.definitionCache.keys().next().value!);
-                    }
-                    this.definitionCache.set(definitionKey, definition);
-                }
-            }
-            const cacheKey = definition
-                ? `${definition.filePath}:${definition.offset}:${part}:${slot ?? ''}`
-                : undefined;
-            if (cacheKey) {
-                const cached = this.cache.get(cacheKey);
-                if (cached && cached.token === this.cacheToken(definition!.filePath)) {
-                    return cached.parts;
-                }
+            const cachedParts = this.getCachedPart(cachedDefinition, part, slot);
+            if (cachedParts) {
+                return cachedParts.parts;
             }
 
-            // Connecting (inside getProjectForFile) is what populates `signatureKind`, so the
-            // kinds check has to come after it — not before, where it would always be empty on
-            // the very first lookup and silently disable the feature.
-            const project = await this.session.getProjectForFile(shadowPath);
-            const kinds = this.session.signatureKind;
-            if (!project || !kinds) {
-                return [];
-            }
-            const checker = project.checker;
-
-            const type = await this.componentTypeAt(
-                checker,
+            // Starting the definition request and checker project acquisition together removes
+            // an entire transport round trip from cold component completion. The two results only
+            // meet inside the leased project callback, immediately before the type walk.
+            const definitionLookupKey = `${epoch}:${definitionKey ?? `${shadowPath}::${generatedOffset}`}`;
+            const definitionPromise = hasCachedDefinition
+                ? Promise.resolve<DefinitionLookup>({
+                      ok: true,
+                      definition: cachedDefinition
+                  })
+                : this.definitionSingleFlight(definitionLookupKey, shadowPath, generatedOffset);
+            // Definition identity survives attribute-only edits, but a generated offset is tied
+            // to one concrete shadow text. Never make an overtaken request's checker position
+            // authoritative for a newer buffer merely because both refer to the same component.
+            const partLookupKey = `${definitionLookupKey}:${generatedOffset}:${part}:${slot ?? ''}`;
+            const lookup = this.partSingleFlight(
+                partLookupKey,
                 shadowPath,
                 generatedOffset,
-                definition
+                part,
+                slot,
+                definitionPromise,
+                epoch,
+                isCurrent
             );
-            if (!type) {
+            let result: PartLookup | undefined;
+            try {
+                result = await lookup.promise;
+            } finally {
+                lookup.waiters.delete(isCurrent);
+            }
+            if (!result || !isCurrent() || epoch !== this.invalidationEpoch) {
                 return [];
             }
 
-            const carrier = await this.resolveCarrier(checker, kinds, type, part);
-            if (!carrier) {
-                return [];
+            if (definitionKey) {
+                this.setBounded(this.definitionCache, definitionKey, result.definition);
             }
-
-            let parts: ComponentPartInfo;
-            if (part === 'slots') {
-                const slotSymbol = await checker.getPropertyOfType(carrier, slot ?? 'default');
-                if (!slotSymbol) {
+            if (result.cacheable && result.definition && result.token) {
+                // An open declaration may have changed while its checker calls were in flight.
+                // Only publish an answer against the exact declaration version we enumerated.
+                if (result.token !== this.cacheToken(result.definition.filePath)) {
                     return [];
                 }
-                const slotType = await checker.getTypeOfSymbol(slotSymbol);
-                parts = slotType ? await this.describe(checker, slotType) : [];
-            } else {
-                parts = await this.describe(checker, carrier);
-            }
-
-            if (cacheKey && parts.length) {
-                if (this.cache.size >= 200) {
-                    this.cache.delete(this.cache.keys().next().value!);
-                }
-                this.cache.set(cacheKey, {
-                    token: this.cacheToken(definition!.filePath),
-                    parts
+                this.setBounded(this.cache, this.partCacheKey(result.definition, part, slot), {
+                    token: result.token,
+                    parts: result.parts
                 });
             }
-            return parts;
+            return result.parts;
         } catch (e) {
             Logger.debug('[tsgo] component info lookup failed', e);
             return [];
         }
+    }
+
+    private definitionSingleFlight(
+        key: string,
+        shadowPath: string,
+        generatedOffset: number
+    ): Promise<DefinitionLookup> {
+        const existing = this.definitionLookups.get(key);
+        if (existing) {
+            return existing;
+        }
+        const lookup = Promise.resolve()
+            .then(() => this.definitionAt(shadowPath, generatedOffset))
+            .then<DefinitionLookup>((definition) => ({ ok: true, definition }))
+            .catch<DefinitionLookup>((error) => {
+                Logger.debug('[tsgo] component definition lookup failed', error);
+                return { ok: false };
+            });
+        const tracked = lookup.finally(() => {
+            if (this.definitionLookups.get(key) === tracked) {
+                this.definitionLookups.delete(key);
+            }
+        });
+        this.definitionLookups.set(key, tracked);
+        return tracked;
+    }
+
+    private partSingleFlight(
+        key: string,
+        shadowPath: string,
+        generatedOffset: number,
+        part: 'props' | 'events' | 'slots',
+        slot: string | undefined,
+        definitionPromise: Promise<DefinitionLookup>,
+        epoch: number,
+        isCurrent: () => boolean
+    ): InFlightPartLookup {
+        const existing = this.partLookups.get(key);
+        if (existing) {
+            existing.waiters.add(isCurrent);
+            return existing;
+        }
+        const lookup: InFlightPartLookup = {
+            promise: Promise.resolve(undefined),
+            waiters: new Set([isCurrent])
+        };
+        const anyCurrent = () =>
+            epoch === this.invalidationEpoch && [...lookup.waiters].some((current) => current());
+        const operation = this.session.withProjectForFile(
+            shadowPath,
+            async (project): Promise<PartLookup | undefined> => {
+                const resolvedDefinition = await definitionPromise;
+                if (!resolvedDefinition.ok || !anyCurrent()) {
+                    return undefined;
+                }
+                const definition = resolvedDefinition.definition;
+                // Capture before touching the checker. If an open declaration changes during
+                // the walk, the caller's post-walk token comparison rejects this old snapshot.
+                const token = definition ? this.cacheToken(definition.filePath) : undefined;
+
+                // Connecting is what populates signatureKind, so inspect it only inside the
+                // leased project callback. Every checker round trip below must retain that lease:
+                // refreshing/disposal midway invalidates Project handles.
+                const kinds = this.session.signatureKind;
+                if (!kinds) {
+                    return { definition, cacheable: false, parts: [] };
+                }
+                const checker = project.checker;
+                const type = await this.componentTypeAt(
+                    checker,
+                    shadowPath,
+                    generatedOffset,
+                    definition
+                );
+                if (!type) {
+                    return { definition, cacheable: false, parts: [] };
+                }
+
+                const carrier = await this.resolveCarrier(checker, kinds, type, part);
+                if (!carrier) {
+                    return { definition, cacheable: false, parts: [] };
+                }
+
+                let parts: ComponentPartInfo;
+                if (part === 'slots') {
+                    const slotSymbol = await checker.getPropertyOfType(carrier, slot ?? 'default');
+                    if (!slotSymbol) {
+                        return { definition, cacheable: false, parts: [] };
+                    }
+                    const slotType = await checker.getTypeOfSymbol(slotSymbol);
+                    if (!slotType) {
+                        return { definition, cacheable: false, parts: [] };
+                    }
+                    parts = await this.describe(checker, slotType);
+                } else {
+                    parts = await this.describe(checker, carrier);
+                }
+
+                return {
+                    definition,
+                    cacheable: true,
+                    parts,
+                    ...(token ? { token } : {})
+                };
+            },
+            anyCurrent
+        );
+        const tracked = operation.finally(() => {
+            if (this.partLookups.get(key) === lookup) {
+                this.partLookups.delete(key);
+            }
+        });
+        lookup.promise = tracked;
+        this.partLookups.set(key, lookup);
+        return lookup;
+    }
+
+    private getCachedPart(
+        definition: ComponentDefinition,
+        part: 'props' | 'events' | 'slots',
+        slot: string | undefined
+    ): { parts: ComponentPartInfo } | undefined {
+        if (!definition) {
+            return undefined;
+        }
+        const cached = this.cache.get(this.partCacheKey(definition, part, slot));
+        return cached?.token === this.cacheToken(definition.filePath) ? cached : undefined;
+    }
+
+    private partCacheKey(
+        definition: Exclude<ComponentDefinition, undefined>,
+        part: 'props' | 'events' | 'slots',
+        slot: string | undefined
+    ): string {
+        return `${definition.filePath}:${definition.offset}:${part}:${slot ?? ''}`;
+    }
+
+    private setBounded<K, V>(map: Map<K, V>, key: K, value: V) {
+        if (map.size >= 200 && !map.has(key)) {
+            map.delete(map.keys().next().value!);
+        }
+        map.set(key, value);
     }
 
     private cacheToken(declarationPath: string): string {

@@ -336,6 +336,43 @@ describe('typescript-go ProjectRegistry', () => {
         assert.strictEqual(projects.forFile(`${uiRoot}/src/lib/Same.svelte`), ui);
     });
 
+    it('indexes every project which consumes a shared ordinary source', () => {
+        const projects = registry();
+        const app = projects.forFile(`${appRoot}/src/lib/Same.svelte`);
+        const ui = projects.forFile(`${uiRoot}/src/lib/Same.svelte`);
+        const shared = `${monorepo}/packages/shared/src/state.ts`;
+        projects.recordProjectGraphInputs(app, {
+            configInputs: [`${appRoot}/tsconfig.json`],
+            manifestInputs: [],
+            sourceInputs: [{ path: shared }]
+        });
+        projects.recordProjectGraphInputs(ui, {
+            configInputs: [`${uiRoot}/tsconfig.json`],
+            manifestInputs: [],
+            sourceInputs: [{ path: shared }]
+        });
+
+        assert.deepStrictEqual(
+            new Set(projects.consumersForSourceChange(shared)),
+            new Set([app, ui])
+        );
+        assert.deepStrictEqual(projects.consumersForSourceChange(`${appRoot}/src/unused.ts`), []);
+    });
+
+    it('cannot prove ordinary-source ownership until every live program graph is published', () => {
+        const projects = registry();
+        const app = projects.forFile(`${appRoot}/src/lib/Same.svelte`);
+        projects.forFile(`${uiRoot}/src/lib/Same.svelte`);
+        const shared = `${monorepo}/packages/shared/src/state.ts`;
+        projects.recordProjectGraphInputs(app, {
+            configInputs: [`${appRoot}/tsconfig.json`],
+            manifestInputs: [],
+            sourceInputs: [{ path: `${appRoot}/src/main.ts` }]
+        });
+
+        assert.strictEqual(projects.consumersForSourceChange(shared), undefined);
+    });
+
     it("maps a consumer shadow through the owner's dirty pinned snapshot", () => {
         const root = normalizePath(fs.mkdtempSync(path.join(os.tmpdir(), 'svelte-owner-map-')));
         const app = `${root}/apps/app`;

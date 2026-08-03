@@ -57,6 +57,7 @@ import {
     LSAndTSDocResolver
 } from './plugins';
 import {
+    createTsGoBackedPlugin,
     createTsGoPlugin,
     isRsvelteEnabled,
     isTsGoEnabled,
@@ -420,9 +421,9 @@ export function startServer(options?: LSOptions) {
             );
         }
 
-        // Full tsgo: when enabled, the JS TypeScript engine is not constructed at all. Building
-        // it registers document listeners and its own snapshot pipeline, so merely having it
-        // around means paying for a second engine even when nothing queries it.
+        // Full tsgo: the JavaScript TypeScript engine is absent from normal startup and every
+        // feature remains owned by tsgo. A completion-only classic owner is constructed lazily
+        // below only when a valid first request arrives before the native project is ready.
         tsGoPlugin = tsGoEnabled
             ? createTsGoPlugin({
                   workspacePath: urlToPath(normalizedWorkspaceUris[0] ?? '') ?? process.cwd(),
@@ -447,7 +448,18 @@ export function startServer(options?: LSOptions) {
             : undefined;
 
         if (tsGoPlugin) {
-            pluginHost.register(tsGoPlugin);
+            // The classic project service is expensive enough to erase much of tsgo's startup
+            // win, but valid completions must never become an empty dropdown while the first
+            // native project is materialising. Construct the classic completion owner only if a
+            // real cold request cannot use the bounded isolated path. It is not registered with
+            // PluginHost, so diagnostics and every other TypeScript feature remain native-only.
+            pluginHost.register(
+                createTsGoBackedPlugin(
+                    { __name: 'tsgo' },
+                    tsGoPlugin,
+                    createClassicCompletionFallback
+                )
+            );
         } else {
             pluginHost.register(createTypeScriptPlugin());
         }
@@ -455,22 +467,62 @@ export function startServer(options?: LSOptions) {
         dynamicTsOrJsTextSync =
             !!tsGoPlugin && !!evt.capabilities.textDocument?.synchronization?.dynamicRegistration;
 
-        function createTypeScriptPlugin() {
+        function createTypeScriptResolver(completionOnly = false) {
+            return new LSAndTSDocResolver(docManager, normalizedWorkspaceUris, configManager, {
+                notifyExceedSizeLimit: notifyTsServiceExceedSizeLimit,
+                onProjectReloaded: completionOnly ? undefined : refreshCrossFilesSemanticFeatures,
+                watch: !completionOnly,
+                nonRecursiveWatchPattern,
+                watchDirectory: completionOnly ? undefined : (patterns) => watchDirectory(patterns),
+                reportConfigError: completionOnly
+                    ? undefined
+                    : (diagnostic) => {
+                          connection?.sendDiagnostics(diagnostic);
+                      }
+            });
+        }
+
+        function createTypeScriptPlugin(
+            completionOnly = false,
+            resolver = createTypeScriptResolver(completionOnly)
+        ) {
             return new TypeScriptPlugin(
                 configManager,
-                new LSAndTSDocResolver(docManager, normalizedWorkspaceUris, configManager, {
-                    notifyExceedSizeLimit: notifyTsServiceExceedSizeLimit,
-                    onProjectReloaded: refreshCrossFilesSemanticFeatures,
-                    watch: true,
-                    nonRecursiveWatchPattern,
-                    watchDirectory: (patterns) => watchDirectory(patterns),
-                    reportConfigError(diagnostic) {
-                        connection?.sendDiagnostics(diagnostic);
-                    }
-                }),
+                resolver,
                 normalizedWorkspaceUris,
                 docManager
             );
+        }
+
+        async function createClassicCompletionFallback(document: Document) {
+            // This snapshot is deliberately taken before the first await. The composition layer
+            // serializes lifecycle messages which arrive after construction starts, preventing an
+            // incremental edit from being applied both here and again after the factory resolves.
+            const initialDirtyBuffers = [...openTsOrJsDocuments.values()].filter(
+                (state) =>
+                    state.open && state.text !== undefined && isTsOrJsLanguageId(state.languageId)
+            );
+            const resolver = createTypeScriptResolver(true);
+            const plugin = createTypeScriptPlugin(true, resolver);
+
+            try {
+                // updateExistingTsOrJsFile intentionally ignores files before a project service
+                // and its snapshot exist. Initialize the exact completion project first, then
+                // seed each dirty source snapshot from disk before replacing it with the editor
+                // buffer.
+                await resolver.getLSAndTSDoc(document);
+                for (const state of initialDirtyBuffers) {
+                    await resolver.getOrCreateSnapshot(state.fileName);
+                    await plugin.updateTsOrJsFile(state.fileName, [{ text: state.text! }]);
+                }
+            } catch (error) {
+                plugin.dispose();
+                throw error;
+            }
+            // Standard TS/JS synchronization is kept outside DocumentManager. Replay the exact
+            // dirty buffers that predate lazy construction; subsequent lifecycle calls are
+            // mirrored by createTsGoBackedPlugin once construction has started.
+            return plugin;
         }
 
         const clientSupportApplyEditCommand = !!evt.capabilities.workspace?.applyEdit;

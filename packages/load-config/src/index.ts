@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL, URL } from 'node:url';
@@ -32,11 +33,23 @@ interface FailedConfig {
 type LoadConfigResult = LoadedConfig | FailedConfig | undefined;
 
 interface ViteModule {
+    loadConfigFromFile?(
+        configEnv: { command: 'build' | 'serve'; mode: string },
+        configFile?: string,
+        configRoot?: string,
+        logLevel?: string
+    ): Promise<{ config: Record<string, unknown> } | null>;
     resolveConfig(
-        inlineConfig: { root: string; configFile: string; logLevel?: string },
+        inlineConfig: Record<string, unknown> & {
+            root: string;
+            configFile: string | false;
+            logLevel?: string;
+        },
         command: 'build' | 'serve'
     ): Promise<{
+        root?: string;
         plugins: Array<{ name?: string; api?: { options?: SvelteConfig } }>;
+        [key: string]: unknown;
     }>;
 }
 
@@ -50,6 +63,71 @@ const cache = new Map<string, Promise<LoadConfigResult>>();
 let configImportEpoch = 0;
 /** Avoid evicting the same CommonJS module repeatedly during one coherent reload generation. */
 const importedConfigEpochByPath = new Map<string, number>();
+
+/**
+ * SvelteKit versions before its Vite plugin became root-aware load `svelte.config` from
+ * `process.cwd()` while Vite is evaluating `vite.config`. Vite's `root` option is therefore too
+ * late for nested workspace packages. Changing the real cwd would make concurrent package loads
+ * race with one another (and with unrelated preprocessors), so expose the requested root only to
+ * the async call tree that is resolving that package's Vite config.
+ *
+ * The dispatcher remains installed for the lifetime of this module because config evaluation can
+ * start asynchronous work. Outside a resolution context it delegates to Node's original cwd
+ * implementation and is therefore behaviorally transparent.
+ */
+const viteConfigRoot = new AsyncLocalStorage<string>();
+const originalCwd = process.cwd.bind(process);
+const originalPathResolve = path.resolve.bind(path);
+/**
+ * Vite and its plugins may keep config-resolution state at module scope. In particular, older
+ * SvelteKit Vite plugins capture cwd when their module is first evaluated. Serialize projects
+ * which resolve through the same imported Vite module while still allowing independently
+ * installed Vite toolchains to load in parallel.
+ */
+const viteResolveQueues = new WeakMap<ViteModule, Promise<void>>();
+
+function withViteConfigRoot<T>(root: string, resolve: () => Promise<T>): Promise<T> {
+    installVirtualRootDispatchers();
+    return viteConfigRoot.run(root, resolve);
+}
+
+function virtualCwd(): string {
+    return viteConfigRoot.getStore() ?? originalCwd();
+}
+
+function virtualPathResolve(...segments: string[]): string {
+    const root = viteConfigRoot.getStore();
+    return root ? originalPathResolve(root, ...segments) : originalPathResolve(...segments);
+}
+
+function installVirtualRootDispatchers(): void {
+    // graceful-fs replaces process.cwd while Vite evaluates a config, captures our dispatcher,
+    // and memoizes the first async-local result it observes. Reassert both stable dispatchers for
+    // every rooted operation so that replacement cannot pin all later packages to the first one.
+    if (process.cwd !== virtualCwd) {
+        process.cwd = virtualCwd;
+    }
+    // Tailwind 3 resolves its default `tailwind.config` through the public path helper at style
+    // transform time. Dispatch it through the same async-local root as process.cwd. Absolute path
+    // arguments retain normal `path.resolve` semantics, and callers outside config/preprocess
+    // resolution continue to use the real cwd.
+    if (path.resolve !== virtualPathResolve) {
+        path.resolve = virtualPathResolve;
+    }
+}
+
+function serializeViteResolve<T>(vite: ViteModule, resolve: () => Promise<T>): Promise<T> {
+    const previous = viteResolveQueues.get(vite) ?? Promise.resolve();
+    const current = previous.then(resolve, resolve);
+    viteResolveQueues.set(
+        vite,
+        current.then(
+            () => undefined,
+            () => undefined
+        )
+    );
+    return current;
+}
 
 /**
  * This function encapsulates the import call in a way
@@ -114,7 +192,7 @@ async function loadConfigFromFile(
         return (await loadSvelteConfig(configFilePath, epoch)) ?? undefined;
     }
 
-    const viteResult = await loadSvelteConfigFromVite(root, configFilePath);
+    const viteResult = await loadSvelteConfigFromVite(root, configFilePath, epoch);
     if (viteResult !== undefined) {
         return viteResult;
     }
@@ -162,7 +240,7 @@ async function loadConfigFromDirectory(dir: string, epoch: number): Promise<Load
     let viteError: FailedConfig | undefined;
 
     if (viteConfigPath) {
-        const result = await loadSvelteConfigFromVite(dir, viteConfigPath);
+        const result = await loadSvelteConfigFromVite(dir, viteConfigPath, epoch);
         if (isLoadedConfig(result)) {
             return result;
         }
@@ -185,20 +263,85 @@ async function loadConfigFromDirectory(dir: string, epoch: number): Promise<Load
 
 async function loadSvelteConfigFromVite(
     root: string,
-    configFilePath: string
+    configFilePath: string,
+    epoch: number
 ): Promise<LoadConfigResult> {
     const vite = await tryImportVite(root);
     if (!vite) {
         return undefined;
     }
 
-    // `root` and `configFile` are the Vite API's project-boundary inputs. Do not emulate the
-    // Vite CLI by changing process.cwd(): the language server resolves package configs while
-    // unrelated documents are being preprocessed, and cwd is process-wide across those tasks.
     try {
-        const resolved = await vite.resolveConfig(
-            { root, configFile: configFilePath, logLevel: 'error' },
-            'serve'
+        const svelteConfigPath = findConfigInDirectory(
+            root,
+            'svelte.config',
+            getSvelteConfigExtensions()
+        );
+        if (svelteConfigPath && vite.loadConfigFromFile) {
+            const authored = await withViteConfigRoot(root, () =>
+                loadSvelteConfig(svelteConfigPath, epoch)
+            );
+            if (!isLoadedConfig(authored)) {
+                return authored;
+            }
+
+            const cleanCssConfig = await serializeViteResolve(vite, async () => {
+                const loadedViteConfig = await withViteConfigRoot(root, () =>
+                    vite.loadConfigFromFile!(
+                        { command: 'serve', mode: 'development' },
+                        configFilePath,
+                        root,
+                        'error'
+                    )
+                );
+                if (!loadedViteConfig) {
+                    return undefined;
+                }
+                const authoredCss =
+                    loadedViteConfig.config.css && typeof loadedViteConfig.config.css === 'object'
+                        ? (loadedViteConfig.config.css as Record<string, unknown>)
+                        : {};
+                // Vite's file loader evaluates config functions but does not run plugin hooks.
+                // Resolve only its authored CSS options so an old SvelteKit plugin cannot replace
+                // the package root, and no arbitrary Vite plugin state enters the checker.
+                const resolved = await withViteConfigRoot(root, () =>
+                    vite.resolveConfig(
+                        {
+                            root,
+                            configFile: false,
+                            logLevel: 'error',
+                            plugins: [],
+                            css: {
+                                ...authoredCss,
+                                // This is Vite's default search path made explicit. PostCSS loaders
+                                // otherwise fall back through process cwd while several workspace
+                                // configs are being initialized concurrently.
+                                postcss: authoredCss.postcss ?? root
+                            }
+                        },
+                        'serve'
+                    )
+                );
+                return resolved;
+            });
+
+            if (cleanCssConfig) {
+                bindVitePreprocessConfig(authored.config, cleanCssConfig, root);
+                return {
+                    config: authored.config,
+                    configFilePath,
+                    configSource: 'vite'
+                };
+            }
+        }
+
+        // Preserve the original Vite-only and old-Vite compatibility path. Older SvelteKit
+        // releases consult process.cwd() while vite.config is evaluated, so virtualize that lookup
+        // per async resolution without changing the process-wide OS cwd.
+        const resolved = await serializeViteResolve(vite, () =>
+            withViteConfigRoot(root, () =>
+                vite.resolveConfig({ root, configFile: configFilePath, logLevel: 'error' }, 'serve')
+            )
         );
         const kitPlugin = resolved.plugins.find(
             (plugin) => plugin.name === 'vite-plugin-sveltekit-setup'
@@ -231,6 +374,34 @@ async function loadSvelteConfigFromVite(
             configSource: 'vite'
         };
     }
+}
+
+function bindVitePreprocessConfig(
+    config: SvelteConfig,
+    resolved: Awaited<ReturnType<ViteModule['resolveConfig']>>,
+    root: string
+): Array<(...args: unknown[]) => Promise<unknown>> {
+    const styles: Array<(...args: unknown[]) => Promise<unknown>> = [];
+    const preprocessors = Array.isArray(config.preprocess)
+        ? config.preprocess
+        : [config.preprocess];
+    for (const preprocessor of preprocessors) {
+        const group = preprocessor as {
+            style?: ((...args: unknown[]) => unknown) & { __resolvedConfig?: unknown };
+        };
+        const style = group?.style;
+        if (style && '__resolvedConfig' in style) {
+            style.__resolvedConfig = resolved;
+            const packageLocalStyle = function (this: unknown, ...args: unknown[]) {
+                return withViteConfigRoot(root, () => Promise.resolve(style.apply(this, args)));
+            } as typeof style;
+            Object.assign(packageLocalStyle, style);
+            packageLocalStyle.__resolvedConfig = resolved;
+            group.style = packageLocalStyle;
+            styles.push(packageLocalStyle as (...args: unknown[]) => Promise<unknown>);
+        }
+    }
+    return styles;
 }
 
 async function loadSvelteConfig(configFilePath: string, epoch: number): Promise<LoadConfigResult> {
