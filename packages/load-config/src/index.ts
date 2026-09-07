@@ -13,6 +13,7 @@ interface SvelteConfig {
     compilerOptions?: Record<string, unknown>;
     preprocess?: unknown;
     extensions?: string[];
+    /** NOTE: SvelteKit 3 has all at its config merged into the top level and this entry is deprecated so this may not exist anymore at some point */
     kit?: unknown;
     vitePlugin?: unknown;
     [key: string]: unknown;
@@ -271,6 +272,7 @@ async function loadSvelteConfigFromVite(
         return undefined;
     }
 
+<<<<<<< HEAD
     try {
         const svelteConfigPath = findConfigInDirectory(
             root,
@@ -342,15 +344,31 @@ async function loadSvelteConfigFromVite(
             withViteConfigRoot(root, () =>
                 vite.resolveConfig({ root, configFile: configFilePath, logLevel: 'error' }, 'serve')
             )
+=======
+    // Make sure that only one Vite config is resolved at a time, to prevent race conditions with multiple
+    // calls to `loadConfig` ending up with changing the process' current working directory mid-resolution.
+    const previous = resolving;
+    let resolve;
+    resolving = new Promise((r) => (resolve = r));
+    await previous;
+
+    // Setting the cwd is only necessary for SvelteKit < 3, where the cwd was used to look up the svelte.config.js file.
+    const changeBack = changeCwd(root);
+
+    try {
+        const resolved = await vite.resolveConfig(
+            { root, configFile: configFilePath, logLevel: 'error' },
+            'serve'
+>>>>>>> 2cfcc15b4c44dfc1128432e20ca663fe20bdd12e
         );
         const kitPlugin = resolved.plugins.find(
             (plugin) => plugin.name === 'vite-plugin-sveltekit-setup'
         );
+        // `api.options` is already the split config shape with kit options under `kit`
         const kitOptions = kitPlugin?.api?.options;
         if (kitOptions) {
-            const { preprocess, compilerOptions, extensions, vitePlugin, ...kit } = kitOptions;
             return {
-                config: { preprocess, compilerOptions, extensions, vitePlugin, kit },
+                config: kitOptions,
                 configFilePath,
                 configSource: 'vite'
             };
@@ -373,6 +391,7 @@ async function loadSvelteConfigFromVite(
             configFilePath,
             configSource: 'vite'
         };
+<<<<<<< HEAD
     }
 }
 
@@ -405,6 +424,26 @@ function bindVitePreprocessConfig(
 }
 
 async function loadSvelteConfig(configFilePath: string, epoch: number): Promise<LoadConfigResult> {
+=======
+    } finally {
+        changeBack();
+        resolve!();
+    }
+}
+
+function changeCwd(dir: string): () => void {
+    const cwd = process.cwd();
+    try {
+        // May throw in e.g. workers, where changing the cwd is not allowed
+        process.chdir(dir);
+        return () => process.chdir(cwd);
+    } catch {
+        return () => {};
+    }
+}
+
+async function loadSvelteConfig(configFilePath: string): Promise<LoadConfigResult> {
+>>>>>>> 2cfcc15b4c44dfc1128432e20ca663fe20bdd12e
     try {
         const moduleUrl = pathToFileURL(configFilePath);
         if (epoch > 0) {

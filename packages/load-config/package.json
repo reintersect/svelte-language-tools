@@ -1,6 +1,11 @@
 {
+<<<<<<< HEAD
     "name": "@reintersect/svelte-load-config",
     "version": "0.2.5",
+=======
+    "name": "@sveltejs/load-config",
+    "version": "0.2.3",
+>>>>>>> 2cfcc15b4c44dfc1128432e20ca663fe20bdd12e
     "description": "Load Svelte config via vite.config or svelte.config",
     "repository": {
         "type": "git",

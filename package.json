@@ -23,9 +23,13 @@
         "typescript": "^6.0.3"
     },
     "devDependencies": {
+        "@changesets/changelog-github": "1.0.0-next.6",
         "@changesets/cli": "^2.29.7",
+<<<<<<< HEAD
         "@svitejs/changesets-changelog-github-compact": "^1.1.0",
         "@typescript/native-preview": "7.0.0-dev.20260703.1",
+=======
+>>>>>>> 2cfcc15b4c44dfc1128432e20ca663fe20bdd12e
         "cross-env": "^7.0.2",
         "prettier": "~3.3.3",
         "ts-node": "^10.0.0"

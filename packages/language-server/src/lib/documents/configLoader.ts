@@ -30,7 +30,7 @@ export interface SvelteConfig {
     loadConfigError?: any;
     isFallbackConfig?: boolean;
     configSource?: 'svelte' | 'vite';
-    kit?: any;
+    files?: any;
 }
 
 export interface ExplicitConfigScope {
@@ -408,7 +408,22 @@ export class ConfigLoader {
 
         if (result && 'config' in result) {
             const configSource = result.configSource;
+<<<<<<< HEAD
             const loadedConfig = result.config as SvelteConfig;
+=======
+            if ('kit' in result.config && !('prerender' in result.config)) {
+                // SvelteKit 3 puts its options at the top level, SvelteKit < 3 inside `kit`,
+                // so we need to normalize it.
+                result.config = {
+                    ...result.config,
+                    ...(result.config.kit as any)
+                };
+            } else {
+                // Accessing `kit` emits a warning in 3 so we delete it.
+                delete result.config.kit;
+            }
+
+>>>>>>> 2cfcc15b4c44dfc1128432e20ca663fe20bdd12e
             const config: SvelteConfig = {
                 ...loadedConfig,
                 configSource,
@@ -426,6 +441,10 @@ export class ConfigLoader {
         }
 
         const configSource = result?.configSource ?? getConfigSource(configPath);
+        // A vite config that loads fine but has no Svelte plugin is not an error: in a monorepo
+        // the crawler also visits packages that don't use Svelte at all. Only report loading
+        // failures, which are the cases where `loadConfig` hands back an `error`.
+        const loadFailed = result?.error !== undefined;
         const error =
             result?.error ??
             new Error(
@@ -434,6 +453,7 @@ export class ConfigLoader {
                     : 'No Svelte configuration found'
             );
         const errorConfigPath = result?.configFilePath ?? configPath;
+<<<<<<< HEAD
         // A workspace-wide scan also encounters ordinary Vite packages which do not own any
         // Svelte files. Keep the fallback (and its loadConfigError) cached so an actual Svelte
         // document still receives a config diagnostic, but do not make successful workspace
@@ -443,6 +463,13 @@ export class ConfigLoader {
         if (!options.broadDiscovery || !isSynthesizedMissingVitePlugin) {
             Logger.error('Error while loading config at ', errorConfigPath);
             Logger.error(error);
+=======
+        if (loadFailed) {
+            Logger.error('Error while loading config at ', errorConfigPath);
+            Logger.error(error);
+        } else {
+            Logger.log('No Svelte config found at ', errorConfigPath);
+>>>>>>> 2cfcc15b4c44dfc1128432e20ca663fe20bdd12e
         }
 
         return {

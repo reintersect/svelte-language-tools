@@ -1,5 +1,6 @@
 # Changelog
 
+<<<<<<< HEAD
 ## 4.8.7
 
 ### Patch Changes
@@ -90,6 +91,24 @@
         pulls debounce to typing pauses; semantic tokens are viewport-scoped;
         completion lists are no longer cloned per item. `SVELTE_LS_NO_RSVELTE=1`
         restores the JS transform.
+=======
+## 4.7.6
+
+### Patch Changes
+
+-   fix: don't log an error for vite configs without a Svelte plugin ([#3091](https://github.com/sveltejs/language-tools/pull/3091))
+
+-   fix: handle SvelteKit 3 having its config merged at the top level ([#3104](https://github.com/sveltejs/language-tools/pull/3104))
+
+## 4.7.5
+
+### Patch Changes
+
+-   fix: prevent silent error during start-up caused by unhandled promise ([#3096](https://github.com/sveltejs/language-tools/pull/3096))
+
+-   Updated dependencies [[`1df53d8`](https://github.com/sveltejs/language-tools/commit/1df53d83049135e5789daf68416334a6f1b6b2c8)]:
+    -   @sveltejs/load-config@0.2.2
+>>>>>>> 2cfcc15b4c44dfc1128432e20ca663fe20bdd12e
 
 ## 4.7.4
 
