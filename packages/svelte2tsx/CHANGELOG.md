@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.61
+
+### Patch Changes
+
+-   fix: handle SvelteKit 3 changed imports for zero types feature ([#3106](https://github.com/sveltejs/language-tools/pull/3106))
+
+## 0.7.60
+
+### Patch Changes
+
+-   fix: remove type dependency on `magic-string` ([#3101](https://github.com/sveltejs/language-tools/pull/3101))
+
 ## 0.7.59
 
 ### Patch Changes

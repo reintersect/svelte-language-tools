@@ -1,7 +1,11 @@
 {
     "name": "@reintersect/svelte-check",
     "description": "Svelte Code Checker Terminal Interface",
+<<<<<<< HEAD
     "version": "4.8.7",
+=======
+    "version": "4.7.6",
+>>>>>>> f03e56672ed174e7042334a3237fe8569cfbf8f1
     "main": "./dist/src/index.js",
     "bin": "./bin/svelte-check",
     "author": "The Svelte Community",

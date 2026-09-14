@@ -1,8 +1,13 @@
 {
     "$schema": "https://unpkg.com/@changesets/config@3.1.1/schema.json",
     "changelog": [
+<<<<<<< HEAD
         "@svitejs/changesets-changelog-github-compact",
         { "repo": "reintersect/svelte-language-tools" }
+=======
+        "@changesets/changelog-github",
+        { "repo": "sveltejs/language-tools", "template": "\n- {summary} {ref}" }
+>>>>>>> f03e56672ed174e7042334a3237fe8569cfbf8f1
     ],
     "commit": false,
     "fixed": [],

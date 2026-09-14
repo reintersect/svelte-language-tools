@@ -1,6 +1,11 @@
 {
+<<<<<<< HEAD
     "name": "@reintersect/svelte-language-server",
     "version": "0.19.8",
+=======
+    "name": "svelte-language-server",
+    "version": "0.18.4",
+>>>>>>> f03e56672ed174e7042334a3237fe8569cfbf8f1
     "description": "A language server for Svelte",
     "main": "dist/src/index.js",
     "typings": "dist/src/index",
