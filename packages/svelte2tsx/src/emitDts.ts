@@ -126,6 +126,8 @@ function loadTsconfig(config: EmitDtsConfig, svelteMap: SvelteMap) {
         options: {
             ...options,
             noEmit: false, // Set to true in case of jsconfig, force false, else nothing is emitted
+            noEmitOnError: false, // Type errors are svelte-check's job, force false, else nothing is emitted
+            isolatedDeclarations: false, // Same, and generated component code can't satisfy it
             moduleResolution:
                 options.moduleResolution &&
                 options.moduleResolution !== ts.ModuleResolutionKind.Classic
@@ -134,6 +136,7 @@ function loadTsconfig(config: EmitDtsConfig, svelteMap: SvelteMap) {
                       ((ts.ModuleResolutionKind as any).NodeJs ?? ts.ModuleResolutionKind.Node10), // Classic if not set, which gives wrong results
             declaration: true, // Needed for d.ts file generation
             emitDeclarationOnly: true, // We only want d.ts file generation
+            noCheck: true, // Skip type-checking, svelte-check does that (TS 5.5+, ignored before)
             declarationDir: config.declarationDir, // Where to put the declarations
             allowNonTsExtensions: true
         },
@@ -278,6 +281,20 @@ async function createTsCompilerHost(options: any, svelteMap: SvelteMap, absDecla
         });
     };
 
+    const getCanonicalFileName = createGetCanonicalFileName(ts.sys.useCaseSensitiveFileNames);
+    // Each resolution host gets its own cache: the two hosts disagree about
+    // whether virtual .svelte.ts/.svelte.js paths exist.
+    const tsModuleResolutionCache = ts.createModuleResolutionCache(
+        ts.sys.getCurrentDirectory(),
+        getCanonicalFileName,
+        options
+    );
+    const svelteModuleResolutionCache = ts.createModuleResolutionCache(
+        ts.sys.getCurrentDirectory(),
+        getCanonicalFileName,
+        options
+    );
+
     function resolveModuleName(name: string, containingFile: string, compilerOptions: any) {
         // Delegate to the TS resolver first.
         // If that does not bring up anything, try the Svelte Module loader
@@ -286,14 +303,20 @@ async function createTsCompilerHost(options: any, svelteMap: SvelteMap, absDecla
             name,
             containingFile,
             compilerOptions,
-            ts.sys
+            ts.sys,
+            tsModuleResolutionCache
         ).resolvedModule;
         if (tsResolvedModule && !isVirtualSvelteFilepath(tsResolvedModule.resolvedFileName)) {
             return tsResolvedModule;
         }
 
-        return ts.resolveModuleName(name, containingFile, compilerOptions, svelteSys)
-            .resolvedModule;
+        return ts.resolveModuleName(
+            name,
+            containingFile,
+            compilerOptions,
+            svelteSys,
+            svelteModuleResolutionCache
+        ).resolvedModule;
     }
 
     return host;
@@ -362,6 +385,31 @@ function toRealSvelteFilepath(filePath: string) {
 
 function ensureRealSvelteFilepath(filePath: string) {
     return isVirtualSvelteFilepath(filePath) ? toRealSvelteFilepath(filePath) : filePath;
+}
+
+const fileNameLowerCaseRegExp = /[^\u0130\u0131\u00DFa-z0-9\\/:\-_\. ]+/g;
+
+/**
+ * adopted from https://github.com/microsoft/TypeScript/blob/8192d550496d884263e292488e325ae96893dc78/src/compiler/core.ts#L1769-L1807
+ * see the comment there about why we can't just use String.prototype.toLowerCase() here
+ */
+function toFileNameLowerCase(x: string) {
+    return fileNameLowerCaseRegExp.test(x) ? x.replace(fileNameLowerCaseRegExp, toLowerCase) : x;
+}
+
+function toLowerCase(x: string) {
+    return x.toLowerCase();
+}
+
+/**
+ * adopted from https://github.com/microsoft/TypeScript/blob/8192d550496d884263e292488e325ae96893dc78/src/compiler/core.ts#L2312
+ */
+function createGetCanonicalFileName(useCaseSensitiveFileNames: boolean) {
+    return useCaseSensitiveFileNames ? identity : toFileNameLowerCase;
+}
+
+function identity<T>(x: T) {
+    return x;
 }
 
 function isSubpath(maybeParent: string, maybeChild: string) {
