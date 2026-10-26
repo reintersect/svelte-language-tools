@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.62
+
+### Patch Changes
+
+-   perf: skip type-checking in `emitDts` ([#3130](https://github.com/sveltejs/language-tools/pull/3130))
+
+-   fix: ignore `noEmitOnError` and `isolatedDeclarations` in `emitDts` ([#3129](https://github.com/sveltejs/language-tools/pull/3129))
+
+-   perf: use a module resolution cache in emitDts, avoiding a full module resolution walk for every import of every file in the program ([#3093](https://github.com/sveltejs/language-tools/pull/3093))
+
+-   fix: recognise the real `<script>` and `<style>` start tags when a matching token also appears inside the other tag ([#3079](https://github.com/sveltejs/language-tools/pull/3079))
+
+-   fix: don't hide $props type argument error ([#3126](https://github.com/sveltejs/language-tools/pull/3126))
+
+## 0.7.61
+
+### Patch Changes
+
+-   fix: handle SvelteKit 3 changed imports for zero types feature ([#3106](https://github.com/sveltejs/language-tools/pull/3106))
+
+## 0.7.60
+
+### Patch Changes
+
+-   fix: remove type dependency on `magic-string` ([#3101](https://github.com/sveltejs/language-tools/pull/3101))
+
 ## 0.7.59
 
 ### Patch Changes

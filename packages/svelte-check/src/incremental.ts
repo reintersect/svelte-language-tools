@@ -87,6 +87,17 @@ function getCacheDir(workspacePath: string): string {
     return path.join(workspacePath, CACHE_DIR_NAME);
 }
 
+/**
+ * Checks whether a path is one of the possible cache directories or inside of them.
+ * Both locations are checked because `.svelte-kit` can be created while watching.
+ */
+export function isInCacheDir(workspacePath: string, filePath: string): boolean {
+    return [
+        path.join(workspacePath, CACHE_DIR_NAME),
+        path.join(workspacePath, SVELTE_KIT_DIR, CACHE_DIR_NAME)
+    ].some((cacheDir) => filePath === cacheDir || filePath.startsWith(cacheDir + path.sep));
+}
+
 function toPosixPath(value: string) {
     return value.replace(/\\/g, '/');
 }
@@ -137,7 +148,10 @@ async function loadKitFilesSettings(
         return defaultKitFilesSettings;
     }
 
-    return kitFilesSettingsFromConfig(result.config.kit);
+    return kitFilesSettingsFromConfig(
+        // SvelteKit 3 puts its options at the top level
+        'files' in result.config ? result.config : result.config.kit
+    );
 }
 
 /**
@@ -407,7 +421,12 @@ export function writeOverlayTsconfig(
         (dir) => toRelativePosix(overlayDir, dir)
     );
     const tsconfigDir = path.dirname(tsconfigPath);
-    const rawInclude = normalizeConfigSpecs(parsed.raw?.include);
+    // `include` and `files` inherited through `extends` are already merged into `raw`. If neither
+    // is set, TypeScript defaults `include` to `**/*`. The overlay always sets `files` (the shims),
+    // which would turn that default into an empty `include`, so spell the default out.
+    const rawInclude =
+        normalizeConfigSpecs(parsed.raw?.include) ??
+        (normalizeConfigSpecs(parsed.raw?.files) ? undefined : ['**/*']);
     const rawExclude = normalizeConfigSpecs(parsed.raw?.exclude);
     const rawFiles = normalizeConfigSpecs(parsed.raw?.files) ?? [];
     const include = rebaseConfigSpecs(rawInclude, tsconfigDir, overlayDir);
@@ -419,7 +438,11 @@ export function writeOverlayTsconfig(
     let configFiles = rebaseConfigSpecs(rawFiles, tsconfigDir, overlayDir) ?? [];
     // Remove .svelte files from the files list to avoid TS6054; replace with .d.svelte.ts
     configFiles = configFiles.filter((file) => !file.endsWith('.svelte'));
-    configFiles = configFiles.concat(rawFiles.map((file) => toVirtualSvelteDtsSpec(file)));
+    configFiles = configFiles.concat(
+        rawFiles
+            .filter((file) => file.endsWith('.svelte'))
+            .map((file) => toVirtualSvelteDtsSpec(file))
+    );
     const virtualInclude = rawInclude?.map((spec) => toVirtualSvelteDtsSpec(spec));
     const mergedInclude = [...(include ?? []), ...(virtualInclude ?? [])];
     const virtualExclude = rawExclude?.map((spec) => toVirtualSvelteDtsSpec(spec));
@@ -515,10 +538,35 @@ export function runTypeScriptDiagnostics(
             reject(err);
         });
 
-        proc.on('close', () => {
+        proc.on('close', (code, signal) => {
             const output = `${stdout}\n${stderr}`;
             try {
-                resolve(parseDiagnostics(output, cwd));
+                const diagnostics = parseDiagnostics(output, cwd);
+
+                // A non-zero exit can also mean the compiler reported diagnostics, so only
+                // treat it as an error when nothing was parsed. A signal always is: the
+                // run did not finish, so any diagnostics it printed are partial. A crash
+                // reported as an exit code after a diagnostic was printed (e.g. on Windows,
+                // where every kill is reported that way) still resolves.
+                if (signal !== null || (code !== 0 && diagnostics.length === 0)) {
+                    const reason =
+                        signal !== null
+                            ? `was killed by signal ${signal}`
+                            : `exited with code ${code} without a parseable diagnostic`;
+                    // Include what the compiler printed. Unparsed output, such as a global
+                    // error or an unknown compiler option, is often the only explanation.
+                    const detail = stripAnsi(output).trim();
+                    reject(
+                        new Error(
+                            `The TypeScript compiler process ${reason}.${
+                                detail ? `\n${detail.slice(0, 2000)}` : ''
+                            }`
+                        )
+                    );
+                    return;
+                }
+
+                resolve(diagnostics);
             } catch (e) {
                 reject(e);
             }
@@ -1340,15 +1388,21 @@ export function updateDiagnosticsCache(
  * Resolves the paths to svelte2tsx shim declaration files.
  * These shims provide type definitions for Svelte-specific globals and JSX.
  * Uses different shim versions based on the installed Svelte version (v3 vs v4+).
+ * Like the language server (see `get_global_types` in svelte2tsx), Svelte's own
+ * `svelte-html.d.ts` is preferred over `svelte-jsx-v4.d.ts` when available, so that
+ * elements are typed from `svelte/elements` (including `<svelte:boundary>` and
+ * user augmentations of `SvelteHTMLElements`).
  *
  * @returns Array of absolute paths to the shim .d.ts files
  */
 function resolveSvelte2tsxShims(): string[] {
-    const shimNames = [
-        Number(VERSION.split('.')[0]) < 4 ? 'svelte-shims.d.ts' : 'svelte-shims-v4.d.ts',
-        Number(VERSION.split('.')[0]) < 4 ? 'svelte-jsx.d.ts' : 'svelte-jsx-v4.d.ts'
-        // 'svelte-native-jsx.d.ts' // TODO read tsconfig/svelte.config.js to see if it's enabled
-    ];
+    const isSvelte3 = Number(VERSION.split('.')[0]) < 4;
+    const svelteHtml = isSvelte3 ? undefined : resolveSvelteHtmlTypes();
+    const shimNames = [isSvelte3 ? 'svelte-shims.d.ts' : 'svelte-shims-v4.d.ts'];
+    if (!svelteHtml) {
+        shimNames.push(isSvelte3 ? 'svelte-jsx.d.ts' : 'svelte-jsx-v4.d.ts');
+    }
+    // 'svelte-native-jsx.d.ts' // TODO read tsconfig/svelte.config.js to see if it's enabled
     const resolved: string[] = [];
     for (const name of shimNames) {
         try {
@@ -1357,5 +1411,18 @@ function resolveSvelte2tsxShims(): string[] {
             // ignore missing optional shims
         }
     }
+    if (svelteHtml) {
+        resolved.push(svelteHtml);
+    }
     return resolved;
+}
+
+function resolveSvelteHtmlTypes(): string | undefined {
+    try {
+        const sveltePath = path.dirname(require.resolve('svelte/package.json'));
+        const svelteHtmlPath = path.join(sveltePath, 'svelte-html.d.ts');
+        return fs.existsSync(svelteHtmlPath) ? svelteHtmlPath : undefined;
+    } catch {
+        return undefined;
+    }
 }
