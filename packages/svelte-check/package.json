@@ -1,7 +1,11 @@
 {
     "name": "@reintersect/svelte-check",
     "description": "Svelte Code Checker Terminal Interface",
+<<<<<<< HEAD
     "version": "4.8.7",
+=======
+    "version": "4.7.8",
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
     "main": "./dist/src/index.js",
     "bin": "./bin/svelte-check",
     "author": "The Svelte Community",
@@ -60,7 +64,11 @@
         "@rollup/plugin-replace": "5.0.2",
         "@rollup/plugin-typescript": "^10.0.0",
         "@types/sade": "^1.7.2",
+<<<<<<< HEAD
         "@typescript/native-preview": "7.0.0-dev.20260703.1",
+=======
+        "@typescript/native": "npm:typescript@7.0.2",
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
         "rollup": "3.7.5",
         "rollup-plugin-cleanup": "^3.2.0",
         "rollup-plugin-copy": "^3.4.0",

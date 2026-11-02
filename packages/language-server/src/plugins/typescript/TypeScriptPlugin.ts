@@ -107,6 +107,7 @@ import {
 import { CallHierarchyProviderImpl } from './features/CallHierarchyProvider';
 import { CodeLensProviderImpl } from './features/CodeLensProvider';
 import { WorkspaceSymbolsProviderImpl } from './features/WorkspaceSymbolProvider';
+import type { SvelteDocumentSnapshot } from './DocumentSnapshot';
 
 export class TypeScriptPlugin
     implements
@@ -282,7 +283,7 @@ export class TypeScriptPlugin
         const navTree = lang.getNavigationTree(tsDoc.filePath);
 
         const symbols: SymbolInformation[] = [];
-        collectSymbols(navTree, undefined, (symbol) => symbols.push(symbol));
+        collectSymbols(navTree, undefined);
 
         const topContainerName = symbols[0].name;
         const result: SymbolInformation[] = [];
@@ -327,6 +328,23 @@ export class TypeScriptPlugin
             }
 
             if (symbol.name === '<function>') {
+                // Generated functions in the template can cover arbitrary template text, which
+                // results in malformed entries. Keep functions that map to an expression the user
+                // actually wrote.
+                const symbolStartOffset = document.offsetAt(symbol.location.range.start);
+                // svelte2tsx replaces the instance script's end tag with the generated template
+                // callback. Its start therefore maps to scriptInfo.end, which is also considered
+                // inside the script by isInScript. Treat this boundary as template code here so the
+                // generated callback is filtered out.
+                const startsAtScriptEnd = symbolStartOffset === document.scriptInfo?.end;
+                if (
+                    startsAtScriptEnd ||
+                    (!isInScript(symbol.location.range.start, document) &&
+                        !this.isInUserWrittenTemplateFunction(tsDoc, symbolStartOffset))
+                ) {
+                    continue;
+                }
+
                 let name = getTextInRange(symbol.location.range, document.getText()).trimLeft();
                 if (name.length > 50) {
                     name = name.substring(0, 50) + '...';
@@ -347,15 +365,12 @@ export class TypeScriptPlugin
 
         return result;
 
-        function collectSymbols(
-            tree: NavigationTree,
-            container: string | undefined,
-            cb: (symbol: SymbolInformation) => void
-        ) {
+        function collectSymbols(tree: NavigationTree, container: string | undefined) {
             const start = tree.spans[0];
             const end = tree.spans[tree.spans.length - 1];
-            if (start && end) {
-                cb(
+            // Match VS Code's TypeScript outline by excluding import and re-export aliases.
+            if (start && end && tree.kind !== ts.ScriptElementKind.alias) {
+                symbols.push(
                     SymbolInformation.create(
                         tree.text,
                         symbolKindFromString(tree.kind),
@@ -370,10 +385,33 @@ export class TypeScriptPlugin
             }
             if (tree.childItems) {
                 for (const child of tree.childItems) {
-                    collectSymbols(child, tree.text, cb);
+                    collectSymbols(child, tree.text);
                 }
             }
         }
+    }
+
+    private isInUserWrittenTemplateFunction(
+        tsDoc: SvelteDocumentSnapshot,
+        offset: number
+    ): boolean {
+        let result = false;
+
+        tsDoc.walkSvelteAst({
+            enter(node) {
+                if (offset < node.start || offset > node.end) {
+                    this.skip();
+                    return;
+                }
+
+                if (node.type === 'ArrowFunctionExpression' || node.type === 'FunctionExpression') {
+                    result = true;
+                    this.skip();
+                }
+            }
+        });
+
+        return result;
     }
 
     async getCompletions(

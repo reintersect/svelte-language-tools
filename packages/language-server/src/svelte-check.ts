@@ -25,10 +25,15 @@ import { isInGeneratedCode } from './plugins/typescript/features/utils';
 import { mapAndFilterDiagnostics } from './plugins/typescript/features/DiagnosticsProvider';
 import { convertRange, getDiagnosticTag, mapSeverity } from './plugins/typescript/utils';
 import { groupBy, normalizePath, pathToUrl, urlToPath } from './utils';
+<<<<<<< HEAD
 import {
     getConfigLoadErrorDiagnostics,
     isSvelteConfigLoadDiagnostic
 } from './plugins/svelte/features/getDiagnostics';
+=======
+import { tsApiSync, tsAst, tsFs } from './plugins/typescript-go/types';
+import { SvelteCheckTSGoDiagnosticsProvider } from './plugins/typescript-go/features/DiagnosticsProvider';
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
 
 export function mapSvelteCheckDiagnostics(
     sourcePath: string,
@@ -77,6 +82,7 @@ export interface SvelteCheckOptions {
     onFileSnapshotCreated?: (filePath: string) => void;
 }
 
+<<<<<<< HEAD
 export interface SvelteCheckFileDiagnostics {
     filePath: string;
     text: string;
@@ -100,6 +106,16 @@ export async function preloadSvelteConfigsForClassicDiagnostics(
             .filter((file) => file.fileName.toLowerCase().endsWith('.svelte'))
             .map((file) => loadConfig(file.fileName))
     );
+=======
+    experimental?: {
+        tsgo: {
+            apiModule: unknown;
+            astModule: unknown;
+            fsModule: unknown;
+            tsVersion: string;
+        };
+    };
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
 }
 
 /**
@@ -123,7 +139,7 @@ export class SvelteCheck {
         this.initialize(workspacePath, options);
     }
 
-    private async initialize(workspacePath: string, options: SvelteCheckOptions) {
+    private initialize(workspacePath: string, options: SvelteCheckOptions) {
         if (options.tsconfig && !isAbsolute(options.tsconfig)) {
             throw new Error('tsconfigPath needs to be absolute, got ' + options.tsconfig);
         }
@@ -165,6 +181,7 @@ export class SvelteCheck {
         }
         if (shouldRegister('js') || options.tsconfig) {
             const workspaceUris = [pathToUrl(workspacePath)];
+<<<<<<< HEAD
             this.lsAndTSDocResolver = new LSAndTSDocResolver(
                 this.docManager,
                 workspaceUris,
@@ -179,6 +196,35 @@ export class SvelteCheck {
             );
             this.pluginHost.register(
                 new TypeScriptPlugin(
+=======
+            if (options.experimental?.tsgo && options.tsconfig) {
+                const modules = options.experimental.tsgo as {
+                    apiModule: typeof tsApiSync;
+                    astModule: typeof tsAst;
+                    fsModule: typeof tsFs;
+                    tsVersion: string;
+                };
+                if (!modules.apiModule.API || !('ScriptKind' in modules.astModule)) {
+                    throw new Error('Unsupported typescript-go version');
+                }
+                this.tsGoDiagnosticsProvider = new SvelteCheckTSGoDiagnosticsProvider(
+                    modules,
+                    options.tsconfig,
+                    'svelte-check',
+                    (filePath: string, text: string) =>
+                        this.docManager.openDocument(
+                            {
+                                text: text,
+                                uri: pathToUrl(filePath)
+                            },
+                            /* openedByClient */ true
+                        )
+                );
+            } else {
+                this.lsAndTSDocResolver = new LSAndTSDocResolver(
+                    this.docManager,
+                    workspaceUris,
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
                     this.configManager,
                     this.lsAndTSDocResolver,
                     workspaceUris,
@@ -541,6 +587,86 @@ export class SvelteCheck {
         }
     }
 
+<<<<<<< HEAD
+=======
+    private async getDiagnosticsForTsconfigTsGo() {
+        if (!this.tsGoDiagnosticsProvider) {
+            throw new Error(
+                'Cannot get diagnostics for tsconfig without TSGo diagnostics provider'
+            );
+        }
+
+        const project = await this.tsGoDiagnosticsProvider.getProject();
+        if (!project) {
+            throw new Error('Expected to have api project');
+        }
+        let allTsDiagnostics = Array.from(project.program.getConfigFileParsingDiagnostics());
+        const configFileParsingDiagnosticsLength = allTsDiagnostics?.length ?? 0;
+
+        allTsDiagnostics = allTsDiagnostics.concat(project.program.getSyntacticDiagnostics());
+        const contentMapperDiagnostic = allTsDiagnostics.find((v) => v.code === 18068);
+        if (contentMapperDiagnostic) {
+            contentMapperDiagnostic.text = 'Content mappers are not yet supported';
+            return this.tsGoDiagnosticsProvider.mapAndFilterDiagnostics(project, [
+                contentMapperDiagnostic
+            ]);
+        }
+
+        if (allTsDiagnostics.length == configFileParsingDiagnosticsLength) {
+            if (
+                'getProgramDiagnostics' in project.program &&
+                'getGlobalDiagnostics' in project.program
+            ) {
+                const programOrGlobal = project.program
+                    .getProgramDiagnostics()
+                    .concat(project.program.getGlobalDiagnostics());
+                allTsDiagnostics = allTsDiagnostics.concat(
+                    this.tsGoDiagnosticsProvider.deduplicateDiagnostics(programOrGlobal)
+                );
+            }
+
+            if (allTsDiagnostics.length == configFileParsingDiagnosticsLength) {
+                allTsDiagnostics = allTsDiagnostics.concat(
+                    project.program.getSemanticDiagnostics()
+                );
+            }
+        }
+
+        const result = this.tsGoDiagnosticsProvider.mapAndFilterDiagnostics(
+            project,
+            allTsDiagnostics
+        );
+        const map = new Map<
+            string,
+            { filePath: string; text: string; diagnostics: Diagnostic[] }
+        >();
+        for (const diag of result) {
+            map.set(diag.filePath, diag);
+        }
+
+        for (const filePath of this.tsGoDiagnosticsProvider.getAllSvelteFiles()) {
+            const uri = pathToUrl(filePath);
+            if (!uri) {
+                continue;
+            }
+            const doc = this.docManager.get(uri);
+            if (!doc) {
+                continue;
+            }
+
+            const nonTsDiagnostics = await this.getDiagnosticsForFile(uri);
+            let existing = map.get(filePath);
+            if (existing) {
+                existing.diagnostics = existing.diagnostics.concat(nonTsDiagnostics.diagnostics);
+            } else {
+                map.set(filePath, nonTsDiagnostics);
+            }
+        }
+
+        return Array.from(map.values());
+    }
+
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
     private async getDiagnosticsForFile(uri: string) {
         const diagnostics = deduplicateSvelteParserDiagnostics(
             await this.pluginHost.getDiagnostics({ uri })

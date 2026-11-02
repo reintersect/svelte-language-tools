@@ -25,13 +25,24 @@ import {
 import {
     emitSvelteFiles,
     EmitResult,
+    isInCacheDir,
     mapCliDiagnosticsToLsp,
     runTypeScriptDiagnostics,
     updateDiagnosticsCache,
     writeOverlayTsconfig
 } from './incremental';
 import { createIgnored, findFiles } from './utils';
+<<<<<<< HEAD
 import { runTsGoCheck } from './tsgo-overlay';
+=======
+import {
+    formatTsGoNotFoundError,
+    tryLoadApi as tryLoadTsApi,
+    tryLoadAst as tryLoadTsAst,
+    tryLoadFs as tryLoadTsFs,
+    tryParseTsGoVersion
+} from './tsgo';
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
 
 type Result = {
     fileCount: number;
@@ -934,8 +945,14 @@ async function watchWithVirtualFiles(
             if (
                 path.includes('node_modules') ||
                 path.includes('.git') ||
+<<<<<<< HEAD
                 (stats?.isFile() &&
                     (!VIRTUAL_WATCH_FILE_REGEX.test(path) || VITE_CONFIG_REGEX.test(path)))
+=======
+                // Files emitted by each run would otherwise trigger the next run
+                isInCacheDir(opts.workspaceUri.fsPath, path) ||
+                (stats?.isFile() && (!FILE_ENDING_REGEX.test(path) || VITE_CONFIG_REGEX.test(path)))
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
             ) {
                 return true;
             }
@@ -999,6 +1016,7 @@ parseOptions(async (opts) => {
             watch: opts.watch
         };
 
+<<<<<<< HEAD
         // `--tsgo-experimental-api` used to drive tsgo through its in-process API with an
         // overlay of its own, which mis-resolved `.svelte` imports and reported 41 phantom
         // errors on a package the classic engine finds clean. It now means `--tsgo`.
@@ -1010,6 +1028,63 @@ parseOptions(async (opts) => {
         }
         if (useTsGo && !opts.tsconfig) {
             throw new Error('`--tsgo` requires a tsconfig/jsconfig file');
+=======
+        if (opts.tsgoExperimental) {
+            if (!opts.tsconfig) {
+                throw new Error('--tsgo-experimental-api requires a tsconfig/jsconfig file');
+            }
+            if (opts.incremental) {
+                throw new Error('--tsgo-experimental-api cannot be used with --incremental');
+            }
+            if (opts.tsgo) {
+                throw new Error('--tsgo-experimental-api cannot be used with --tsgo');
+            }
+            const pkg = tryParseTsGoVersion(opts.tsconfig);
+            if (!pkg) {
+                throw new Error(formatTsGoNotFoundError('--tsgo-experimental-api'));
+            }
+
+            const minPre7_0Nightly = 'dev.20260614.1';
+            if (
+                pkg.major === 7 &&
+                pkg.minor === 0 &&
+                pkg.patch === 0 &&
+                pkg.preRelease?.includes('dev')
+            ) {
+                // ex: 7.0.0-dev.20260518.1
+                if (pkg.preRelease.localeCompare(minPre7_0Nightly) < 0) {
+                    throw new Error(
+                        'Unsupported @typescript/native-preview version. Please upgrade to at least 7.0.0-' +
+                            minPre7_0Nightly
+                    );
+                }
+            } else if (pkg.major === 7 && pkg.minor === 1 && pkg.preRelease?.includes('dev')) {
+                const minPre7_1Nightly = 'dev.20261021.1';
+                if (pkg.preRelease.localeCompare(minPre7_1Nightly) < 0) {
+                    throw new Error(
+                        'Unsupported TypeScript 7.1 version. Please upgrade to at least 7.1.0-beta or 7.1.0-' +
+                            minPre7_1Nightly
+                    );
+                }
+            }
+
+            const [apiModule, astModule, fsModule] = await Promise.all([
+                tryLoadTsApi(opts.tsconfig, pkg),
+                tryLoadTsAst(opts.tsconfig, pkg),
+                tryLoadTsFs(opts.tsconfig, pkg)
+            ]);
+            if (!apiModule || !astModule || !fsModule) {
+                throw new Error(
+                    `Unsupported ${pkg.pkgJsonName} version. Please ensure you have the latest version installed.` +
+                        'If the problem persists, please report an issue in https://github.com/sveltejs/language-tools/issues.'
+                );
+            }
+
+            const fullVersion = pkg.major + '.' + pkg.minor + '.' + pkg.patch;
+            svelteCheckOptions.experimental = {
+                tsgo: { apiModule, astModule, tsVersion: fullVersion, fsModule }
+            };
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
         }
 
         const runOnce = useTsGo ? runWithTsGo : runWithVirtualFiles;
@@ -1058,8 +1133,15 @@ parseOptions(async (opts) => {
                     : 1;
             exitAfterFlush(exitCode);
         }
+<<<<<<< HEAD
     } catch (err) {
         writer.failure(err instanceof Error ? err : new Error(String(err)));
+=======
+    } catch (_err) {
+        console.error(_err);
+        console.error('svelte-check failed');
+        // A failed run must not look like a clean one to CI.
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
         exitAfterFlush(1);
     }
 });

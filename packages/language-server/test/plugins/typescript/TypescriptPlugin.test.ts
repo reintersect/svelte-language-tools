@@ -75,14 +75,14 @@ describe('TypescriptPlugin', function () {
         return input.replace(/\r\n/g, '~:~').replace(/\n/g, '~:~').replace(/~:~/g, '\n');
     }
 
-    function setup(filename: string) {
+    function setup(filename: string, text?: string) {
         const docManager = new DocumentManager((args) =>
             args.uri.includes('.svelte')
                 ? new Document(args.uri, harmonizeNewLines(args.text))
                 : document
         );
         const filePath = path.join(testDir, filename);
-        const document = new Document(pathToUrl(filePath), ts.sys.readFile(filePath) || '');
+        const document = new Document(pathToUrl(filePath), text ?? ts.sys.readFile(filePath) ?? '');
         const lsConfigManager = new LSConfigManager();
         const workspaceUris = [pathToUrl(testDir)];
         const lsAndTsDocResolver = new LSAndTSDocResolver(
@@ -353,6 +353,14 @@ describe('TypescriptPlugin', function () {
         ]);
     });
 
+    it('does not provide document symbols for imports or re-export aliases', async () => {
+        const { plugin, document } = setup('documentsymbols-imports.svelte');
+        const symbols = await plugin.getDocumentSymbols(document);
+        const names = symbols.map((symbol) => symbol.name).sort();
+
+        assert.deepStrictEqual(names, ['answer', 'local', 'run']);
+    });
+
     it('can cancel document symbols before promise resolved', async () => {
         const { plugin, document } = setup('documentsymbols.svelte');
         const cancellationTokenSource = new CancellationTokenSource();
@@ -361,6 +369,31 @@ describe('TypescriptPlugin', function () {
         cancellationTokenSource.cancel();
         assert.deepStrictEqual(await symbolsPromise, []);
     });
+
+    for (const finalNewline of ['', '\n']) {
+        it(`filters the generated template function ${finalNewline ? 'with' : 'without'} a final newline`, async () => {
+            // Keep this source inline because formatters add a final newline to fixture files.
+            const text = [
+                '<script>',
+                '  import Test1 from "./Test1.svelte";',
+                '  (function () { return true; })();',
+                '</script>',
+                '',
+                '<Test1></Test1>'
+            ].join('\n');
+            assert.ok(!text.endsWith('\n'));
+
+            const { plugin, document } = setup(
+                'documentsymbols-no-final-newline.svelte',
+                text + finalNewline
+            );
+            const symbols = await plugin.getDocumentSymbols(document);
+
+            assert.deepStrictEqual(symbols.map((symbol) => symbol.name).sort(), [
+                'function () { return true; }'
+            ]);
+        });
+    }
 
     it('provides definitions within svelte doc', async () => {
         const { plugin, document } = setup('definitions.svelte');
@@ -865,6 +898,25 @@ describe('TypescriptPlugin', function () {
     if (!isSvelte5Plus) {
         return;
     }
+
+    it('filters generated snippet functions without hiding source-authored template symbols', async () => {
+        const { plugin, document } = setup('documentsymbols-snippets.v5/input.svelte');
+
+        const symbols = await plugin.getDocumentSymbols(document);
+        const names = symbols.map((symbol) => symbol.name).sort();
+
+        assert.ok(names.includes('items.map() callback'));
+        assert.deepStrictEqual(names, [
+            'children',
+            'children',
+            'data',
+            'getter',
+            'item',
+            'items',
+            'items.map() callback',
+            'value'
+        ]);
+    });
 
     it('provides definitions from svelte to rune-mode svelte doc', async () => {
         const { plugin, document } = setup('definition/definition-rune.svelte');

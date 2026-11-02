@@ -23,12 +23,23 @@
         "typescript": "^6.0.3"
     },
     "devDependencies": {
+        "@changesets/changelog-github": "1.0.0-next.6",
         "@changesets/cli": "^2.29.7",
+<<<<<<< HEAD
         "@svitejs/changesets-changelog-github-compact": "^1.1.0",
         "@typescript/native-preview": "7.0.0-dev.20260703.1",
+=======
+>>>>>>> e7826d325d734e6be6bfd7694acc3804ea264a1e
         "cross-env": "^7.0.2",
         "prettier": "~3.3.3",
         "ts-node": "^10.0.0"
     },
-    "packageManager": "pnpm@9.3.0"
+    "packageManager": "pnpm@9.3.0",
+    "pnpm": {
+        "peerDependencyRules": {
+            "allowedVersions": {
+                "prettier-plugin-svelte4>svelte": "^4.2.19"
+            }
+        }
+    }
 }
